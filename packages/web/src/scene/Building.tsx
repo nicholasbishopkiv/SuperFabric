@@ -1,8 +1,15 @@
 import { Html } from "@react-three/drei";
 import type { ThreeEvent } from "@react-three/fiber";
 import { memo, useCallback } from "react";
-import { useFabric, useIsSelected, useRoom, useRoomAgentCount } from "../store";
-import { buildingSize } from "./layout";
+import { useFabric, useIsSelected, useRoom, useRoomAgentCount, useRoomStatus } from "../store";
+import {
+  beaconHeight,
+  buildingSize,
+  labelHeight,
+  PROJECT_ROOF_HEIGHT,
+  ROOM_ROOF_THICKNESS,
+} from "./layout";
+import { StatusBeacon } from "./StatusBeacon";
 
 const COLORS = {
   project: "#5a6b7c",
@@ -24,6 +31,7 @@ const SELECTED_EMISSIVE = 0.55;
 export const Building = memo(function Building({ roomId }: { roomId: string }) {
   const room = useRoom(roomId);
   const agents = useRoomAgentCount(roomId);
+  const status = useRoomStatus(roomId);
   const selected = useIsSelected(roomId);
   const selectRoom = useFabric((s) => s.selectRoom);
 
@@ -45,7 +53,6 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
   const emissiveIntensity = selected ? SELECTED_EMISSIVE : 0;
   // A 4-sided cone needs to reach the box's corners, not its edges, to cover the footprint.
   const roofRadius = (width * Math.SQRT2) / 2 + 0.1;
-  const labelHeight = height + (isProject ? 3.4 : 1.6);
 
   return (
     <group position={[room.position.x, 0, room.position.z]} onClick={onClick}>
@@ -60,8 +67,8 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
 
       {isProject ? (
         // A pitched four-sided roof, rotated 45° so its faces line up with the block's.
-        <mesh castShadow position-y={height + 1} rotation-y={Math.PI / 4}>
-          <coneGeometry args={[roofRadius, 2, 4]} />
+        <mesh castShadow position-y={height + PROJECT_ROOF_HEIGHT / 2} rotation-y={Math.PI / 4}>
+          <coneGeometry args={[roofRadius, PROJECT_ROOF_HEIGHT, 4]} />
           <meshStandardMaterial
             color={COLORS.projectRoof}
             emissive={emissive}
@@ -70,8 +77,8 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
         </mesh>
       ) : (
         // A workshop gets a flatter roof: a thin slab with a slight overhang.
-        <mesh castShadow position-y={height + 0.15}>
-          <boxGeometry args={[width + 0.4, 0.3, width + 0.4]} />
+        <mesh castShadow position-y={height + ROOM_ROOF_THICKNESS / 2}>
+          <boxGeometry args={[width + 0.4, ROOM_ROOF_THICKNESS, width + 0.4]} />
           <meshStandardMaterial
             color={COLORS.roomRoof}
             emissive={emissive}
@@ -79,6 +86,8 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
           />
         </mesh>
       )}
+
+      <StatusBeacon status={status} y={beaconHeight(room.kind)} />
 
       {selected && (
         // An unmistakable ground ring under the selection: the emissive bump alone is subtle on a
@@ -95,7 +104,7 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
         white rectangle. A constant screen-space size is also the right behaviour for a plan view —
         the label stays exactly as readable at every zoom level, which is what the factor was for.
       */}
-      <Html position={[0, labelHeight, 0]} center occlude>
+      <Html position={[0, labelHeight(room.kind), 0]} center occlude>
         <div
           style={{
             font: "600 13px system-ui, sans-serif",
@@ -112,7 +121,10 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
           }}
         >
           {room.name}
-          {isProject ? "" : ` · ${agents} agent${agents === 1 ? "" : "s"}`}
+          {/* The project block normally shows no count — it is the factory, not a department. But an
+              agent *can* be created in the project room, and then figures stand at the block; a
+              label that stayed silent about them would contradict what the floor shows. */}
+          {isProject && agents === 0 ? "" : ` · ${agents} agent${agents === 1 ? "" : "s"}`}
         </div>
       </Html>
     </group>

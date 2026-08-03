@@ -1,14 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { ringPosition as sharedRingPosition } from "@superfabric/shared";
 import {
+  agentSlots,
+  beaconHeight,
   buildingSize,
   ISO_CAMERA_POSITION,
   ISO_ZOOM,
   ISO_ZOOM_MAX,
   ISO_ZOOM_MIN,
   isoCameraTarget,
+  labelHeight,
   ringPosition,
+  roofTop,
 } from "../src/scene/layout";
+import { BYPASS_COLOR, STATUS_COLOR, STATUS_EMISSIVE } from "../src/scene/palette";
 
 /**
  * jsdom has no WebGL, so a `<Canvas>` can never be mounted here. What is testable is every piece of
@@ -77,5 +82,75 @@ describe("buildingSize", () => {
     const a = ringPosition(0);
     const b = ringPosition(1);
     expect(Math.hypot(a.x - b.x, a.z - b.z)).toBeGreaterThan(buildingSize("room").width);
+  });
+});
+
+describe("what stacks above a building", () => {
+  it("puts the beacon clear of the roof and the label clear of the beacon", () => {
+    for (const kind of ["project", "room"] as const) {
+      expect(roofTop(kind)).toBeGreaterThan(buildingSize(kind).height);
+      expect(beaconHeight(kind)).toBeGreaterThan(roofTop(kind));
+      expect(labelHeight(kind)).toBeGreaterThan(beaconHeight(kind));
+    }
+  });
+
+  it("stacks the project block's furniture higher than a workshop's", () => {
+    expect(beaconHeight("project")).toBeGreaterThan(beaconHeight("room"));
+    expect(labelHeight("project")).toBeGreaterThan(labelHeight("room"));
+  });
+});
+
+describe("agentSlots", () => {
+  it("places nobody for an empty room", () => {
+    expect(agentSlots(0, "room")).toEqual([]);
+  });
+
+  it("stands a lone agent on the camera-facing diagonal", () => {
+    const [[x, z]] = agentSlots(1, "room");
+    expect(x).toBeCloseTo(z, 3);
+    expect(x).toBeGreaterThan(0);
+  });
+
+  it("gives every agent its own spot, all in front of the building", () => {
+    for (const count of [2, 3, 5, 8]) {
+      const slots = agentSlots(count, "room");
+      expect(slots).toHaveLength(count);
+      expect(new Set(slots.map((s) => s.join(","))).size).toBe(count);
+      // "in front" means the +x/+z half of the floor: nobody hides behind the block
+      for (const [x, z] of slots) expect(x + z).toBeGreaterThan(0);
+    }
+  });
+
+  it("stands them outside the building's own footprint", () => {
+    for (const kind of ["project", "room"] as const) {
+      const half = buildingSize(kind).width / 2;
+      for (const [x, z] of agentSlots(4, kind)) {
+        expect(Math.max(Math.abs(x), Math.abs(z))).toBeGreaterThan(half);
+      }
+    }
+  });
+
+  it("pushes the arc further out for the bigger project block", () => {
+    const [[rx, rz]] = agentSlots(1, "room");
+    const [[px, pz]] = agentSlots(1, "project");
+    expect(Math.hypot(px, pz)).toBeGreaterThan(Math.hypot(rx, rz));
+  });
+});
+
+describe("the status palette", () => {
+  it("gives the four statuses four distinguishable colours", () => {
+    const colors = Object.values(STATUS_COLOR);
+    expect(colors).toHaveLength(4);
+    expect(new Set(colors).size).toBe(4);
+    // the two an operator must never confuse: "answer me" and "I failed"
+    expect(STATUS_COLOR.blocked).not.toBe(STATUS_COLOR.error);
+    // and the bypass marker must not collide with any of them
+    expect(colors).not.toContain(BYPASS_COLOR);
+  });
+
+  it("keeps idle quiet and everything that wants attention bright", () => {
+    expect(STATUS_EMISSIVE.idle).toBeLessThan(STATUS_EMISSIVE.working);
+    expect(STATUS_EMISSIVE.blocked).toBeGreaterThanOrEqual(STATUS_EMISSIVE.working);
+    expect(STATUS_EMISSIVE.error).toBeGreaterThanOrEqual(STATUS_EMISSIVE.working);
   });
 });

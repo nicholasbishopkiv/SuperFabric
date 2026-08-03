@@ -42,3 +42,46 @@ export function isoCameraTarget(rooms: readonly Pick<RoomInfo, "position">[]): [
 export function buildingSize(kind: RoomInfo["kind"]): { width: number; height: number } {
   return kind === "project" ? { width: 6, height: 5 } : { width: 4, height: 3 };
 }
+
+/** The project block's pitched roof: a 4-sided cone this tall, sitting on top of the box. */
+export const PROJECT_ROOF_HEIGHT = 2;
+/** A workshop's flat roof: a thin slab with a slight overhang. */
+export const ROOM_ROOF_THICKNESS = 0.3;
+
+/** The highest point of a building's roof — everything stacked above it starts from here. */
+export function roofTop(kind: RoomInfo["kind"]): number {
+  const { height } = buildingSize(kind);
+  return height + (kind === "project" ? PROJECT_ROOF_HEIGHT : ROOM_ROOF_THICKNESS);
+}
+
+/** Where a room's status beacon floats: clear of the roof, below the label. */
+export function beaconHeight(kind: RoomInfo["kind"]): number {
+  return roofTop(kind) + 0.9;
+}
+
+/** Where a building's name label sits: above the beacon, so the two never overlap. */
+export function labelHeight(kind: RoomInfo["kind"]): number {
+  return beaconHeight(kind) + 1.4;
+}
+
+/**
+ * Where each of a room's agents stands: on a short arc in *front* of the building, meaning the
+ * +x/+z corner, which is the one the fixed isometric camera looks at. One agent stands in the
+ * middle; more fan out around it, and the arc widens with the crowd so eight agents still read as
+ * eight figures rather than one blob.
+ *
+ * Pure and exported so it is testable — `Agents` only places what this returns.
+ */
+export function agentSlots(count: number, kind: RoomInfo["kind"]): [x: number, z: number][] {
+  if (count <= 0) return [];
+  const { width } = buildingSize(kind);
+  const radius = width * 0.5 + 1.3;
+  // The arc is centred on the camera-facing diagonal and spans up to ~120°.
+  const centre = Math.PI / 4;
+  const spread = Math.min(0.42 * (count - 1), (2 * Math.PI) / 3);
+  const round = (v: number) => Math.round(v * 1000) / 1000;
+  return Array.from({ length: count }, (_, i) => {
+    const angle = centre + (count === 1 ? 0 : spread * (i / (count - 1) - 0.5));
+    return [round(radius * Math.cos(angle)), round(radius * Math.sin(angle))];
+  });
+}

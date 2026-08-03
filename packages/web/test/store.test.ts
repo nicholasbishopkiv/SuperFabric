@@ -1,6 +1,6 @@
 import type { RoomInfo, SessionInfo } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
-import { hasMotion, initialFabricState, liveAgentCount, useFabric } from "../src/store";
+import { agentStatus, hasMotion, initialFabricState, liveAgentCount, useFabric } from "../src/store";
 
 const apply = (msg: Parameters<ReturnType<typeof useFabric.getState>["apply"]>[0]) =>
   useFabric.getState().apply(msg);
@@ -9,7 +9,7 @@ beforeEach(() => {
   useFabric.setState({
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
-    selectedRoomId: null,
+    selectedRoomId: null, roomStatus: {},
   });
 });
 
@@ -256,6 +256,116 @@ describe("rooms", () => {
     useFabric.getState().selectRoom("r1");
     apply({ kind: "rooms", rooms: [project, room({ agentCount: 1 }), room({ id: "r2", name: "web" })] });
     expect(useFabric.getState().selectedRoomId).toBe("r1");
+  });
+});
+
+describe("agentStatus", () => {
+  it("collapses the six session statuses onto the four the floor paints", () => {
+    expect(agentStatus(session({ status: "idle" }))).toBe("idle");
+    expect(agentStatus(session({ status: "paused" }))).toBe("idle");
+    expect(agentStatus(session({ status: "done" }))).toBe("idle");
+    expect(agentStatus(session({ status: "working" }))).toBe("working");
+    expect(agentStatus(session({ status: "error" }))).toBe("error");
+  });
+
+  it("reads a starting agent as working, the way the beacon paints it", () => {
+    // `hasMotion` deliberately disagrees: see its doc comment. Colour and frameloop are not the
+    // same question — a spawned-but-unprompted agent looks busy and must not pin the frameloop.
+    expect(agentStatus(session({ status: "starting" }))).toBe("working");
+  });
+
+  it("puts blocked above working and error above blocked", () => {
+    expect(agentStatus(session({ status: "working", blocked: true }))).toBe("blocked");
+    expect(agentStatus(session({ status: "idle", blocked: true }))).toBe("blocked");
+    expect(agentStatus(session({ status: "error", blocked: true }))).toBe("error");
+  });
+});
+
+describe("roomStatus", () => {
+  const project = room({ id: "p", name: "fabrica", path: "/p", kind: "project", position: { x: 0, z: 0 } });
+  const floor = [project, room({ id: "r1" }), room({ id: "r2", name: "web" })];
+
+  /** Apply a floor and a session list, then read the derived status of one room. */
+  function statusOf(sessions: SessionInfo[], roomId: string) {
+    apply({ kind: "rooms", rooms: floor });
+    apply({ kind: "sessions", sessions });
+    return useFabric.getState().roomStatus[roomId];
+  }
+
+  it("is idle for a room with no sessions at all", () => {
+    expect(statusOf([], "r1")).toBe("idle");
+    expect(statusOf([session({ roomId: "r2", status: "working" })], "r1")).toBe("idle");
+  });
+
+  it("is working while any session in the room is working or starting", () => {
+    expect(statusOf([session({ roomId: "r1", status: "working" })], "r1")).toBe("working");
+    expect(statusOf([session({ roomId: "r1", status: "starting" })], "r1")).toBe("working");
+  });
+
+  it("is blocked while any session in the room holds an unresolved approval", () => {
+    expect(statusOf([session({ roomId: "r1", status: "idle", blocked: true })], "r1")).toBe("blocked");
+  });
+
+  it("prefers blocked over a working sibling", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1", status: "working" }),
+      session({ id: "b", roomId: "r1", status: "idle", blocked: true }),
+    ];
+    expect(statusOf(sessions, "r1")).toBe("blocked");
+  });
+
+  it("prefers error over everything else in the room", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1", status: "working" }),
+      session({ id: "b", roomId: "r1", blocked: true }),
+      session({ id: "c", roomId: "r1", status: "error" }),
+    ];
+    expect(statusOf(sessions, "r1")).toBe("error");
+  });
+
+  it("clears blocked once the approval is resolved", () => {
+    apply({ kind: "rooms", rooms: floor });
+    apply({ kind: "sessions", sessions: [session({ roomId: "r1", status: "working", blocked: true })] });
+    expect(useFabric.getState().roomStatus["r1"]).toBe("blocked");
+
+    // the server answers `blocked: false` on the next broadcast after the operator allowed it
+    apply({ kind: "sessions", sessions: [session({ roomId: "r1", status: "working", blocked: false })] });
+    expect(useFabric.getState().roomStatus["r1"]).toBe("working");
+  });
+
+  it("gives a roomless session's status to no room", () => {
+    apply({ kind: "rooms", rooms: floor });
+    apply({ kind: "sessions", sessions: [session({ roomId: null, status: "error", blocked: true })] });
+    expect(useFabric.getState().roomStatus).toEqual({ p: "idle", r1: "idle", r2: "idle" });
+  });
+
+  it("keeps each room's status independent", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1", status: "working" }),
+      session({ id: "b", roomId: "r2", status: "error" }),
+    ];
+    apply({ kind: "rooms", rooms: floor });
+    apply({ kind: "sessions", sessions });
+    expect(useFabric.getState().roomStatus).toEqual({ p: "idle", r1: "working", r2: "error" });
+  });
+
+  it("gains an entry for a room that appears after the sessions did", () => {
+    apply({ kind: "sessions", sessions: [session({ roomId: "r1", status: "working" })] });
+    apply({ kind: "rooms", rooms: floor });
+    expect(useFabric.getState().roomStatus["r1"]).toBe("working");
+  });
+
+  it("keeps the map's identity when a session churns without changing any room's status", () => {
+    apply({ kind: "rooms", rooms: floor });
+    apply({ kind: "sessions", sessions: [session({ roomId: "r1", status: "working" })] });
+    const before = useFabric.getState().roomStatus;
+
+    apply({
+      kind: "sessions",
+      sessions: [session({ roomId: "r1", status: "working", claudeSessionId: "c1", lastSeq: 9 })],
+    });
+
+    expect(useFabric.getState().roomStatus).toBe(before);
   });
 });
 

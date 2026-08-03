@@ -6,6 +6,23 @@ export interface EventRow {
   event: SessionEvent;
 }
 
+/**
+ * The four states the factory floor paints, for a room and for a single agent alike. This is a
+ * deliberate collapse of the six `SessionStatus` values onto what an operator has to *do*:
+ *
+ * - `idle` — nothing to do.
+ * - `working` — something is happening; leave it alone.
+ * - `blocked` — an approval is waiting for **you**.
+ * - `error` — something failed and will not un-fail on its own.
+ *
+ * `paused` and `done` read as `idle` (nothing is moving), `starting` reads as `working` (it looks
+ * busy). The colours live in `scene/palette.ts` and are keyed by exactly this type.
+ */
+export type FactoryStatus = "idle" | "working" | "blocked" | "error";
+
+/** Precedence: a room shows the most demanding state any of its agents is in. */
+const STATUS_RANK: Record<FactoryStatus, number> = { idle: 0, working: 1, blocked: 2, error: 3 };
+
 export interface FabricState {
   sessions: SessionInfo[];
   /** The factory floor: the project building first, then one workshop per room. */
@@ -19,6 +36,13 @@ export interface FabricState {
   roomIds: string[];
   /** The building the operator clicked, shared by the scene and (from Task 9) the room panel. */
   selectedRoomId: string | null;
+  /**
+   * roomId -> what that room's beacon shows. Derived from `sessions` (which already carry the
+   * server-derived `status` and `blocked`), never from replayed events: the log is the source of
+   * truth, but the server has already folded it down for us and every attached socket gets the
+   * result. Every room on the floor has an entry, so an empty room is explicitly `idle`.
+   */
+  roomStatus: Record<string, FactoryStatus>;
   /** sessionId -> events in seq order */
   events: Record<string, EventRow[]>;
   /** sessionId -> highest seq applied (may sit above a gap) */
@@ -43,6 +67,7 @@ export const initialFabricState = {
   rooms: [] as RoomInfo[],
   roomIds: [] as string[],
   selectedRoomId: null as string | null,
+  roomStatus: {} as Record<string, FactoryStatus>,
   events: {} as Record<string, EventRow[]>,
   lastSeq: {} as Record<string, number>,
   contiguousSeq: {} as Record<string, number>,
@@ -69,6 +94,59 @@ function sameRoom(a: RoomInfo, b: RoomInfo): boolean {
     && a.position.x === b.position.x && a.position.z === b.position.z;
 }
 
+/** Every field a figure or a beacon draws from. */
+function sameSession(a: SessionInfo, b: SessionInfo): boolean {
+  return a.state === b.state && a.status === b.status && a.blocked === b.blocked
+    && a.autonomy === b.autonomy && a.roomId === b.roomId
+    && a.claudeSessionId === b.claudeSessionId && a.lastSeq === b.lastSeq;
+}
+
+/**
+ * What one agent's figure shows. Per session, not per room: two agents in the same room routinely
+ * disagree, and the whole point of a figure each is that you can see which one is stuck.
+ */
+export function agentStatus(session: Pick<SessionInfo, "status" | "blocked">): FactoryStatus {
+  if (session.status === "error") return "error";
+  if (session.blocked) return "blocked";
+  if (session.status === "working" || session.status === "starting") return "working";
+  return "idle";
+}
+
+/**
+ * The beacon state of every room on the floor: `idle` unless one of its agents says otherwise, and
+ * the most demanding of those when several do (`error` > `blocked` > `working` > `idle`). Sessions
+ * with `roomId: null` belong to no room and contribute to none.
+ */
+export function roomStatusMap(
+  rooms: readonly Pick<RoomInfo, "id">[],
+  sessions: readonly SessionInfo[],
+): Record<string, FactoryStatus> {
+  const map: Record<string, FactoryStatus> = {};
+  for (const room of rooms) map[room.id] = "idle";
+  for (const session of sessions) {
+    const roomId = session.roomId;
+    // An unknown room id is a session in a room this client has not been told about yet; the
+    // `rooms` message that introduces it recomputes the whole map, so nothing is lost by skipping.
+    if (roomId === null || map[roomId] === undefined) continue;
+    const next = agentStatus(session);
+    if (STATUS_RANK[next] > STATUS_RANK[map[roomId]]) map[roomId] = next;
+  }
+  return map;
+}
+
+/** Keeps the previous map when nothing about it changed, so a beacon does not re-render for free. */
+function nextRoomStatus(
+  previous: Record<string, FactoryStatus>,
+  rooms: readonly Pick<RoomInfo, "id">[],
+  sessions: readonly SessionInfo[],
+): Record<string, FactoryStatus> {
+  const map = roomStatusMap(rooms, sessions);
+  const keys = Object.keys(map);
+  const unchanged = keys.length === Object.keys(previous).length
+    && keys.every((id) => previous[id] === map[id]);
+  return unchanged ? previous : map;
+}
+
 /**
  * The server sends the whole room list on every change, so applying it naively would hand every
  * building a brand-new object and re-render the entire floor because one room moved. Unchanged rows
@@ -90,7 +168,23 @@ function applyRooms(s: FabricState, incoming: RoomInfo[]): Partial<FabricState> 
     roomIds: idsUnchanged ? s.roomIds : ids,
     // A room that is gone cannot stay selected, or the panel would describe nothing.
     selectedRoomId: s.selectedRoomId !== null && !ids.includes(s.selectedRoomId) ? null : s.selectedRoomId,
+    roomStatus: nextRoomStatus(s.roomStatus, rooms, s.sessions),
   };
+}
+
+/**
+ * Same trick as `applyRooms`, for the same reason: the session list is rebroadcast whole (debounced
+ * to 250 ms) and a figure must not re-render because a *sibling* agent produced a token. Unchanged
+ * rows keep their identity, which is what makes `useRoomAgents`' shallow comparison bite.
+ */
+function applySessions(s: FabricState, incoming: SessionInfo[]): Partial<FabricState> | FabricState {
+  const previous = new Map(s.sessions.map((x) => [x.id, x]));
+  const sessions = incoming.map((x) => {
+    const prev = previous.get(x.id);
+    return prev !== undefined && sameSession(prev, x) ? prev : x;
+  });
+  if (sessions.length === s.sessions.length && sessions.every((x, i) => x === s.sessions[i])) return s;
+  return { sessions, roomStatus: nextRoomStatus(s.roomStatus, s.rooms, sessions) };
 }
 
 export const useFabric = create<FabricState>((set) => ({
@@ -98,7 +192,7 @@ export const useFabric = create<FabricState>((set) => ({
 
   apply: (msg) =>
     set((s) => {
-      if (msg.kind === "sessions") return { sessions: msg.sessions };
+      if (msg.kind === "sessions") return applySessions(s, msg.sessions);
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
       if (msg.kind === "error") return { lastError: msg.message };
       if (msg.kind !== "event") return s;
@@ -159,6 +253,13 @@ export function liveAgentCount(sessions: readonly SessionInfo[], roomId: string)
 
 export const useRoomAgentCount = (roomId: string): number =>
   useFabric((s) => liveAgentCount(s.sessions, roomId));
+
+/**
+ * What this room's beacon shows. Returns a string, so a subscriber only re-renders when *this*
+ * room's status actually changed — the map's identity churning is invisible here.
+ */
+export const useRoomStatus = (roomId: string): FactoryStatus =>
+  useFabric((s) => s.roomStatus[roomId] ?? "idle");
 
 /**
  * Whether anything in the scene needs animating. The canvas runs `frameloop="demand"` and only
