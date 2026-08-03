@@ -1,21 +1,292 @@
-import { useEffect } from "react";
+import type { SessionEvent } from "@superfabric/shared";
+import { useEffect, useRef, useState } from "react";
+import type { EventRow } from "./store";
 import { useFabric } from "./store";
-import { connect } from "./wsClient";
+import { connect, send, subscribe } from "./wsClient";
 
-// Placeholder shell: the M0 console lands in Task 13.
+type ApprovalRequest = Extract<SessionEvent, { type: "approval_request" }>;
+
+const C = {
+  dim: "#7a7a7a",
+  text: "#1c1c1c",
+  err: "#c0392b",
+  line: "#d8d8d8",
+  card: "#e08a00",
+};
+
 export default function App() {
-  const connected = useFabric((s) => s.connected);
   const sessions = useFabric((s) => s.sessions);
+  const events = useFabric((s) => s.events);
+  const connected = useFabric((s) => s.connected);
+  const lastError = useFabric((s) => s.lastError);
+
+  const [active, setActive] = useState<string | null>(null);
+  const [input, setInput] = useState("");
+  const knownIds = useRef(new Set<string>());
+  const wantNewest = useRef(false);
+  const transcriptRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     connect();
   }, []);
 
+  function select(sessionId: string): void {
+    setActive(sessionId);
+    subscribe(sessionId);
+  }
+
+  // Follow a session as soon as we learn about one: the freshly created one if the user just
+  // pressed "New session", otherwise the newest known session when nothing is selected yet.
+  useEffect(() => {
+    const fresh = sessions.filter((s) => !knownIds.current.has(s.id));
+    for (const s of sessions) knownIds.current.add(s.id);
+    const newest = fresh.at(-1);
+    if (wantNewest.current && newest) {
+      wantNewest.current = false;
+      select(newest.id);
+      return;
+    }
+    if (sessions.length === 0) return;
+    // Also re-point at the newest session if the selected one is gone from the server's list.
+    if (active === null || !sessions.some((s) => s.id === active)) select(sessions[sessions.length - 1].id);
+  }, [sessions, active]);
+
+  const rows: EventRow[] = active !== null ? (events[active] ?? []) : [];
+
+  // An approval is pending until an approval_resolved with the same id shows up.
+  const resolutions = new Map<string, "allow" | "deny">();
+  for (const { event } of rows) {
+    if (event.type === "approval_resolved") resolutions.set(event.approvalId, event.behavior);
+  }
+  const pendingCount = rows.filter(
+    (r) => r.event.type === "approval_request" && !resolutions.has(r.event.approvalId),
+  ).length;
+
+  useEffect(() => {
+    const el = transcriptRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [rows.length, pendingCount]);
+
+  function answer(approvalId: string, behavior: "allow" | "deny"): void {
+    if (active === null) return;
+    send({ kind: "approval", sessionId: active, approvalId, behavior });
+  }
+
+  function submitPrompt(e: React.FormEvent): void {
+    e.preventDefault();
+    const text = input.trim();
+    if (active === null || text === "") return;
+    send({ kind: "prompt", sessionId: active, text });
+    setInput("");
+  }
+
+  const canSend = connected && active !== null;
+
   return (
-    <div style={{ fontFamily: "system-ui", padding: "2rem" }}>
-      <h1>SuperFabric — M0 console</h1>
-      <p>{connected ? "connected" : "reconnecting…"}</p>
-      <p>{sessions.length} session(s)</p>
+    <div
+      style={{
+        fontFamily: "system-ui, sans-serif",
+        fontSize: 14,
+        color: C.text,
+        maxWidth: 760,
+        margin: "2rem auto",
+        padding: "0 1rem",
+      }}
+    >
+      <h1 style={{ fontSize: 20, margin: "0 0 4px" }}>SuperFabric — M0 console</h1>
+      <div style={{ color: connected ? C.dim : C.err, marginBottom: 12 }}>
+        {connected ? "● connected" : "○ reconnecting…"}
+        {lastError !== null && <span style={{ color: C.err }}> · server error: {lastError}</span>}
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginBottom: 12 }}>
+        <button
+          onClick={() => {
+            wantNewest.current = true;
+            send({ kind: "create_session" });
+          }}
+          disabled={!connected}
+        >
+          New session
+        </button>
+        {sessions.map((s) => (
+          <button
+            key={s.id}
+            onClick={() => select(s.id)}
+            title={s.id}
+            style={{ fontWeight: s.id === active ? 700 : 400 }}
+          >
+            {s.id.slice(0, 8)} [{s.state}]
+          </button>
+        ))}
+        <span style={{ flex: 1 }} />
+        <button
+          onClick={() => active !== null && send({ kind: "interrupt", sessionId: active })}
+          disabled={!canSend}
+        >
+          Interrupt
+        </button>
+      </div>
+
+      <div
+        ref={transcriptRef}
+        style={{
+          border: `1px solid ${C.line}`,
+          borderRadius: 4,
+          padding: 12,
+          height: 420,
+          overflowY: "auto",
+          background: "#fff",
+        }}
+      >
+        {rows.length === 0 && (
+          <div style={{ color: C.dim }}>
+            {active === null ? "No session selected — create one." : "No events yet."}
+          </div>
+        )}
+        {rows.map(({ seq, event }) => (
+          <Entry key={seq} event={event} resolutions={resolutions} onAnswer={answer} />
+        ))}
+      </div>
+
+      <form onSubmit={submitPrompt} style={{ display: "flex", gap: 6, marginTop: 12 }}>
+        <input
+          name="prompt"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder={active === null ? "Create a session first…" : "Message the agent…"}
+          style={{ flex: 1, padding: "6px 8px", font: "inherit" }}
+        />
+        <button type="submit" disabled={!canSend}>
+          Send
+        </button>
+      </form>
     </div>
   );
+}
+
+function Entry({
+  event,
+  resolutions,
+  onAnswer,
+}: {
+  event: SessionEvent;
+  resolutions: Map<string, "allow" | "deny">;
+  onAnswer: (approvalId: string, behavior: "allow" | "deny") => void;
+}) {
+  switch (event.type) {
+    case "user_prompt":
+      return (
+        <p style={{ margin: "6px 0", whiteSpace: "pre-wrap" }}>
+          <b>you:</b> {event.text}
+        </p>
+      );
+    case "agent_text":
+      return (
+        <p style={{ margin: "6px 0", whiteSpace: "pre-wrap" }}>
+          <b>agent:</b> {event.text}
+        </p>
+      );
+    case "agent_thinking":
+      return <p style={{ margin: "4px 0", color: C.dim, fontStyle: "italic" }}>thinking…</p>;
+    case "tool_use":
+      return (
+        <p style={{ margin: "4px 0", color: C.dim }}>
+          ⚙ {event.toolName} <span>{summarize(event.input)}</span>
+        </p>
+      );
+    case "tool_result":
+      return (
+        <p style={{ margin: "4px 0", color: event.isError === true ? C.err : C.dim }}>
+          ↳ {event.toolName}
+          {event.output !== undefined && event.output !== "" ? `: ${truncate(event.output, 200)}` : ""}
+        </p>
+      );
+    case "session_status":
+      return (
+        <p style={{ margin: "4px 0", color: C.dim }}>
+          · {event.status}
+          {event.detail !== undefined ? ` — ${event.detail}` : ""}
+        </p>
+      );
+    case "turn_complete":
+      return (
+        <p style={{ margin: "4px 0", color: C.dim }}>
+          · turn complete{event.costUsd !== undefined ? ` · $${event.costUsd.toFixed(4)}` : ""}
+        </p>
+      );
+    case "session_error":
+      return <p style={{ margin: "6px 0", color: C.err }}>✖ {event.message}</p>;
+    case "approval_request": {
+      const behavior = resolutions.get(event.approvalId);
+      if (behavior !== undefined) {
+        return (
+          <p style={{ margin: "4px 0", color: C.dim }}>
+            ⚑ {event.toolName} — {behavior === "allow" ? "allowed" : "denied"}
+          </p>
+        );
+      }
+      return <ApprovalCard request={event} onAnswer={onAnswer} />;
+    }
+    // approval_resolved is rendered as part of its request line above.
+    case "approval_resolved":
+      return null;
+  }
+}
+
+function ApprovalCard({
+  request,
+  onAnswer,
+}: {
+  request: ApprovalRequest;
+  onAnswer: (approvalId: string, behavior: "allow" | "deny") => void;
+}) {
+  return (
+    <div
+      style={{
+        border: `2px solid ${C.card}`,
+        borderRadius: 4,
+        padding: 8,
+        margin: "8px 0",
+        background: "#fff8ec",
+      }}
+    >
+      <div style={{ marginBottom: 6 }}>
+        <b>Approve {request.toolName}?</b>
+      </div>
+      <pre
+        style={{
+          margin: "0 0 8px",
+          padding: 6,
+          background: "#fff",
+          border: `1px solid ${C.line}`,
+          borderRadius: 3,
+          maxHeight: 160,
+          overflow: "auto",
+          fontSize: 12,
+          whiteSpace: "pre-wrap",
+        }}
+      >
+        {JSON.stringify(request.input, null, 2)}
+      </pre>
+      <button onClick={() => onAnswer(request.approvalId, "allow")}>Allow</button>{" "}
+      <button onClick={() => onAnswer(request.approvalId, "deny")}>Deny</button>
+    </div>
+  );
+}
+
+/** One-line gist of a tool input, so the transcript stays readable instead of a JSON dump. */
+function summarize(input: unknown): string {
+  if (input === null || typeof input !== "object") return "";
+  const o = input as Record<string, unknown>;
+  for (const key of ["command", "file_path", "path", "pattern", "url", "description"]) {
+    const v = o[key];
+    if (typeof v === "string" && v !== "") return truncate(v, 120);
+  }
+  return truncate(JSON.stringify(o), 120);
+}
+
+function truncate(s: string, max: number): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
