@@ -4,6 +4,7 @@ import Fastify from "fastify";
 import { WebSocketServer, type WebSocket } from "ws";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
+import { RoomManager } from "./roomManager.js";
 import { SessionManager } from "./sessionManager.js";
 import { ClaudeCodeExecutor } from "./executors/claudeCode.js";
 import { isOriginAllowed } from "./origin.js";
@@ -12,10 +13,18 @@ import { WsHub } from "./wsHub.js";
 const dataDir = process.env.SUPERFABRIC_DATA ?? path.join(process.cwd(), ".fabrica");
 mkdirSync(dataDir, { recursive: true });
 
+// The project the factory runs on: rooms are folders under this root, and the central building
+// stands for the root itself.
+const projectRoot = path.resolve(process.env.SUPERFABRIC_PROJECT ?? process.cwd());
+
 const db = openDb(path.join(dataDir, "fabrica.db"));
 const store = new EventStore(db);
-const mgr = new SessionManager(db, store, new ClaudeCodeExecutor());
-const hub = new WsHub(store, mgr);
+const rooms = new RoomManager(db, projectRoot);
+const mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms);
+const hub = new WsHub(store, mgr, rooms);
+
+const projectRoom = rooms.ensureProjectRoom();
+console.log(`project root: ${projectRoot} (project room "${projectRoom.name}", ${rooms.listRooms().length - 1} room(s))`);
 
 const resumed = mgr.resumeAll();
 if (resumed.length > 0) console.log(`resumed sessions: ${resumed.join(", ")}`);

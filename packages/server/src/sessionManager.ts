@@ -3,12 +3,26 @@ import { statSync } from "node:fs";
 import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
+import type { RoomManager } from "./roomManager.js";
 import { AutonomyMode, DEFAULT_AUTONOMY, type SessionInfo } from "@superfabric/shared";
 
 /** A tool call waiting on an operator decision, bound to the session that asked. */
 interface PendingApproval {
   sessionId: string;
   resolve: (behavior: "allow" | "deny") => void;
+}
+
+/**
+ * What a new agent needs. An options object rather than positional arguments because `roomId` and
+ * `cwd` answer the same question — where the agent works — and a caller must be able to give either
+ * without knowing about the other.
+ */
+export interface CreateSessionOptions {
+  /** Working directory. Ignored when `roomId` is given: a room's folder is its agents' cwd. */
+  cwd?: string;
+  /** The room to work in. Its folder becomes the cwd. Unknown ids are rejected. */
+  roomId?: string;
+  autonomy?: AutonomyMode;
 }
 
 export class SessionManager {
@@ -23,9 +37,9 @@ export class SessionManager {
   private stopping = false;
   private readonly stmts;
 
-  constructor(private db: Db, private store: EventStore, private executor: Executor) {
+  constructor(private db: Db, private store: EventStore, private executor: Executor, private rooms: RoomManager) {
     this.stmts = {
-      insertSession: db.prepare("INSERT INTO sessions (id, cwd, autonomy) VALUES (?, ?, ?)"),
+      insertSession: db.prepare("INSERT INTO sessions (id, cwd, autonomy, room_id) VALUES (?, ?, ?, ?)"),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
       activeSessions: db.prepare("SELECT id, cwd, claude_session_id, autonomy FROM sessions WHERE state = 'active'"),
       markError: db.prepare("UPDATE sessions SET state = 'error' WHERE id = ? AND state = 'active'"),
@@ -34,14 +48,30 @@ export class SessionManager {
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
       listSessions: db.prepare(`
         SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
-               s.autonomy AS autonomy, COALESCE(MAX(e.seq), 0) AS last_seq
+               s.autonomy AS autonomy, s.room_id AS room_id, COALESCE(MAX(e.seq), 0) AS last_seq
         FROM sessions s LEFT JOIN events e ON e.session_id = s.id
         GROUP BY s.id ORDER BY s.created_at
       `),
     };
   }
 
-  createSession(cwd: string, autonomy: AutonomyMode = DEFAULT_AUTONOMY): string {
+  /**
+   * Start an agent. In a room, the room's folder is the cwd — that is what "room = folder" means for
+   * the agent working there — so an unknown `roomId` is refused rather than quietly falling back to
+   * some other directory.
+   */
+  createSession(opts: CreateSessionOptions = {}): string {
+    const autonomy = opts.autonomy ?? DEFAULT_AUTONOMY;
+    let roomId: string | null = null;
+    let cwd = opts.cwd ?? process.cwd();
+
+    if (opts.roomId !== undefined) {
+      const room = this.rooms.getRoom(opts.roomId);
+      if (room === undefined) throw new Error(`unknown room ${opts.roomId}`);
+      roomId = room.id;
+      cwd = room.path;
+    }
+
     // `cwd` comes straight off the wire. An unchecked value is persisted forever and makes the
     // executor fail obscurely on this boot and every boot after it, so validate it here.
     let isDir = false;
@@ -50,7 +80,7 @@ export class SessionManager {
     if (!isDir) throw new Error(`cwd is not a directory: ${cwd}`);
 
     const id = randomUUID();
-    this.stmts.insertSession.run(id, cwd, autonomy);
+    this.stmts.insertSession.run(id, cwd, autonomy, roomId);
     this.startExecutor(id, cwd, null, autonomy);
     return id;
   }
@@ -219,15 +249,14 @@ export class SessionManager {
   listSessions(): SessionInfo[] {
     return (this.stmts.listSessions.all() as {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
-      autonomy: string; last_seq: number;
+      autonomy: string; room_id: string | null; last_seq: number;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
       claudeSessionId: r.claude_session_id,
       lastSeq: r.last_seq,
       autonomy: asAutonomy(r.autonomy),
-      // Sessions gain a real room in migration 3; until then every session is roomless.
-      roomId: null,
+      roomId: r.room_id,
     }));
   }
 }

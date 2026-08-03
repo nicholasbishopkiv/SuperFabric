@@ -1,5 +1,6 @@
 import { ClientMessage, type ServerMessage } from "@superfabric/shared";
 import type { EventStore } from "./eventStore.js";
+import type { RoomManager } from "./roomManager.js";
 import type { SessionManager } from "./sessionManager.js";
 
 export interface SocketLike { send(data: string): void; }
@@ -8,7 +9,7 @@ export class WsHub {
   /** socket -> subscribed sessionIds with last sent seq */
   private subs = new Map<SocketLike, Map<string, number>>();
 
-  constructor(private store: EventStore, private mgr: SessionManager) {
+  constructor(private store: EventStore, private mgr: SessionManager, private rooms: RoomManager) {
     store.onAppend((sessionId, seq, event) => {
       const msg: ServerMessage = { kind: "event", sessionId, seq, event };
       for (const [sock, sessions] of this.subs) {
@@ -53,9 +54,13 @@ export class WsHub {
           });
           break;
         case "create_session": {
-          // `autonomy` omitted => SessionManager applies the product default ("auto").
-          const id = this.mgr.createSession(msg.cwd ?? process.cwd(), msg.autonomy);
+          // `autonomy` omitted => SessionManager applies the product default ("auto"); a `roomId`
+          // makes the room's folder the cwd, and an unknown one throws into the catch below.
+          const id = this.mgr.createSession({ cwd: msg.cwd, roomId: msg.roomId, autonomy: msg.autonomy });
           this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions() });
+          // The room's agentCount just changed; refresh it in the same round trip so the building's
+          // label never lags behind the agent standing in it.
+          if (msg.roomId !== undefined) this.sendRooms(sock);
           this.subscribe(sock, id, 0); // auto-subscribe the creator from seq 0
           break;
         }
@@ -68,10 +73,26 @@ export class WsHub {
           );
           break;
         case "list_sessions": this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions() }); break;
+        // Rooms: each case answers with the whole room list rather than a delta, so a client can
+        // rebuild the floor from one message and never has to merge. A failure (duplicate name,
+        // unknown id) throws into the catch below and is reported as an error instead.
+        case "create_room":
+          this.rooms.createRoom(msg.name);
+          this.sendRooms(sock);
+          break;
+        case "move_room":
+          this.rooms.moveRoom(msg.roomId, msg.position);
+          this.sendRooms(sock);
+          break;
+        case "list_rooms": this.sendRooms(sock); break;
       }
     } catch (err) {
       this.safeSend(sock, { kind: "error", message: String(err) });
     }
+  }
+
+  private sendRooms(sock: SocketLike): void {
+    this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms() });
   }
 
   /** Replay the log after `afterSeq`, then keep tailing from wherever the replay ended. */

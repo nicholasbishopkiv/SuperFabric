@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
+import { RoomManager } from "../src/roomManager.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
 import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../src/executor.js";
@@ -11,14 +12,15 @@ import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } f
 function make(db = openDb(":memory:")) {
   const store = new EventStore(db);
   const exec = new FakeExecutor();
-  const mgr = new SessionManager(db, store, exec);
-  return { db, store, exec, mgr };
+  const rooms = new RoomManager(db, tmpdir());
+  const mgr = new SessionManager(db, store, exec, rooms);
+  return { db, store, exec, rooms, mgr };
 }
 
 describe("SessionManager", () => {
   it("creates a session, persists it, and logs prompt+reply events", async () => {
     const { store, exec, mgr } = make();
-    const id = mgr.createSession("/tmp");
+    const id = mgr.createSession({ cwd: "/tmp" });
     mgr.prompt(id, "hi");
     await exec.settle();
     const types = store.listAfter(id, 0).map(e => e.event.type);
@@ -31,8 +33,8 @@ describe("SessionManager", () => {
     const db = openDb(":memory:");
     const store = new EventStore(db);
     const exec = new FakeExecutor({ script: [{ tool: "Bash", input: {} }] });
-    const mgr = new SessionManager(db, store, exec);
-    const id = mgr.createSession("/tmp");
+    const mgr = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+    const id = mgr.createSession({ cwd: "/tmp" });
     mgr.prompt(id, "run it");
     // wait until the approval_request event lands in the store
     await vi.waitFor(() => {
@@ -51,11 +53,11 @@ describe("SessionManager", () => {
   it("resumeAll restarts active sessions with the stored provider session id", async () => {
     const db = openDb(":memory:");
     const { mgr, exec, store } = { ...make(db) };
-    const id = mgr.createSession("/tmp");
+    const id = mgr.createSession({ cwd: "/tmp" });
     mgr.prompt(id, "hi");
     await exec.settle();
     // new manager over the same db simulates a server restart
-    const mgr2 = new SessionManager(db, store, exec);
+    const mgr2 = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
     const resumed = mgr2.resumeAll();
     expect(resumed).toEqual([id]);
     mgr2.prompt(id, "again");
@@ -71,8 +73,8 @@ describe("SessionManager", () => {
 
   it("rejects a non-existent cwd instead of persisting a broken session", () => {
     const { mgr, db } = make();
-    expect(() => mgr.createSession("/definitely/not/a/real/path")).toThrow(/does not exist/);
-    expect(() => mgr.createSession(join(tmpdir(), "not-a-dir-file"))).toThrow();
+    expect(() => mgr.createSession({ cwd: "/definitely/not/a/real/path" })).toThrow(/does not exist/);
+    expect(() => mgr.createSession({ cwd: join(tmpdir(), "not-a-dir-file") })).toThrow();
     expect((db.prepare("SELECT COUNT(*) c FROM sessions").get() as { c: number }).c).toBe(0);
   });
 
@@ -80,7 +82,7 @@ describe("SessionManager", () => {
     const { mgr } = make();
     const file = join(mkdtempSync(join(tmpdir(), "superfabric-cwd-")), "f.txt");
     writeFileSync(file, "x");
-    expect(() => mgr.createSession(file)).toThrow(/not a directory/);
+    expect(() => mgr.createSession({ cwd: file })).toThrow(/not a directory/);
   });
 
   // ---- approvals are bound to their session (C3/I3) ----
@@ -90,8 +92,8 @@ describe("SessionManager", () => {
       const db = openDb(":memory:");
       const store = new EventStore(db);
       const exec = new FakeExecutor({ script: [{ tool: "Bash", input: {} }] });
-      const mgr = new SessionManager(db, store, exec);
-      const id = mgr.createSession("/tmp");
+      const mgr = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+      const id = mgr.createSession({ cwd: "/tmp" });
       mgr.prompt(id, "run it");
       await vi.waitFor(() => {
         if (!store.listAfter(id, 0).some(e => e.event.type === "approval_request")) throw new Error("not yet");
@@ -137,7 +139,7 @@ describe("SessionManager", () => {
       const { db, store, exec, id, approvalId } = await withPendingApproval();
       // A fresh manager over the same db: the log still holds approval_request, but the resolver
       // died with the previous process.
-      const revived = new SessionManager(db, store, exec);
+      const revived = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
       revived.resumeAll();
       expect(() => revived.approve(id, approvalId, "allow")).toThrow(/expired with the previous process/);
       const rows = resolutions(store, id);
@@ -163,20 +165,20 @@ describe("SessionManager", () => {
     }
     const db = openDb(":memory:");
     const store = new EventStore(db);
-    const mgr = new SessionManager(db, store, new FailingExecutor());
-    const id = mgr.createSession("/tmp");
+    const mgr = new SessionManager(db, store, new FailingExecutor(), new RoomManager(db, tmpdir()));
+    const id = mgr.createSession({ cwd: "/tmp" });
     expect(mgr.listSessions()[0]).toMatchObject({ id, state: "error" });
     // a fresh manager (server restart) must not re-spawn a known-broken session
-    expect(new SessionManager(db, store, new FailingExecutor()).resumeAll()).toEqual([]);
+    expect(new SessionManager(db, store, new FailingExecutor(), new RoomManager(db, tmpdir())).resumeAll()).toEqual([]);
   });
 
   it("resumeAll reports only the sessions it actually started", async () => {
     const db = openDb(":memory:");
     const { mgr, store, exec } = make(db);
-    const id = mgr.createSession("/tmp");
+    const id = mgr.createSession({ cwd: "/tmp" });
     // the same manager already holds a live handle for it
     expect(mgr.resumeAll()).toEqual([]);
-    const mgr2 = new SessionManager(db, store, exec);
+    const mgr2 = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
     expect(mgr2.resumeAll()).toEqual([id]);
     expect(mgr2.resumeAll()).toEqual([]);
   });
@@ -206,8 +208,8 @@ describe("SessionManager", () => {
     const cwd = mkdtempSync(join(tmpdir(), "superfabric-resume-"));
 
     const exec1 = new RecordingExecutor(providerId);
-    const mgr = new SessionManager(db, store, exec1);
-    const id = mgr.createSession(cwd);
+    const mgr = new SessionManager(db, store, exec1, new RoomManager(db, tmpdir()));
+    const id = mgr.createSession({ cwd });
     expect(exec1.starts).toHaveLength(1);
     expect(exec1.starts[0].cwd).toBe(cwd);
     expect(exec1.starts[0].resumeSessionId ?? null).toBeNull();
@@ -220,7 +222,7 @@ describe("SessionManager", () => {
 
     // restart: a second manager over the same db must hand the stored id back to the executor
     const exec2 = new RecordingExecutor(providerId);
-    const mgr2 = new SessionManager(db, store, exec2);
+    const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
     expect(mgr2.resumeAll()).toEqual([id]);
     expect(exec2.starts).toHaveLength(1);
     expect(exec2.starts[0].resumeSessionId).toBe(providerId);
@@ -251,7 +253,7 @@ describe("SessionManager", () => {
     const setup = (db = openDb(":memory:")) => {
       const store = new EventStore(db);
       const exec = new RecordingExecutor();
-      return { db, store, exec, mgr: new SessionManager(db, store, exec) };
+      return { db, store, exec, mgr: new SessionManager(db, store, exec, new RoomManager(db, tmpdir())) };
     };
 
     const stored = (db: ReturnType<typeof openDb>, id: string) =>
@@ -259,7 +261,7 @@ describe("SessionManager", () => {
 
     it("defaults a new session to auto and passes it to the executor", () => {
       const { db, exec, mgr } = setup();
-      const id = mgr.createSession("/tmp");
+      const id = mgr.createSession({ cwd: "/tmp" });
       expect(stored(db, id)).toBe("auto");
       expect(exec.starts[0].autonomy).toBe("auto");
       expect(mgr.listSessions()[0].autonomy).toBe("auto");
@@ -267,7 +269,7 @@ describe("SessionManager", () => {
 
     it("createSession with bypass persists it and hands it to the executor", () => {
       const { db, exec, mgr } = setup();
-      const id = mgr.createSession("/tmp", "bypass");
+      const id = mgr.createSession({ cwd: "/tmp", autonomy: "bypass" });
       expect(stored(db, id)).toBe("bypass");
       expect(exec.starts).toHaveLength(1);
       expect(exec.starts[0].autonomy).toBe("bypass");
@@ -276,7 +278,7 @@ describe("SessionManager", () => {
 
     it("setAutonomy persists, restarts the live executor with the new mode, and logs it", async () => {
       const { db, store, exec, mgr } = setup();
-      const id = mgr.createSession("/tmp", "auto");
+      const id = mgr.createSession({ cwd: "/tmp", autonomy: "auto" });
       // the provider session id lands asynchronously; the restart must resume from it
       await vi.waitFor(() => {
         const row = db.prepare("SELECT claude_session_id c FROM sessions WHERE id = ?").get(id) as { c: string | null };
@@ -306,7 +308,7 @@ describe("SessionManager", () => {
 
     it("persists without restarting when the session is not live", async () => {
       const { db, store, exec, mgr } = setup();
-      const id = mgr.createSession("/tmp", "auto");
+      const id = mgr.createSession({ cwd: "/tmp", autonomy: "auto" });
       await mgr.stopAll();
       const startsBefore = exec.starts.length;
 
@@ -320,7 +322,7 @@ describe("SessionManager", () => {
 
     it("does not spawn a replacement executor when shutdown starts mid-toggle", async () => {
       const { db, exec, mgr } = setup();
-      const id = mgr.createSession("/tmp", "auto");
+      const id = mgr.createSession({ cwd: "/tmp", autonomy: "auto" });
       // the toggle suspends while stopping the old executor; shutdown begins in the meantime
       const toggling = mgr.setAutonomy(id, "bypass");
       await mgr.stopAll();
@@ -339,12 +341,12 @@ describe("SessionManager", () => {
     it("resumeAll restarts a session with its stored mode, so bypass stays bypass", async () => {
       const db = openDb(":memory:");
       const { store, mgr } = setup(db);
-      const id = mgr.createSession("/tmp", "bypass");
+      const id = mgr.createSession({ cwd: "/tmp", autonomy: "bypass" });
       await mgr.stopAll();
 
       // a second manager over the same db simulates a server restart
       const exec2 = new RecordingExecutor();
-      const mgr2 = new SessionManager(db, store, exec2);
+      const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
       expect(mgr2.resumeAll()).toEqual([id]);
       expect(exec2.starts[0].autonomy).toBe("bypass");
       expect(mgr2.listSessions().find(s => s.id === id)!.autonomy).toBe("bypass");
@@ -353,20 +355,122 @@ describe("SessionManager", () => {
     it("falls back to auto for an unparseable stored mode", () => {
       const db = openDb(":memory:");
       const { store, mgr } = setup(db);
-      const id = mgr.createSession("/tmp", "bypass");
+      const id = mgr.createSession({ cwd: "/tmp", autonomy: "bypass" });
       db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?").run("nonsense", id);
       expect(mgr.listSessions()[0].autonomy).toBe("auto");
       const exec2 = new RecordingExecutor();
-      const mgr2 = new SessionManager(db, store, exec2);
+      const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
       mgr2.resumeAll();
       expect(exec2.starts[0].autonomy).toBe("auto");
+    });
+  });
+
+  // ---- M1a: a session belongs to a room and runs in that room's folder ----
+
+  describe("rooms", () => {
+    /** Records every start() so a test can assert the cwd the executor was handed. */
+    class RecordingExecutor implements Executor {
+      readonly name = "recording";
+      readonly starts: ExecutorStartOptions[] = [];
+      start(opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
+        this.starts.push(opts);
+        ev.onEvent({ type: "session_status", status: "idle" });
+        return {
+          providerSessionId: Promise.resolve("claude-session-room"),
+          send: () => {},
+          interrupt: async () => {},
+          stop: async () => {},
+        };
+      }
+    }
+
+    /** A project root with one real room folder, plus a manager wired to it. */
+    function withRoom<T>(fn: (ctx: {
+      db: ReturnType<typeof openDb>; store: EventStore; exec: RecordingExecutor;
+      rooms: RoomManager; mgr: SessionManager; room: ReturnType<RoomManager["createRoom"]>;
+    }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-session-room-"));
+      const db = openDb(":memory:");
+      try {
+        const store = new EventStore(db);
+        const exec = new RecordingExecutor();
+        const rooms = new RoomManager(db, root);
+        rooms.ensureProjectRoom();
+        const room = rooms.createRoom("backend");
+        return fn({ db, store, exec, rooms, mgr: new SessionManager(db, store, exec, rooms), room });
+      } finally {
+        // The db is in-memory and deliberately left open: a session's providerSessionId lands on a
+        // later microtask, and closing underneath it turns a passing test into a stray rejection.
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    it("persists a session's room and reports it in listSessions", () => {
+      withRoom(({ db, mgr, room }) => {
+        const id = mgr.createSession({ roomId: room.id });
+        expect(db.prepare("SELECT room_id FROM sessions WHERE id = ?").get(id)).toEqual({ room_id: room.id });
+        expect(mgr.listSessions().find((s) => s.id === id)!.roomId).toBe(room.id);
+      });
+    });
+
+    it("leaves a session without a room as roomless", () => {
+      withRoom(({ db, mgr }) => {
+        const id = mgr.createSession({ cwd: tmpdir() });
+        expect(db.prepare("SELECT room_id FROM sessions WHERE id = ?").get(id)).toEqual({ room_id: null });
+        expect(mgr.listSessions().find((s) => s.id === id)!.roomId).toBeNull();
+      });
+    });
+
+    it("runs an agent in a room with that room's folder as its cwd", () => {
+      withRoom(({ exec, mgr, room }) => {
+        mgr.createSession({ roomId: room.id });
+        expect(exec.starts).toHaveLength(1);
+        expect(exec.starts[0].cwd).toBe(room.path);
+      });
+    });
+
+    it("lets the room's folder win over a cwd sent alongside it", () => {
+      withRoom(({ db, exec, mgr, room }) => {
+        const id = mgr.createSession({ cwd: tmpdir(), roomId: room.id });
+        expect(exec.starts[0].cwd).toBe(room.path);
+        // and the stored cwd is the room's too, so a resume comes back in the same folder
+        expect(db.prepare("SELECT cwd FROM sessions WHERE id = ?").get(id)).toEqual({ cwd: room.path });
+      });
+    });
+
+    it("keeps the room across a restart", () => {
+      withRoom(({ db, store, rooms, mgr, room }) => {
+        const id = mgr.createSession({ roomId: room.id });
+        const exec2 = new RecordingExecutor();
+        const revived = new SessionManager(db, store, exec2, rooms);
+        expect(revived.resumeAll()).toEqual([id]);
+        expect(exec2.starts[0].cwd).toBe(room.path);
+        expect(revived.listSessions().find((s) => s.id === id)!.roomId).toBe(room.id);
+      });
+    });
+
+    it("rejects an unknown roomId instead of persisting a session nobody can place", () => {
+      withRoom(({ db, exec, mgr }) => {
+        expect(() => mgr.createSession({ roomId: "nope" })).toThrow(/unknown room/);
+        expect((db.prepare("SELECT COUNT(*) c FROM sessions").get() as { c: number }).c).toBe(0);
+        expect(exec.starts).toHaveLength(0);
+      });
+    });
+
+    it("counts a room's agents once the session exists", () => {
+      withRoom(({ rooms, mgr, room }) => {
+        expect(rooms.listRooms().find((r) => r.id === room.id)!.agentCount).toBe(0);
+        mgr.createSession({ roomId: room.id });
+        mgr.createSession({ roomId: room.id });
+        expect(rooms.listRooms().find((r) => r.id === room.id)!.agentCount).toBe(2);
+      });
     });
   });
 
   describe("stopAll", () => {
     it("stops every live executor; prompt() on a stopped session then throws", async () => {
       const { mgr } = make();
-      const id = mgr.createSession("/tmp");
+      const id = mgr.createSession({ cwd: "/tmp" });
       await mgr.stopAll();
       expect(() => mgr.prompt(id, "hi")).toThrow();
     });
@@ -386,8 +490,8 @@ describe("SessionManager", () => {
       }
       const db = openDb(":memory:");
       const store = new EventStore(db);
-      const mgr = new SessionManager(db, store, new HangingExecutor());
-      const id = mgr.createSession("/tmp");
+      const mgr = new SessionManager(db, store, new HangingExecutor(), new RoomManager(db, tmpdir()));
+      const id = mgr.createSession({ cwd: "/tmp" });
 
       const start = Date.now();
       await mgr.stopAll(50);
@@ -397,7 +501,7 @@ describe("SessionManager", () => {
 
     it("is safe to call twice", async () => {
       const { mgr } = make();
-      mgr.createSession("/tmp");
+      mgr.createSession({ cwd: "/tmp" });
       await mgr.stopAll();
       await expect(mgr.stopAll()).resolves.toBeUndefined();
     });
