@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
 import { FitButton } from "./hud/FitButton";
 import { RoomPanel } from "./hud/RoomPanel";
+import { TaskPanel } from "./hud/TaskPanel";
 import { FactoryScene } from "./scene/FactoryScene";
 import { connect } from "./wsClient";
 
@@ -19,9 +20,11 @@ export default function App() {
   return (
     <>
       <FactoryScene />
-      {/* Two overlays, two edges: rooms on the left, the one-agent console on the right. */}
+      {/* Three overlays, three edges: rooms on the left, the one-agent console on the right, the
+          task board along the bottom between them. The top is left clear on purpose. */}
       <RoomPanel />
       <ConsoleDrawer />
+      <TaskPanel />
       {/* Last, so it paints over the panel's own corner. */}
       <FitButton />
     </>

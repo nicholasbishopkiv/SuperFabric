@@ -6,6 +6,8 @@ import type {
   ServerMessage,
   SessionEvent,
   SessionInfo,
+  TaskInfo,
+  TaskStatus,
 } from "@superfabric/shared";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
@@ -89,6 +91,12 @@ export interface RoomDrag {
   position: ScenePosition;
 }
 
+/** The edges an overlay panel can cover. The top is deliberately free: nothing lives there. */
+export type HudSide = "left" | "right" | "bottom";
+
+/** How much of the canvas each panel covers, in CSS pixels. See `FabricState.hudInsets`. */
+export type HudInsets = Record<HudSide, number>;
+
 /** How long a package takes to cross a belt, unless the caller says otherwise. */
 export const DEFAULT_PACKAGE_MS = 2_400;
 
@@ -115,10 +123,13 @@ export interface FabricState {
    * How many CSS pixels of the canvas each HUD panel covers. The canvas is full-bleed *behind* the
    * overlays, so without this the camera frames the factory in the middle of the viewport and the
    * middle of the viewport is under the console drawer. The panels measure themselves and report it
-   * here (they know their own collapsed/expanded width; the scene must not go reading their DOM),
+   * here (they know their own collapsed/expanded size; the scene must not go reading their DOM),
    * and the camera framing subtracts it.
+   *
+   * Three edges now: the task board owns the bottom one, and it is a *height* where the other two
+   * are widths — which is the whole reason this is a record of sides rather than a pair of numbers.
    */
-  hudInsets: { left: number; right: number };
+  hudInsets: HudInsets;
   /**
    * Bumped by the "fit" control. The camera frames the floor automatically only until the operator
    * pans or zooms — after that the view is theirs — so there has to be one explicit way to ask for
@@ -141,6 +152,8 @@ export interface FabricState {
   conveyors: Conveyor[];
   /** Packages travelling a belt right now. Empty is the normal state. */
   packages: PackageInFlight[];
+  /** The task board, newest first — the server's whole list, rebroadcast on every change. */
+  tasks: TaskInfo[];
   /** Bus messages still queued at their sender, oldest first. See `WaitingMessage`. */
   waiting: WaitingMessage[];
   /**
@@ -181,7 +194,7 @@ export interface FabricState {
   setConnected(connected: boolean): void;
   selectRoom(roomId: string | null): void;
   /** Report how wide one of the overlay panels is right now. A no-op when it has not changed. */
-  setHudInset(side: "left" | "right", px: number): void;
+  setHudInset(side: HudSide, px: number): void;
   /** Ask the camera to frame the whole factory again. */
   requestCameraFit(): void;
   /**
@@ -227,12 +240,13 @@ export const initialFabricState = {
   rooms: [] as RoomInfo[],
   roomIds: [] as string[],
   selectedRoomId: null as string | null,
-  hudInsets: { left: 0, right: 0 } as { left: number; right: number },
+  hudInsets: { left: 0, right: 0, bottom: 0 } as HudInsets,
   fitRequests: 0,
   drag: null as RoomDrag | null,
   roomStatus: {} as Record<string, FactoryStatus>,
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
+  tasks: [] as TaskInfo[],
   waiting: [] as WaitingMessage[],
   animatedMessages: {} as Record<string, true>,
   messagesLoaded: false,
@@ -436,6 +450,28 @@ function applySessions(s: FabricState, incoming: SessionInfo[]): Partial<FabricS
   return { sessions, roomStatus: nextRoomStatus(s.roomStatus, s.rooms, sessions) };
 }
 
+/** Every field a card on the board draws from. */
+function sameTask(a: TaskInfo, b: TaskInfo): boolean {
+  return a.title === b.title && a.detail === b.detail && a.status === b.status
+    && a.roomId === b.roomId && a.agentId === b.agentId
+    && a.blockedOnMessageId === b.blockedOnMessageId && a.updatedAt === b.updatedAt;
+}
+
+/**
+ * Same trick as `applyRooms`/`applySessions`: the board is rebroadcast whole on every change, and an
+ * agent driving `factory_task_update` changes it as fast as it can call a tool. Unchanged cards keep
+ * their identity so one moving task repaints one row.
+ */
+function applyTasks(s: FabricState, incoming: TaskInfo[]): Partial<FabricState> | FabricState {
+  const previous = new Map(s.tasks.map((t) => [t.id, t]));
+  const tasks = incoming.map((t) => {
+    const prev = previous.get(t.id);
+    return prev !== undefined && sameTask(prev, t) ? prev : t;
+  });
+  if (tasks.length === s.tasks.length && tasks.every((t, i) => t === s.tasks[i])) return s;
+  return { tasks };
+}
+
 export const useFabric = create<FabricState>((set, get) => ({
   ...initialFabricState,
 
@@ -446,6 +482,7 @@ export const useFabric = create<FabricState>((set, get) => ({
     set((s) => {
       if (msg.kind === "sessions") return applySessions(s, msg.sessions);
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
+      if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
       if (msg.kind === "error") return { lastError: msg.message };
       if (msg.kind !== "event") return s;
 
@@ -682,8 +719,7 @@ export const useBeltDirections = (roomId: string): number[] =>
 
 export const useSelectedRoomId = (): string | null => useFabric((s) => s.selectedRoomId);
 
-export const useHudInsets = (): { left: number; right: number } =>
-  useFabric(useShallow((s) => s.hudInsets));
+export const useHudInsets = (): HudInsets => useFabric(useShallow((s) => s.hudInsets));
 
 /** Whether *any* building is being dragged. Subscribing to the boolean, not to the moving position. */
 export const useIsDragging = (): boolean => useFabric((s) => s.drag !== null);
@@ -744,6 +780,35 @@ export function roomlessSessions(sessions: readonly SessionInfo[]): SessionInfo[
 
 export const useRoomlessSessions = (): SessionInfo[] =>
   useFabric(useShallow((s) => roomlessSessions(s.sessions)));
+
+// ---- the task board ----
+
+/**
+ * The order the board reads in: what has not started, what is moving, what is stuck, what is up for
+ * review, what is finished. `blocked` sits in the middle rather than at the end because it is the
+ * group the operator is being asked to do something about.
+ */
+export const TASK_STATUS_ORDER: readonly TaskStatus[] = [
+  "open", "in_progress", "blocked", "review", "done",
+];
+
+export const useTasks = (): TaskInfo[] => useFabric((s) => s.tasks);
+
+/** The board grouped for display. Empty groups are kept: an empty column is information. */
+export function tasksByStatus(tasks: readonly TaskInfo[]): { status: TaskStatus; tasks: TaskInfo[] }[] {
+  return TASK_STATUS_ORDER.map((status) => ({ status, tasks: tasks.filter((t) => t.status === status) }));
+}
+
+/**
+ * How many tasks a room still owes. `done` is excluded on purpose: the badge is a workload, and a
+ * room whose every card is finished should read as clear rather than as busy.
+ */
+export function openTaskCount(tasks: readonly TaskInfo[], roomId: string): number {
+  return tasks.filter((t) => t.roomId === roomId && t.status !== "done").length;
+}
+
+export const useRoomTaskCount = (roomId: string): number =>
+  useFabric((s) => openTaskCount(s.tasks, roomId));
 
 /**
  * The bus messages nobody has picked up yet. Deliberately *not* part of `hasMotion`: the marker is

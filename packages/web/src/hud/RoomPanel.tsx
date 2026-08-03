@@ -13,6 +13,7 @@ import {
   useRoomIds,
   useRoomlessSessions,
   useRoomStatus,
+  useRoomTaskCount,
   useSelectedRoomId,
 } from "../store";
 import { send } from "../wsClient";
@@ -71,6 +72,7 @@ function StatusDot({ status, title }: { status: FactoryStatus; title?: string })
 const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
   const room = useRoom(roomId);
   const agents = useRoomAgentCount(roomId);
+  const tasks = useRoomTaskCount(roomId);
   const status = useRoomStatus(roomId);
   const selected = useIsSelected(roomId);
   const selectRoom = useFabric((s) => s.selectRoom);
@@ -105,6 +107,25 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
         </span>
         {room.kind === "project" && <span style={{ color: HUD.dim, fontSize: 12 }}>project</span>}
         <span style={{ flex: 1 }} />
+        {/* Unfinished tasks owned by this room — the same count the board's cards add up to, so the
+            list and the board can never disagree about who owes what. */}
+        {tasks > 0 && (
+          <span
+            title={`${tasks} unfinished task${tasks === 1 ? "" : "s"} on the board`}
+            style={{
+              color: HUD.text,
+              fontSize: 12,
+              lineHeight: "16px",
+              padding: "0 6px",
+              borderRadius: 8,
+              border: `1px solid ${HUD.line}`,
+              background: "#f1f1f1",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {tasks}
+          </span>
+        )}
         <span style={{ color: HUD.dim, fontSize: 12, whiteSpace: "nowrap" }}>
           {agents} agent{agents === 1 ? "" : "s"}
         </span>

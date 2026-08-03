@@ -120,6 +120,7 @@ export function isoFraming(
   viewHeight: number,
   leftInset = 0,
   rightInset = 0,
+  bottomInset = 0,
 ): Framing {
   const target = isoCameraTarget(rooms);
   if (rooms.length === 0) return { zoom: ISO_ZOOM, target };
@@ -145,17 +146,20 @@ export function isoFraming(
   }
 
   const usableWidth = Math.max(1, viewWidth - leftInset - rightInset - 2 * FIT_MARGIN_PX);
-  const usableHeight = Math.max(1, viewHeight - 2 * FIT_MARGIN_PX);
+  const usableHeight = Math.max(1, viewHeight - bottomInset - 2 * FIT_MARGIN_PX);
   const spanX = Math.max(maxX - minX, 0.001);
   const spanY = Math.max(maxY - minY, 0.001);
   const fitted = Math.min(usableWidth / spanX, usableHeight / spanY, ISO_ZOOM);
   const zoom = Math.round(Math.max(ISO_ZOOM_MIN, Math.min(ISO_ZOOM_MAX, fitted)) * 1000) / 1000;
 
-  // Where the usable rectangle's centre sits relative to the canvas's, in screen units.
+  // Where the usable rectangle's centre sits relative to the canvas's, in screen units. Screen +y is
+  // up (see `isoProject`), so a panel along the bottom edge pushes that centre *up* by half its
+  // height, exactly as the left panel pushes it right by half its width.
   const offsetX = (leftInset - rightInset) / 2 / zoom;
+  const offsetY = bottomInset / 2 / zoom;
   const [cx, cy] = isoProject(target[0], 0, target[2]);
   // Pan so the bounding box's centre lands on the usable rectangle's centre.
-  const pan = isoFloorDelta((minX + maxX) / 2 - cx - offsetX, (minY + maxY) / 2 - cy);
+  const pan = isoFloorDelta((minX + maxX) / 2 - cx - offsetX, (minY + maxY) / 2 - cy - offsetY);
   return { zoom, target: [round3(target[0] + pan.x), 0, round3(target[2] + pan.z)] };
 }
 

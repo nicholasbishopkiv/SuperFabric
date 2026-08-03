@@ -250,6 +250,36 @@ describe("isoFraming", () => {
   it("keeps the target on the floor plane", () => {
     expect(isoFraming(floor(5), 1440, 900, 320, 560).target[1]).toBe(0);
   });
+
+  it("keeps every building clear of the task board along the bottom edge", () => {
+    const rooms = floor(8);
+    const bottom = 260;
+    const f = isoFraming(rooms, 1440, 900, 320, 560, bottom);
+    for (const [px, py] of cornersPx(rooms, f)) {
+      // canvas y measured from the top, from a canvas-centre-relative offset (screen +y is up)
+      const y = 900 / 2 - py;
+      expect(y).toBeGreaterThanOrEqual(0);
+      expect(y).toBeLessThanOrEqual(900 - bottom);
+      expect(Math.abs(px)).toBeLessThanOrEqual(1440 / 2);
+    }
+  });
+
+  it("lifts the view when the board opens instead of leaving the factory behind it", () => {
+    const rooms = floor(6);
+    const closed = isoFraming(rooms, 1440, 900, 320, 560);
+    const open = isoFraming(rooms, 1440, 900, 320, 560, 260);
+    // The uncovered strip's centre is higher up the screen, so the factory has to move up with it.
+    expect(isoProject(open.target[0], 0, open.target[2])[1])
+      .toBeLessThan(isoProject(closed.target[0], 0, closed.target[2])[1]);
+    // …and there is less room, so it also pulls back.
+    expect(open.zoom).toBeLessThanOrEqual(closed.zoom);
+  });
+
+  it("survives a board taller than the viewport", () => {
+    const f = isoFraming(floor(6), 600, 400, 0, 0, 900);
+    expect(Number.isFinite(f.zoom)).toBe(true);
+    expect(f.zoom).toBeGreaterThanOrEqual(ISO_ZOOM_MIN);
+  });
 });
 
 describe("camera contract", () => {

@@ -66,7 +66,9 @@ export function CameraFraming() {
 
     // Read positions rather than subscribing to them: see the note about drags above.
     const rooms = useFabric.getState().rooms;
-    const { zoom, target } = isoFraming(rooms, size.width, size.height, insets.left, insets.right);
+    const { zoom, target } = isoFraming(
+      rooms, size.width, size.height, insets.left, insets.right, insets.bottom,
+    );
     camera.zoom = zoom;
     camera.position.set(
       target[0] + ISO_CAMERA_POSITION[0],
@@ -82,7 +84,11 @@ export function CameraFraming() {
     }
     // `frameloop="demand"`: moving a camera outside React's commit renders nothing on its own.
     invalidate();
-  }, [roomIds, size.width, size.height, insets.left, insets.right, fitRequests, camera, controls, invalidate]);
+  }, [
+    roomIds, size.width, size.height,
+    insets.left, insets.right, insets.bottom,
+    fitRequests, camera, controls, invalidate,
+  ]);
 
   return null;
 }

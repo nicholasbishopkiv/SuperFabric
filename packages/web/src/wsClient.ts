@@ -39,6 +39,9 @@ export function connect(): void {
     // The bus's traffic, for the same reason: a message queued for a busy room is drawn on the
     // floor, and this snapshot is the baseline that keeps the belts from replaying old deliveries.
     send({ kind: "list_messages" });
+    // And the board, which is server state like the others: an operator reloading the page must see
+    // what the factory is working on without having to wait for a task to change.
+    send({ kind: "list_tasks" });
     // The server hard-terminates sockets on shutdown, so a reconnect must re-ask for the tail of
     // every session we were following — from the last contiguous seq we hold, not from 0.
     const { contiguousSeq } = useFabric.getState();

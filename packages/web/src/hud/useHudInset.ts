@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import type { HudSide } from "../store";
 import { useFabric } from "../store";
 
 /**
@@ -11,14 +12,19 @@ import { useFabric } from "../store";
  * panels' DOM from inside the scene would couple the floor to the HUD's markup, which is the same
  * mistake in the other direction.
  */
-export function useHudInset<T extends HTMLElement>(side: "left" | "right"): React.RefObject<T | null> {
+export function useHudInset<T extends HTMLElement>(side: HudSide): React.RefObject<T | null> {
   const ref = useRef<T | null>(null);
 
   useEffect(() => {
     const el = ref.current;
     if (el === null) return;
     const { setHudInset } = useFabric.getState();
-    const report = (): void => setHudInset(side, el.getBoundingClientRect().width);
+    // The side decides which dimension covers the canvas: the edge panels are as wide as they are,
+    // the bottom board is as tall as it is.
+    const report = (): void => {
+      const box = el.getBoundingClientRect();
+      setHudInset(side, side === "bottom" ? box.height : box.width);
+    };
     report();
     const observer = new ResizeObserver(report);
     observer.observe(el);

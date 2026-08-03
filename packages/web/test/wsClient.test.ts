@@ -55,11 +55,13 @@ beforeEach(() => { FakeWebSocket.instances = []; });
 afterEach(() => { delete globals.WebSocket; delete globals.location; });
 
 describe("wsClient", () => {
-  it("asks for the whole floor on open: sessions, rooms and the bus's traffic", async () => {
+  it("asks for the whole floor on open: sessions, rooms, bus traffic and the board", async () => {
     const { sock } = await freshClient();
     // The bus's snapshot is part of the floor: a message queued for a busy room is drawn on it, and
     // this answer is the baseline that stops later broadcasts replaying old deliveries as packages.
-    expect(sock.sent.map((m) => m.kind)).toEqual(["list_sessions", "list_rooms", "list_messages"]);
+    // The board is server state too — a reload must not have to wait for a task to change.
+    expect(sock.sent.map((m) => m.kind))
+      .toEqual(["list_sessions", "list_rooms", "list_messages", "list_tasks"]);
   });
 
   it("re-asks for the floor after a reconnect", async () => {

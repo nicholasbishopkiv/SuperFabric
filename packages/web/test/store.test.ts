@@ -1,4 +1,4 @@
-import type { MessageInfo, RoomInfo, SessionInfo } from "@superfabric/shared";
+import type { MessageInfo, RoomInfo, SessionInfo, TaskInfo } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   agentStatus,
@@ -8,9 +8,12 @@ import {
   hasMotion,
   initialFabricState,
   liveAgentCount,
+  openTaskCount,
   roomAgents,
   roomlessSessions,
   roomPosition,
+  TASK_STATUS_ORDER,
+  tasksByStatus,
   useFabric,
 } from "../src/store";
 
@@ -759,6 +762,60 @@ describe("packages", () => {
     const before = useFabric.getState().packages;
     useFabric.getState().reapPackages(Date.now());
     expect(useFabric.getState().packages).toBe(before);
+  });
+});
+
+describe("the task board", () => {
+  const task = (over: Partial<TaskInfo> = {}): TaskInfo => ({
+    id: "t1", title: "Expose a webhook", detail: "", status: "open", roomId: null,
+    agentId: null, blockedOnMessageId: null, createdAt: 1_000, updatedAt: 1_000, ...over,
+  });
+
+  it("takes the whole board from a tasks message", () => {
+    apply({ kind: "tasks", tasks: [task({ id: "t1" }), task({ id: "t2", status: "done" })] });
+    expect(useFabric.getState().tasks.map((t) => t.id)).toEqual(["t1", "t2"]);
+  });
+
+  it("keeps unchanged cards' identity so one moving task repaints one row", () => {
+    apply({ kind: "tasks", tasks: [task({ id: "t1" }), task({ id: "t2" })] });
+    const [first, second] = useFabric.getState().tasks;
+
+    apply({ kind: "tasks", tasks: [task({ id: "t1" }), task({ id: "t2", status: "done", updatedAt: 1_100 })] });
+    const after = useFabric.getState().tasks;
+    expect(after[0]).toBe(first);
+    expect(after[1]).not.toBe(second);
+  });
+
+  it("is a genuine no-op when the rebroadcast changed nothing", () => {
+    apply({ kind: "tasks", tasks: [task()] });
+    const before = useFabric.getState().tasks;
+    apply({ kind: "tasks", tasks: [task()] });
+    expect(useFabric.getState().tasks).toBe(before);
+  });
+
+  it("groups by status in the board's reading order, keeping empty groups", () => {
+    apply({ kind: "tasks", tasks: [
+      task({ id: "a", status: "done" }),
+      task({ id: "b", status: "blocked", blockedOnMessageId: "m1" }),
+      task({ id: "c", status: "blocked" }),
+    ] });
+    const groups = tasksByStatus(useFabric.getState().tasks);
+    expect(groups.map((g) => g.status)).toEqual([...TASK_STATUS_ORDER]);
+    expect(groups.map((g) => g.tasks.map((t) => t.id))).toEqual([[], [], ["b", "c"], [], ["a"]]);
+  });
+
+  it("counts a room's unfinished tasks, and only that room's", () => {
+    const tasks = [
+      task({ id: "a", roomId: "r1" }),
+      task({ id: "b", roomId: "r1", status: "blocked" }),
+      task({ id: "c", roomId: "r1", status: "done" }),
+      task({ id: "d", roomId: "r2" }),
+      task({ id: "e", roomId: null }),
+    ];
+    // `done` is excluded: the badge is a workload, and a room whose cards are all finished is clear.
+    expect(openTaskCount(tasks, "r1")).toBe(2);
+    expect(openTaskCount(tasks, "r2")).toBe(1);
+    expect(openTaskCount(tasks, "nope")).toBe(0);
   });
 });
 
