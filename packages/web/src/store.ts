@@ -98,6 +98,12 @@ export interface FabricState {
   setConnected(connected: boolean): void;
   selectRoom(roomId: string | null): void;
   /**
+   * Forget the last server error. The overlay shows `lastError` next to whatever the operator was
+   * doing when it arrived, so a rejected room name has to stop being shown once they try again —
+   * otherwise the second attempt looks like it failed the same way.
+   */
+  clearError(): void;
+  /**
    * Put a package on the belt between two rooms. **This is the seam the M3 factory bus plugs into**:
    * when a real inter-room message exists, the bus calls this and nothing else on the client changes.
    * Until then the console drawer's manual control is the only caller.
@@ -319,6 +325,8 @@ export const useFabric = create<FabricState>((set, get) => ({
 
   selectRoom: (roomId) => set({ selectedRoomId: roomId }),
 
+  clearError: () => set((s) => (s.lastError === null ? s : { lastError: null })),
+
   sendPackage: (from, to, durationMs = DEFAULT_PACKAGE_MS) => {
     if (from === to) return;
     set((s) => {
@@ -399,6 +407,24 @@ export function roomAgents(sessions: readonly SessionInfo[], roomId: string): Se
  */
 export const useRoomAgents = (roomId: string): SessionInfo[] =>
   useFabric(useShallow((s) => roomAgents(s.sessions, roomId)));
+
+/**
+ * The sessions that belong to no room at all. Every M0 session is one of these (`room_id` did not
+ * exist yet), and so is anything created through the console drawer's plain "New session" button —
+ * they run, they cost quota, and **nothing on the factory floor draws them**, because a figure with
+ * no building to stand at has nowhere to be. The room panel lists them for exactly that reason: the
+ * floor is allowed to be incomplete, the operator's view of what is running is not.
+ *
+ * Unlike `roomAgents` this keeps finished and failed sessions too. A room's figures are what is
+ * standing there now; this is a list of what the floor is *not* showing, and a `done` roomless
+ * session is still not shown anywhere else.
+ */
+export function roomlessSessions(sessions: readonly SessionInfo[]): SessionInfo[] {
+  return sessions.filter((s) => s.roomId === null);
+}
+
+export const useRoomlessSessions = (): SessionInfo[] =>
+  useFabric(useShallow((s) => roomlessSessions(s.sessions)));
 
 /**
  * Whether anything in the scene needs animating. The canvas runs `frameloop="demand"` and only

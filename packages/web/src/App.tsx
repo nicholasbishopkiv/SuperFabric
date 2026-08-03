@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
+import { RoomPanel } from "./hud/RoomPanel";
 import { FactoryScene } from "./scene/FactoryScene";
 import { connect } from "./wsClient";
 
@@ -17,6 +18,8 @@ export default function App() {
   return (
     <>
       <FactoryScene />
+      {/* Two overlays, two edges: rooms on the left, the one-agent console on the right. */}
+      <RoomPanel />
       <ConsoleDrawer />
     </>
   );

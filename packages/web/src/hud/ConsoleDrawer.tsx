@@ -3,59 +3,10 @@ import { useEffect, useRef, useState } from "react";
 import type { EventRow } from "../store";
 import { useFabric } from "../store";
 import { send, subscribe } from "../wsClient";
+import { AutonomySelect, BypassWarning } from "./AutonomySelect";
+import { HUD as C } from "./theme";
 
 type ApprovalRequest = Extract<SessionEvent, { type: "approval_request" }>;
-
-const C = {
-  dim: "#7a7a7a",
-  text: "#1c1c1c",
-  err: "#c0392b",
-  line: "#d8d8d8",
-  card: "#e08a00",
-};
-
-/** Human labels for the autonomy modes — the console never shows SDK permission-mode jargon. */
-const AUTONOMY_LABELS: Record<AutonomyMode, string> = {
-  attended: "Attended — every gated action asks",
-  auto: "Auto — classifier decides (default)",
-  bypass: "Bypass — nothing is gated",
-};
-const AUTONOMY_MODES = ["attended", "auto", "bypass"] as const;
-
-function AutonomySelect({
-  value,
-  disabled,
-  onChange,
-}: {
-  value: AutonomyMode;
-  disabled: boolean;
-  onChange: (autonomy: AutonomyMode) => void;
-}) {
-  return (
-    <select
-      aria-label="Autonomy"
-      value={value}
-      disabled={disabled}
-      onChange={(e) => onChange(e.target.value as AutonomyMode)}
-      style={{ font: "inherit" }}
-    >
-      {AUTONOMY_MODES.map((m) => (
-        <option key={m} value={m}>
-          {AUTONOMY_LABELS[m]}
-        </option>
-      ))}
-    </select>
-  );
-}
-
-/** One-line, no-modal warning shown only while Bypass is the selected mode. */
-function BypassWarning() {
-  return (
-    <span style={{ color: C.err }}>
-      ⚠ this agent can run any command without asking — only for a sandboxed room (M4)
-    </span>
-  );
-}
 
 /**
  * **Placeholder for the M3 factory bus.** There is no inter-room messaging yet, so nothing on the
@@ -192,7 +143,7 @@ export function ConsoleDrawer() {
         fontFamily: "system-ui, sans-serif",
         fontSize: 14,
         color: C.text,
-        background: open ? "rgba(250,250,250,0.94)" : "transparent",
+        background: open ? C.panel : "transparent",
         borderLeft: open ? `1px solid ${C.line}` : "none",
         padding: open ? "12px 14px" : 8,
         overflowY: "auto",

@@ -6,6 +6,7 @@ import {
   initialFabricState,
   liveAgentCount,
   roomAgents,
+  roomlessSessions,
   useFabric,
 } from "../src/store";
 
@@ -434,6 +435,49 @@ describe("roomAgents", () => {
     // a figure standing next to a label that says "2 agents" would be a lie either way round
     expect(roomAgents(sessions, "r1")).toHaveLength(liveAgentCount(sessions, "r1"));
     expect(roomAgents(sessions, "r1").map((s) => s.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("roomlessSessions", () => {
+  it("is exactly what the floor cannot draw", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1" }),
+      session({ id: "b", roomId: null }),
+      session({ id: "c", roomId: null, state: "done" }),
+    ];
+    // `roomAgents` and `roomlessSessions` between them must account for every session, or the
+    // operator has something running that no surface shows.
+    expect(roomlessSessions(sessions).map((s) => s.id)).toEqual(["b", "c"]);
+    expect(roomAgents(sessions, "r1").map((s) => s.id)).toEqual(["a"]);
+  });
+
+  it("keeps finished and failed sessions, unlike a room's figures", () => {
+    const sessions = [
+      session({ id: "a", roomId: null, state: "done" }),
+      session({ id: "b", roomId: null, state: "error" }),
+    ];
+    // a room's figures are what is standing there *now*; this is a list of what is hidden, and a
+    // finished roomless session is still hidden everywhere else
+    expect(roomlessSessions(sessions)).toHaveLength(2);
+  });
+
+  it("is empty once every session has a room", () => {
+    expect(roomlessSessions([session({ roomId: "r1" })])).toEqual([]);
+  });
+});
+
+describe("clearError", () => {
+  it("forgets the last server error", () => {
+    apply({ kind: "error", message: "room already exists: backend" });
+    expect(useFabric.getState().lastError).toBe("room already exists: backend");
+    useFabric.getState().clearError();
+    expect(useFabric.getState().lastError).toBeNull();
+  });
+
+  it("is a genuine no-op when there was no error, so nothing re-renders for it", () => {
+    const before = useFabric.getState();
+    useFabric.getState().clearError();
+    expect(useFabric.getState()).toBe(before);
   });
 });
 
