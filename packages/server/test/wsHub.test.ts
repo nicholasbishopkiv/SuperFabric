@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
 import { SessionManager } from "../src/sessionManager.js";
@@ -9,6 +9,23 @@ function fakeSocket() {
   const sent: any[] = [];
   const sock: SocketLike = { send: (d: string) => sent.push(JSON.parse(d)) };
   return { sock, sent };
+}
+
+/** A hub over an in-memory db with a scripted fake executor, plus one attached socket. */
+function makeHub(opts: { script?: { tool: string; input: unknown }[]; attach?: boolean } = {}) {
+  const db = openDb(":memory:");
+  const store = new EventStore(db);
+  const exec = new FakeExecutor(opts.script ? { script: opts.script } : {});
+  const mgr = new SessionManager(db, store, exec);
+  const hub = new WsHub(store, mgr);
+  const { sock, sent } = fakeSocket();
+  if (opts.attach !== false) hub.attach(sock);
+  return { db, store, exec, mgr, hub, sock, sent };
+}
+
+/** The hub's private socket -> watermark table; asserted directly, it is the thing I1 broke. */
+function subsFor(hub: WsHub): Map<SocketLike, Map<string, number>> {
+  return (hub as unknown as { subs: Map<SocketLike, Map<string, number>> }).subs;
 }
 
 describe("WsHub", () => {
@@ -76,5 +93,95 @@ describe("WsHub", () => {
     hub.attach(sock);
     hub.handleMessage(sock, "not json");
     expect(sent.some(m => m.kind === "error")).toBe(true);
+  });
+
+  // ---- C1: a frame that makes the dispatch throw must not escape handleMessage ----
+
+  describe("dispatch failures", () => {
+    const frames = [
+      { kind: "prompt", sessionId: "nope", text: "hi" },
+      { kind: "approval", sessionId: "nope", approvalId: "also-nope", behavior: "allow" },
+      { kind: "create_session", cwd: "/definitely/not/a/real/path" },
+    ];
+
+    for (const frame of frames) {
+      it(`replies error instead of throwing for ${frame.kind} on an unknown target`, () => {
+        const { hub, sock, sent } = makeHub();
+        expect(() => hub.handleMessage(sock, JSON.stringify(frame))).not.toThrow();
+        expect(sent.filter(m => m.kind === "error")).toHaveLength(1);
+      });
+    }
+
+    it("replies error for an interrupt on an unknown session without an unhandled rejection", async () => {
+      const { hub, sock, sent } = makeHub();
+      // The manager's interrupt() is a no-op for unknown ids today; make it reject to prove the
+      // rejection is caught and reported rather than taking the process down.
+      const mgr = (hub as unknown as { mgr: SessionManager }).mgr;
+      mgr.interrupt = async () => { throw new Error("interrupt exploded"); };
+      expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "interrupt", sessionId: "nope" }))).not.toThrow();
+      await vi.waitFor(() => {
+        if (!sent.some(m => m.kind === "error" && /interrupt exploded/.test(m.message))) throw new Error("not yet");
+      });
+    });
+  });
+
+  // ---- I9: a detached socket must not resurrect itself ----
+
+  it("ignores messages from a socket that was already detached", async () => {
+    const { hub, mgr, exec, sock, sent } = makeHub();
+    const id = mgr.createSession("/tmp");
+    hub.detach(sock);
+    hub.handleMessage(sock, JSON.stringify({ kind: "subscribe", sessionId: id, afterSeq: 0 }));
+    expect(sent.filter(m => m.kind === "event")).toHaveLength(0);
+    mgr.prompt(id, "after detach");
+    await exec.settle();
+    expect(sent.filter(m => m.kind === "event")).toHaveLength(0);
+  });
+
+  // ---- I1: a failed send must not advance the watermark ----
+
+  it("detaches a socket whose send throws and does not advance its watermark", async () => {
+    const { hub, mgr, exec } = makeHub({ attach: false });
+    const id = mgr.createSession("/tmp");
+    const seen: number[] = [];
+    let explode = false;
+    const sock: SocketLike = {
+      send: (d: string) => {
+        if (explode) throw new Error("socket is dead");
+        const m = JSON.parse(d);
+        if (m.kind === "event") seen.push(m.seq);
+      },
+    };
+    hub.attach(sock);
+    hub.handleMessage(sock, JSON.stringify({ kind: "subscribe", sessionId: id, afterSeq: 0 }));
+    const watermark = () => subsFor(hub).get(sock)?.get(id);
+    const before = watermark();
+    expect(before).toBeGreaterThan(0);
+
+    explode = true;
+    mgr.prompt(id, "goes nowhere");
+    await exec.settle();
+    // the socket was dropped entirely, so no watermark survives to skip past the lost events
+    expect(subsFor(hub).has(sock)).toBe(false);
+    expect(seen.at(-1)).toBe(before);
+  });
+
+  // ---- I2: an afterSeq beyond the log must not mute the session ----
+
+  it("clamps an afterSeq past the end of the log and keeps tailing", async () => {
+    const { hub, mgr, exec, sock, sent } = makeHub();
+    const id = mgr.createSession("/tmp");
+    mgr.prompt(id, "first");
+    await exec.settle();
+    const maxSeq = mgr.listSessions().find(s => s.id === id)!.lastSeq;
+
+    hub.handleMessage(sock, JSON.stringify({ kind: "subscribe", sessionId: id, afterSeq: maxSeq + 993 }));
+    expect(sent.some(m => m.kind === "error" && /beyond the log/.test(m.message))).toBe(true);
+
+    mgr.prompt(id, "second");
+    await exec.settle();
+    const seqs = sent.filter(m => m.kind === "event").map(m => m.seq);
+    expect(seqs.length).toBeGreaterThan(0);
+    expect(Math.min(...seqs)).toBe(maxSeq + 1);
   });
 });

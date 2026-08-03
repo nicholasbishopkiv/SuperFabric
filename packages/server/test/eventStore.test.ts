@@ -12,6 +12,17 @@ describe("EventStore", () => {
     const replay = store.listAfter("A", 1);
     expect(replay).toEqual([{ seq: 2, event: { type: "agent_text", text: "two" } }]);
   });
+  it("reports maxSeq per session, 0 for a session with no events", () => {
+    const store = new EventStore(openDb(":memory:"));
+    expect(store.maxSeq("A")).toBe(0);
+    store.append("A", { type: "agent_text", text: "one" });
+    store.append("A", { type: "agent_text", text: "two" });
+    store.append("B", { type: "agent_text", text: "other" });
+    expect(store.maxSeq("A")).toBe(2);
+    expect(store.maxSeq("B")).toBe(1);
+    expect(store.maxSeq("never-existed")).toBe(0);
+  });
+
   it("notifies subscribers on append", () => {
     const store = new EventStore(openDb(":memory:"));
     const seen: number[] = [];
