@@ -94,6 +94,24 @@ export const FLOOR = {
   stanchion: "#8b93a0",
 } as const;
 
+/**
+ * The lighting rig's colours. Here rather than in the rig itself for the same reason as everything
+ * else: the warm/cool split is a decision about how the whole floor looks, not a parameter of one
+ * `<directionalLight>`.
+ */
+export const LIGHT = {
+  /** The key: warm, as if through a north-facing sawtooth roof on a bright day. */
+  key: "#fff0d6",
+  /** The fill: cool, so a shaded face is a *different colour* and not merely darker. */
+  fill: "#a9bdd8",
+  /** Hemisphere sky. */
+  sky: "#ffeedd",
+  /** Hemisphere ground: bounce off a big pale concrete slab is the colour of the slab. */
+  bounce: "#b5ad9d",
+  /** Behind everything, where no geometry reaches. */
+  backdrop: "#9aa1a8",
+} as const;
+
 // ---- buildings ---------------------------------------------------------------------------------
 
 /**
@@ -112,9 +130,9 @@ export const PROJECT = {
 
 /** A workshop's shared shell. Its *accent* is what tells one workshop from another. */
 export const ROOM = {
-  wall: "#7f8996",
-  plinth: "#535d69",
-  roof: "#5f6975",
+  wall: "#8c96a3",
+  plinth: "#525c68",
+  roof: "#616b77",
   /** The overhanging lip of the flat roof. */
   fascia: "#4c555f",
 } as const;

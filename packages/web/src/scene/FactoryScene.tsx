@@ -6,9 +6,11 @@ import { Buildings } from "./Buildings";
 import { CameraFraming } from "./CameraFraming";
 import { Conveyors } from "./Conveyor";
 import { Floor } from "./Floor";
+import { FactoryLights } from "./lighting";
 import { Packages } from "./Packages";
 import { RoomDrag } from "./RoomDrag";
 import { ISO_CAMERA_POSITION, ISO_ZOOM, ISO_ZOOM_MAX, ISO_ZOOM_MIN } from "./layout";
+import { LIGHT } from "./palette";
 
 /**
  * The factory floor as an isometric plan view: an orthographic camera on the [24, 20, 24] diagonal
@@ -34,23 +36,9 @@ export function FactoryScene() {
       // clip the geometry standing between it and the origin.
       camera={{ position: [...ISO_CAMERA_POSITION], zoom: ISO_ZOOM, near: -200, far: 600 }}
       onCreated={({ camera }) => camera.lookAt(0, 0, 0)}
-      style={{ position: "fixed", inset: 0, background: "#e9ecef" }}
+      style={{ position: "fixed", inset: 0, background: LIGHT.backdrop }}
     >
-      <ambientLight intensity={0.6} />
-      <directionalLight
-        position={[10, 18, 6]}
-        intensity={1.5}
-        castShadow
-        shadow-mapSize={[2048, 2048]}
-        // The default shadow frustum is a 10-unit box; the floor is 200 across, so it has to be
-        // widened or buildings on the ring cast no shadow at all.
-        shadow-camera-left={-60}
-        shadow-camera-right={60}
-        shadow-camera-top={60}
-        shadow-camera-bottom={-60}
-        shadow-camera-near={-100}
-        shadow-camera-far={200}
-      />
+      <FactoryLights />
       <Floor />
       <Conveyors />
       <Buildings />
