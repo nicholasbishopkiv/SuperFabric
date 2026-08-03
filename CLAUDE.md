@@ -25,8 +25,15 @@ and a subscription limit monitor with auto-pause/resume.
 ## Stack
 
 pnpm workspaces · TypeScript · Node 22+ · Fastify + ws · better-sqlite3 (WAL) ·
-`@anthropic-ai/claude-agent-sdk` · React 19 + Vite · react-three-fiber + drei · zustand ·
-dockerode (M4). Dependency license policy: MIT/Apache only (no AGPL).
+`@anthropic-ai/claude-agent-sdk` · zod 4 · React 19 + Vite · react-three-fiber + drei ·
+zustand · dockerode (M4).
+
+**Dependency license policy**: third-party libraries must be MIT/Apache-2.0/BSD/ISC —
+no copyleft (GPL/AGPL/SSPL). One deliberate exception: Anthropic's own
+`@anthropic-ai/claude-agent-sdk` (and the `claude` CLI it drives) are proprietary
+("© Anthropic PBC, all rights reserved", governed by Anthropic's legal agreements). They
+are the engine this product orchestrates, so the dependency is intrinsic; it is called
+out in the README so users know what they're installing.
 
 ## Conventions
 

@@ -54,10 +54,16 @@ Russian originals: [VISION.ru.md](docs/VISION.ru.md) · [ROADMAP.ru.md](docs/ROA
 
 ## Planned stack
 
-TypeScript · Node 22+ · pnpm workspaces · Fastify + WebSocket · better-sqlite3 ·
+TypeScript · Node 22+ · pnpm workspaces · Fastify + WebSocket · better-sqlite3 · zod ·
 [`@anthropic-ai/claude-agent-sdk`](https://code.claude.com/docs/en/agent-sdk/overview) ·
 React 19 + Vite · react-three-fiber + drei (Three.js) · zustand · dockerode.
-Dependency license policy: MIT/Apache only.
+
+SuperFabric itself is MIT. Third-party libraries are MIT/Apache/BSD/ISC — with one
+deliberate exception: `@anthropic-ai/claude-agent-sdk` and the `claude` CLI it drives are
+Anthropic's proprietary software (© Anthropic PBC, governed by
+[Anthropic's legal agreements](https://code.claude.com/docs/en/legal-and-compliance)).
+They are the engine this tool orchestrates, so installing SuperFabric means installing
+them too.
 
 ## ⚠️ Important disclaimers
 

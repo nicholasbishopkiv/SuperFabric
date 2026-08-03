@@ -13,6 +13,8 @@ export function openDb(path: string): Db {
       cwd TEXT NOT NULL,
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
+    -- No foreign key to sessions(id) on purpose: this is an append-only audit log,
+    -- and it must outlive the session row it describes so history survives deletion.
     CREATE TABLE IF NOT EXISTS events (
       session_id TEXT NOT NULL,
       seq INTEGER NOT NULL,
