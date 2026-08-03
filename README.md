@@ -54,6 +54,23 @@ pnpm -F @superfabric/web dev      # open the printed Vite URL
 Requires Node 22+, pnpm 9+, and a working `claude` login (M0 uses your current
 `~/.claude` account; multi-account arrives in M2). See [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## Security
+
+SuperFabric drives agents that run commands on your machine with your Claude account. Treat
+the server as a local privileged tool:
+
+- **It binds to `127.0.0.1` only** — never to `0.0.0.0`. Nothing is reachable from the network.
+- **Only allow-listed browser origins may open the WebSocket.** Browsers do not apply CORS to
+  WebSockets, so without a check any website you visit could connect to the local server and
+  drive your agent. The handshake accepts the server's own origin, the Vite dev origins
+  (`localhost:5173` / `127.0.0.1:5173`) and anything in `SUPERFABRIC_ALLOWED_ORIGINS`
+  (comma-separated); every other `Origin` is rejected with 403 and logged. Requests with **no**
+  `Origin` header are allowed, because non-browser clients (CLI tools, scripts) send none while
+  browsers always do.
+- **There is no authentication.** Anyone who can run code on the machine — or on any host you
+  add to `SUPERFABRIC_ALLOWED_ORIGINS` — can drive your agents and approve their tool calls.
+  Don't run SuperFabric on a shared host, and don't expose the port through a tunnel.
+
 ## Documentation
 
 | Document | Contents |

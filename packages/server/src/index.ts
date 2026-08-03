@@ -6,6 +6,7 @@ import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
 import { SessionManager } from "./sessionManager.js";
 import { ClaudeCodeExecutor } from "./executors/claudeCode.js";
+import { isOriginAllowed } from "./origin.js";
 import { WsHub } from "./wsHub.js";
 
 const dataDir = process.env.SUPERFABRIC_DATA ?? path.join(process.cwd(), ".fabrica");
@@ -29,7 +30,20 @@ const wsPath = "/ws";
 
 await app.listen({ port, host });
 
-const wss = new WebSocketServer({ server: app.server, path: wsPath });
+const wss = new WebSocketServer({
+  server: app.server,
+  path: wsPath,
+  // ws's default cap is 100 MB, handed straight to JSON.parse. Our largest legitimate frame is a
+  // prompt; 1 MiB is generous for that and cheap to reject.
+  maxPayload: 1024 * 1024,
+  // Browsers do not apply CORS to WebSockets, so without this any website the operator visits
+  // could drive their agent. See src/origin.ts for the full policy.
+  verifyClient: ({ origin, req }, done) => {
+    if (isOriginAllowed(origin, port, process.env.SUPERFABRIC_ALLOWED_ORIGINS)) return done(true);
+    console.warn(`ws: rejected handshake from origin ${origin} (${req.socket.remoteAddress ?? "?"})`);
+    done(false, 403, "Forbidden origin");
+  },
+});
 wss.on("connection", (sock: WebSocket) => {
   hub.attach(sock);
   sock.on("message", (raw) => hub.handleMessage(sock, raw.toString()));
