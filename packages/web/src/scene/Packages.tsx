@@ -3,7 +3,7 @@ import { useLayoutEffect, useMemo, useRef } from "react";
 import type { CatmullRomCurve3, InstancedMesh } from "three";
 import { BoxGeometry, Matrix4, MeshStandardMaterial, Vector3 } from "three";
 import type { PackageInFlight } from "../store";
-import { useFabric } from "../store";
+import { beltFan, useFabric } from "../store";
 import { conveyorCurve, pointAt } from "./conveyorPath";
 import { PACKAGE_COLOR } from "./palette";
 
@@ -40,6 +40,8 @@ interface Route {
 export function Packages() {
   const packages = useFabric((s) => s.packages);
   const rooms = useFabric((s) => s.rooms);
+  // The belts, for their fan offsets: a package has to ride the belt that was actually drawn.
+  const conveyors = useFabric((s) => s.conveyors);
   const reapPackages = useFabric((s) => s.reapPackages);
   const meshRef = useRef<InstancedMesh>(null);
 
@@ -56,10 +58,10 @@ export function Packages() {
       if (from === undefined || to === undefined) continue;
       // A `RoomInfo` is a `BeltEnd`: the curve needs the kind as well as the position, because it
       // starts and ends at the buildings' walls rather than at their centres.
-      built.push({ pkg, curve: conveyorCurve(from, to) });
+      built.push({ pkg, curve: conveyorCurve(from, to, undefined, beltFan(conveyors, pkg.from, pkg.to)) });
     }
     return built;
-  }, [packages, rooms]);
+  }, [packages, rooms, conveyors]);
 
   /** Writes one matrix per in-flight package and returns whether any of them has arrived. */
   function place(now: number): boolean {

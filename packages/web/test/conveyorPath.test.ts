@@ -1,10 +1,13 @@
+import { ringPosition as sharedRingPosition } from "@superfabric/shared";
 import { describe, expect, it } from "vitest";
 import { Vector3 } from "three";
 import {
   BELT_EDGE_MARGIN,
+  BELT_FAN_STEP,
   BELT_HEIGHT,
   beltEnds,
   conveyorCurve,
+  DEFAULT_BOW,
   pointAt,
   wallDistance,
 } from "../src/scene/conveyorPath";
@@ -130,6 +133,41 @@ describe("conveyorCurve", () => {
     // the straight line between the two wall anchors runs from x = 3.8 to x = 11.7
     expect(mid.x).toBeCloseTo(7.75, 3);
     expect(Math.abs(mid.z)).toBeGreaterThan(0.5);
+  });
+
+  it("fans belts leaving the same building apart, so their mouths separate", () => {
+    // Two spine belts of the same length to two adjacent ring slots. Without a fan they bow by the
+    // same amount and track each other all the way in; with one they diverge.
+    const a = room(sharedRingPosition(0).x, sharedRingPosition(0).z);
+    const b = room(sharedRingPosition(1).x, sharedRingPosition(1).z);
+    const hub = project(0, 0);
+
+    const gap = (fanA: number, fanB: number) => {
+      // a quarter of the way along each belt: near the mouth, where they used to converge
+      const pa = pointAt(conveyorCurve(hub, a, DEFAULT_BOW, fanA), 0.25);
+      const pb = pointAt(conveyorCurve(hub, b, DEFAULT_BOW, fanB), 0.25);
+      return pa.distanceTo(pb);
+    };
+
+    expect(gap(-1, 1)).toBeGreaterThan(gap(0, 0));
+  });
+
+  it("offsets by a fixed distance per step of fan, not by a fraction of the length", () => {
+    // The bow is proportional to length, which is exactly why it cannot separate two belts of the
+    // same length. The fan has to be absolute.
+    const shortMid = pointAt(conveyorCurve(room(0, 0), room(12, 0), 0, 1), 0.5);
+    const longMid = pointAt(conveyorCurve(room(0, 0), room(30, 0), 0, 1), 0.5);
+    expect(Math.abs(shortMid.z)).toBeCloseTo(BELT_FAN_STEP, 2);
+    expect(Math.abs(longMid.z)).toBeCloseTo(BELT_FAN_STEP, 2);
+  });
+
+  it("is symmetric in the fan too: one pair of rooms is one belt however it is addressed", () => {
+    // `Packages` builds its curve from the package's own from/to, which may be the other way round
+    // from how the belt was drawn. If the fan were mirrored the box would fly beside the conveyor.
+    const forward = pointAt(conveyorCurve(room(0, 0), room(14, 6), DEFAULT_BOW, 2), 0.4);
+    const backward = pointAt(conveyorCurve(room(14, 6), room(0, 0), DEFAULT_BOW, 2), 0.6);
+    expect(forward.x).toBeCloseTo(backward.x, 4);
+    expect(forward.z).toBeCloseTo(backward.z, 4);
   });
 
   it("bows harder the longer the belt is, so a long belt is not a barely-bent line", () => {

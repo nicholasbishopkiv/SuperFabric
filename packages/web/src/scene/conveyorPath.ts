@@ -73,11 +73,32 @@ export function beltEnds(from: BeltEnd, to: BeltEnd): { start: ScenePosition; en
 export const DEFAULT_BOW = 0.18;
 
 /**
- * A belt from one building's wall to another's, bowed slightly outward. Deliberately symmetric:
- * swapping the arguments bows the belt to the same side of the line, so a pair of rooms is one belt
- * however it is addressed.
+ * Extra sideways offset per unit of `fan`, in world units.
+ *
+ * Bowing by a *fraction of length* alone is not enough to separate belts leaving the same wall: two
+ * spine belts are within a few percent of the same length, so they bow by the same amount and track
+ * each other all the way in, arriving as one thick line at the mouth. `fan` is the belt's signed
+ * index among the belts leaving that room (the store assigns it), and this is how far apart one step
+ * of index pushes them. It is a fixed distance rather than a fraction, because the point is to
+ * separate two belts from each other and not to be proportional to anything.
  */
-export function conveyorCurve(from: BeltEnd, to: BeltEnd, bow = DEFAULT_BOW): CatmullRomCurve3 {
+export const BELT_FAN_STEP = 1.15;
+
+/**
+ * A belt from one building's wall to another's, bowed slightly outward. Deliberately symmetric in
+ * `from`/`to`: swapping the arguments bows the belt to the same side of the line, so a pair of rooms
+ * is one belt however it is addressed.
+ *
+ * `fan` must be the same for the belt and for any package travelling it, which is why it is carried
+ * on the store's `Conveyor` rather than derived twice — a box on a belt drawn with a different fan
+ * would fly through the air beside it.
+ */
+export function conveyorCurve(
+  from: BeltEnd,
+  to: BeltEnd,
+  bow = DEFAULT_BOW,
+  fan = 0,
+): CatmullRomCurve3 {
   const ends = beltEnds(from, to);
   const start = new Vector3(ends.start.x, BELT_HEIGHT, ends.start.z);
   const end = new Vector3(ends.end.x, BELT_HEIGHT, ends.end.z);
@@ -90,7 +111,7 @@ export function conveyorCurve(from: BeltEnd, to: BeltEnd, bow = DEFAULT_BOW): Ca
   const flip = dx < 0 || (dx === 0 && dz < 0) ? -1 : 1;
   const nx = length === 0 ? 0 : (-dz / length) * flip;
   const nz = length === 0 ? 0 : (dx / length) * flip;
-  const offset = bow * length;
+  const offset = bow * length + fan * BELT_FAN_STEP;
 
   const mid = new Vector3(
     (ends.start.x + ends.end.x) / 2 + nx * offset,

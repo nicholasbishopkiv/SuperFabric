@@ -34,6 +34,16 @@ const STATUS_RANK: Record<FactoryStatus, number> = { idle: 0, working: 1, blocke
 export interface Conveyor {
   from: string;
   to: string;
+  /**
+   * This belt's signed place in the fan of belts leaving `from`, centred on zero — so five spine
+   * belts get -2, -1, 0, 1, 2. The scene turns it into a sideways offset (`BELT_FAN_STEP`), which is
+   * what stops two belts of nearly the same length from tracking each other into the same mouth.
+   *
+   * It lives on the belt rather than being recomputed by whoever draws it, because a package has to
+   * travel the belt that was actually drawn: two answers to "how far is this one fanned" would put
+   * the boxes beside the conveyor instead of on it.
+   */
+  fan: number;
 }
 
 /** A box travelling a belt right now. `startedAt` is a wall clock, so the scene needs no tick state. */
@@ -270,15 +280,20 @@ export function conveyorList(
     for (const r of rooms) {
       if (r.id === project.id) continue;
       known.add(pairKey(project.id, r.id));
-      belts.push({ from: project.id, to: r.id });
+      belts.push({ from: project.id, to: r.id, fan: 0 });
     }
+    // The spine's belts all leave the same building and are all within a few percent of the same
+    // length, so they are the ones that need fanning: give each a signed index centred on zero.
+    const middle = (belts.length - 1) / 2;
+    for (const [i, belt] of belts.entries()) belt.fan = i - middle;
   }
   const onFloor = new Set(rooms.map((r) => r.id));
   for (const [key, pair] of Object.entries(packagedPairs)) {
     // A pair whose room has since been removed has no belt to draw.
     if (known.has(key) || !onFloor.has(pair.from) || !onFloor.has(pair.to)) continue;
     known.add(key);
-    belts.push(pair);
+    // A room-to-room belt is the only belt between those two rooms, so it needs no fanning.
+    belts.push({ from: pair.from, to: pair.to, fan: 0 });
   }
   return belts;
 }
@@ -291,8 +306,25 @@ function nextConveyors(
 ): Conveyor[] {
   const belts = conveyorList(rooms, packagedPairs);
   const unchanged = belts.length === previous.length
-    && belts.every((b, i) => b.from === previous[i].from && b.to === previous[i].to);
+    && belts.every((b, i) =>
+      b.from === previous[i].from && b.to === previous[i].to && b.fan === previous[i].fan);
   return unchanged ? previous : belts;
+}
+
+/**
+ * How far the belt between two rooms is fanned, whichever way round it is asked for. `Packages` needs
+ * this: a box has a `from` and a `to`, and the belt it must ride may have been drawn the other way
+ * about.
+ */
+export function beltFan(conveyors: readonly Conveyor[], from: string, to: string): number {
+  const key = pairKey(from, to);
+  for (const belt of conveyors) {
+    if (pairKey(belt.from, belt.to) === key) return belt.fan;
+  }
+  // `conveyorCurve` bows by the *pair* rather than by argument order — swapping its arguments gives
+  // the identical curve — so the fan needs no mirroring here either, and a package addressed b -> a
+  // rides exactly the belt drawn a -> b.
+  return 0;
 }
 
 /**
@@ -414,7 +446,7 @@ export const useFabric = create<FabricState>((set, get) => ({
       const key = pairKey(from, to);
       const packagedPairs = s.packagedPairs[key] !== undefined
         ? s.packagedPairs
-        : { ...s.packagedPairs, [key]: { from, to } };
+        : { ...s.packagedPairs, [key]: { from, to, fan: 0 } };
       return {
         packages: [
           ...s.packages,

@@ -2,6 +2,8 @@ import type { RoomInfo, SessionInfo } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   agentStatus,
+  beltDirections,
+  beltFan,
   hasMotion,
   initialFabricState,
   liveAgentCount,
@@ -612,6 +614,42 @@ describe("conveyors", () => {
     expect(belts()).toContain("r1|r2");
   });
 
+  it("fans the spine's belts by index, centred on zero", () => {
+    apply({
+      kind: "rooms",
+      rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" }), room({ id: "r3", name: "qa" })],
+    });
+    expect(useFabric.getState().conveyors.map((c) => c.fan)).toEqual([-1, 0, 1]);
+  });
+
+  it("gives a room-to-room belt no fan — it is the only belt between those two rooms", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+    useFabric.getState().sendPackage("r1", "r2", 50);
+    const belt = useFabric.getState().conveyors.find((c) => key(c) === "r1|r2");
+    expect(belt?.fan).toBe(0);
+  });
+
+  it("answers the fan of a pair whichever way round it is asked, so a package rides its own belt", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+    const { conveyors } = useFabric.getState();
+    for (const c of conveyors) {
+      expect(beltFan(conveyors, c.from, c.to)).toBe(c.fan);
+      expect(beltFan(conveyors, c.to, c.from)).toBe(c.fan);
+    }
+    // a pair with no belt at all is unfanned rather than undefined
+    expect(beltFan(conveyors, "r1", "nope")).toBe(0);
+  });
+
+  it("re-fans when a room is added, so the new belt is part of the fan rather than beside it", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+    expect(useFabric.getState().conveyors.map((c) => c.fan)).toEqual([-0.5, 0.5]);
+    apply({
+      kind: "rooms",
+      rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" }), room({ id: "r3", name: "qa" })],
+    });
+    expect(useFabric.getState().conveyors.map((c) => c.fan)).toEqual([-1, 0, 1]);
+  });
+
   it("keeps the belt list referentially stable when nothing about it changed", () => {
     apply({ kind: "rooms", rooms: [project, room({ id: "r1" })] });
     const before = useFabric.getState().conveyors;
@@ -621,6 +659,49 @@ describe("conveyors", () => {
     useFabric.getState().sendPackage("p", "r1", 50);
 
     expect(useFabric.getState().conveyors).toBe(before);
+  });
+});
+
+describe("beltDirections", () => {
+  const project = room({ id: "p", name: "fabrica", path: "/p", kind: "project", position: { x: 0, z: 0 } });
+
+  it("is empty for a room the client has never heard of", () => {
+    expect(beltDirections(useFabric.getState(), "nope")).toEqual([]);
+  });
+
+  it("points at every building this room has a belt to, as flat numbers", () => {
+    apply({
+      kind: "rooms",
+      rooms: [
+        project,
+        room({ id: "r1", position: { x: 12, z: 5 } }),
+        room({ id: "r2", name: "web", position: { x: -5, z: 12 } }),
+      ],
+    });
+    // from the project block, out to both workshops
+    expect(beltDirections(useFabric.getState(), "p")).toEqual([12, 5, -5, 12]);
+    // and from a workshop, back to the project block
+    expect(beltDirections(useFabric.getState(), "r1")).toEqual([-12, -5]);
+  });
+
+  it("follows a building while it is being dragged, so its loading bay follows its belt", () => {
+    apply({
+      kind: "rooms",
+      rooms: [project, room({ id: "r1", position: { x: 12, z: 5 } })],
+    });
+    useFabric.getState().beginRoomDrag("r1", { x: 12, z: 5 });
+    useFabric.getState().dragRoomTo({ x: 0, z: 14 });
+    expect(beltDirections(useFabric.getState(), "p")).toEqual([0, 14]);
+  });
+
+  it("returns a shallow-equal array for an unchanged floor, which is what stops a render loop", () => {
+    // `useBeltDirections` compares element by element; an array of objects would never match and
+    // the building would re-render for ever.
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1", position: { x: 12, z: 5 } })] });
+    const a = beltDirections(useFabric.getState(), "p");
+    const b = beltDirections(useFabric.getState(), "p");
+    expect(a).not.toBe(b);
+    expect(a.every((v, i) => Object.is(v, b[i]))).toBe(true);
   });
 });
 

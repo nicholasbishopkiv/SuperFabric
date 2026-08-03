@@ -28,10 +28,13 @@ function beltGeometry(
   bx: number,
   bz: number,
   bkind: RoomInfo["kind"],
+  fan: number,
 ) {
   const curve = conveyorCurve(
     { position: { x: ax, z: az }, kind: akind },
     { position: { x: bx, z: bz }, kind: bkind },
+    undefined,
+    fan,
   );
 
   const tube = new TubeGeometry(curve, 64, BELT_RADIUS, 4, false);
@@ -71,6 +74,7 @@ const Belt = memo(function Belt({
   bx,
   bz,
   bkind,
+  fan,
 }: {
   ax: number;
   az: number;
@@ -78,11 +82,12 @@ const Belt = memo(function Belt({
   bx: number;
   bz: number;
   bkind: RoomInfo["kind"];
+  fan: number;
 }) {
   const slatsRef = useRef<InstancedMesh>(null);
   const { tube, matrices } = useMemo(
-    () => beltGeometry(ax, az, akind, bx, bz, bkind),
-    [ax, az, akind, bx, bz, bkind],
+    () => beltGeometry(ax, az, akind, bx, bz, bkind, fan),
+    [ax, az, akind, bx, bz, bkind, fan],
   );
 
   // A TubeGeometry holds GPU buffers; dropping the reference is not enough to free them.
@@ -114,7 +119,15 @@ const Belt = memo(function Belt({
  * while one of them is being dragged, which is what `useRoomPosition` adds over the room's own row.
  * A belt left hanging in the air where a building used to be would make a drag look like a bug.
  */
-export const Conveyor = memo(function Conveyor({ from, to }: { from: string; to: string }) {
+export const Conveyor = memo(function Conveyor({
+  from,
+  to,
+  fan,
+}: {
+  from: string;
+  to: string;
+  fan: number;
+}) {
   const a = useRoomPosition(from);
   const b = useRoomPosition(to);
   // The kinds are what let the belt stop at the walls: the project block is half again as wide as a
@@ -122,7 +135,7 @@ export const Conveyor = memo(function Conveyor({ from, to }: { from: string; to:
   const akind = useRoomKind(from);
   const bkind = useRoomKind(to);
   if (a === undefined || b === undefined || akind === undefined || bkind === undefined) return null;
-  return <Belt ax={a.x} az={a.z} akind={akind} bx={b.x} bz={b.z} bkind={bkind} />;
+  return <Belt ax={a.x} az={a.z} akind={akind} bx={b.x} bz={b.z} bkind={bkind} fan={fan} />;
 });
 
 /**
@@ -134,7 +147,7 @@ export function Conveyors() {
   return (
     <>
       {conveyors.map((c) => (
-        <Conveyor key={`${c.from}|${c.to}`} from={c.from} to={c.to} />
+        <Conveyor key={`${c.from}|${c.to}`} from={c.from} to={c.to} fan={c.fan} />
       ))}
     </>
   );
