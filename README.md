@@ -36,9 +36,23 @@ meters, approval cards, and direct chat with any agent.
 
 ## Status
 
-🏗️ **Design phase.** The full design package is written and under review; no code yet.
-Implementation starts with milestone **M0** (core session runner). Star/watch the repo
-to follow along.
+🏗️ **Early development.** Milestone **M0 (core session runner) is complete**: a Claude Code
+session is driven from the browser over a WebSocket, every event is persisted to an
+append-only SQLite log, tool calls surface as approval cards, and a session survives a
+server restart — verified by killing the server mid-session and having the agent still
+recall the conversation afterwards.
+
+Next up is **M1**: the 3D factory floor, rooms-as-folders, and the roles library. The
+current web UI is a deliberately plain console that M1 replaces.
+
+```bash
+pnpm install
+pnpm -F @superfabric/server dev   # 127.0.0.1:4620
+pnpm -F @superfabric/web dev      # open the printed Vite URL
+```
+
+Requires Node 22+, pnpm 9+, and a working `claude` login (M0 uses your current
+`~/.claude` account; multi-account arrives in M2). See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Documentation
 

@@ -43,5 +43,31 @@ out in the README so users know what they're installing.
 
 ## Status
 
-Design approved 2026-08-03. Current milestone: **M0 — core session runner** (plan in
-`docs/superpowers/plans/`, when present).
+Design approved 2026-08-03. **M0 (core session runner) is complete** — see
+`docs/ROADMAP.md` for the acceptance evidence. Next: **M1 — 3D factory floor, project
+block, rooms, roles library v1**.
+
+## Running it
+
+```bash
+pnpm install
+pnpm -F @superfabric/server dev   # Fastify + ws on 127.0.0.1:4620 (tsx watch)
+pnpm -F @superfabric/web dev      # Vite dev server, proxies /ws to the server
+pnpm test                         # whole workspace
+SUPERFABRIC_LIVE_TEST=1 pnpm -F @superfabric/server test claudeExecutor.live  # real quota
+```
+
+Server state lives in `.fabrica/fabrica.db` (override the directory with
+`SUPERFABRIC_DATA`); port via `PORT`.
+
+## Layout
+
+- `packages/shared` — zod protocol shared by server and web (`SessionEvent`,
+  `ClientMessage`, `ServerMessage`).
+- `packages/server` — `db.ts` (schema) · `eventStore.ts` (append-only log + subscriptions)
+  · `executor.ts` (provider seam) · `executors/claudeCode.ts` (Agent SDK, streaming input)
+  · `executors/fake.ts` (scripted, for tests) · `sessionManager.ts` (sessions, approvals,
+  resume/stopAll) · `wsHub.ts` (replay-then-tail) · `index.ts` (wiring only) ·
+  `notes/agent-sdk-api.md` (verified SDK API reference — trust it over memory).
+- `packages/web` — `store.ts` (zustand, dedupes replays) · `wsClient.ts` (reconnect +
+  resubscribe from `lastSeq`) · `App.tsx` (M0 console; M1 replaces it with the 3D floor).
