@@ -30,10 +30,10 @@ describe("ringPosition", () => {
   });
 
   it("matches the known ring values a preview has to agree with", () => {
-    expect(ringPosition(0)).toEqual({ x: 8, z: 0 });
-    expect(ringPosition(1)).toEqual({ x: 5.657, z: 5.657 });
-    expect(ringPosition(2)).toEqual({ x: 0, z: 8 });
-    expect(ringPosition(8)).toEqual({ x: 13, z: 0 });
+    expect(ringPosition(0)).toEqual({ x: 14, z: 0 });
+    expect(ringPosition(1)).toEqual({ x: 9.899, z: 9.899 });
+    expect(ringPosition(2)).toEqual({ x: 0, z: 14 });
+    expect(ringPosition(8)).toEqual({ x: 19, z: 0 });
   });
 });
 

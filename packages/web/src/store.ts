@@ -434,6 +434,14 @@ export function roomPosition(
 export const useRoomPosition = (roomId: string): ScenePosition | undefined =>
   useFabric(useShallow((s) => roomPosition(s, roomId)));
 
+/**
+ * Whether a room is the project block or a workshop. A primitive, so a subscriber does not re-render
+ * because the room gained an agent — which matters for the belts, whose geometry depends on the kind
+ * (how wide the building is) and on nothing else about the room.
+ */
+export const useRoomKind = (roomId: string): RoomInfo["kind"] | undefined =>
+  useFabric((s) => s.rooms.find((r) => r.id === roomId)?.kind);
+
 export const useSelectedRoomId = (): string | null => useFabric((s) => s.selectedRoomId);
 
 /** Whether *any* building is being dragged. Subscribing to the boolean, not to the moving position. */

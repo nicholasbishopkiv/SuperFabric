@@ -2,6 +2,7 @@ import { describe, it, expect } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
+import { ringPosition } from "@superfabric/shared";
 import { openDb } from "../src/db.js";
 import { RoomManager } from "../src/roomManager.js";
 
@@ -94,9 +95,10 @@ describe("RoomManager", () => {
         mgr.ensureProjectRoom();
         const a = mgr.createRoom("a");
         const b = mgr.createRoom("b");
-        // radius 8 + floor(n / 8) * 5, angle (n % 8) * (PI / 4), rounded to 3 decimals
-        expect(a.position).toEqual({ x: 8, z: 0 });
-        expect(b.position).toEqual({ x: 5.657, z: 5.657 });
+        // shared `ringPosition`: radius RING_RADIUS + floor(n / 8) * RING_STEP, angle (n % 8) * (PI / 4)
+        expect(a.position).toEqual(ringPosition(0));
+        expect(b.position).toEqual(ringPosition(1));
+        expect(a.position).toEqual({ x: 14, z: 0 });
         expect(a.position).not.toEqual(b.position);
       });
     });

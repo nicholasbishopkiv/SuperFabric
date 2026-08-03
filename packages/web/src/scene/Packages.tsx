@@ -54,7 +54,9 @@ export function Packages() {
       // A package addressed to a room this client has not been told about has nowhere to travel; the
       // reaper's timer still clears it.
       if (from === undefined || to === undefined) continue;
-      built.push({ pkg, curve: conveyorCurve(from.position, to.position) });
+      // A `RoomInfo` is a `BeltEnd`: the curve needs the kind as well as the position, because it
+      // starts and ends at the buildings' walls rather than at their centres.
+      built.push({ pkg, curve: conveyorCurve(from, to) });
     }
     return built;
   }, [packages, rooms]);

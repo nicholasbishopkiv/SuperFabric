@@ -1,6 +1,7 @@
+import type { RoomInfo } from "@superfabric/shared";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { BoxGeometry, InstancedMesh, Matrix4, Quaternion, TubeGeometry, Vector3 } from "three";
-import { useFabric, useRoomPosition } from "../store";
+import { useFabric, useRoomKind, useRoomPosition } from "../store";
 import { BELT_HEIGHT, conveyorCurve } from "./conveyorPath";
 import { BELT_COLOR, SLAT_COLOR } from "./palette";
 
@@ -20,8 +21,18 @@ const UP = new Vector3(0, 1, 0);
  * static geometry, and rebuilding a tube while the operator pans would be the most expensive possible
  * way to draw a line that has not moved.
  */
-function beltGeometry(ax: number, az: number, bx: number, bz: number) {
-  const curve = conveyorCurve({ x: ax, z: az }, { x: bx, z: bz });
+function beltGeometry(
+  ax: number,
+  az: number,
+  akind: RoomInfo["kind"],
+  bx: number,
+  bz: number,
+  bkind: RoomInfo["kind"],
+) {
+  const curve = conveyorCurve(
+    { position: { x: ax, z: az }, kind: akind },
+    { position: { x: bx, z: bz }, kind: bkind },
+  );
 
   const tube = new TubeGeometry(curve, 64, BELT_RADIUS, 4, false);
   // Scaling y happens about the world origin, which also drops the belt towards the floor; the
@@ -49,23 +60,30 @@ function beltGeometry(ax: number, az: number, bx: number, bz: number) {
 }
 
 /**
- * One belt between two buildings. Split from `Conveyor` so the geometry memo keys on four numbers
- * rather than on two room objects: a room row is replaced whenever its agent count changes, and that
- * must not rebuild a tube.
+ * One belt between two buildings. Split from `Conveyor` so the geometry memo keys on plain numbers
+ * and kinds rather than on two room objects: a room row is replaced whenever its agent count changes,
+ * and that must not rebuild a tube.
  */
 const Belt = memo(function Belt({
   ax,
   az,
+  akind,
   bx,
   bz,
+  bkind,
 }: {
   ax: number;
   az: number;
+  akind: RoomInfo["kind"];
   bx: number;
   bz: number;
+  bkind: RoomInfo["kind"];
 }) {
   const slatsRef = useRef<InstancedMesh>(null);
-  const { tube, matrices } = useMemo(() => beltGeometry(ax, az, bx, bz), [ax, az, bx, bz]);
+  const { tube, matrices } = useMemo(
+    () => beltGeometry(ax, az, akind, bx, bz, bkind),
+    [ax, az, akind, bx, bz, bkind],
+  );
 
   // A TubeGeometry holds GPU buffers; dropping the reference is not enough to free them.
   useEffect(() => () => tube.dispose(), [tube]);
@@ -99,8 +117,12 @@ const Belt = memo(function Belt({
 export const Conveyor = memo(function Conveyor({ from, to }: { from: string; to: string }) {
   const a = useRoomPosition(from);
   const b = useRoomPosition(to);
-  if (a === undefined || b === undefined) return null;
-  return <Belt ax={a.x} az={a.z} bx={b.x} bz={b.z} />;
+  // The kinds are what let the belt stop at the walls: the project block is half again as wide as a
+  // workshop, so its end has to be inset further.
+  const akind = useRoomKind(from);
+  const bkind = useRoomKind(to);
+  if (a === undefined || b === undefined || akind === undefined || bkind === undefined) return null;
+  return <Belt ax={a.x} az={a.z} akind={akind} bx={b.x} bz={b.z} bkind={bkind} />;
 });
 
 /**
