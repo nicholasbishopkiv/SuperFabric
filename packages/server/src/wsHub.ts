@@ -1,6 +1,7 @@
 import { ClientMessage, type ServerMessage } from "@superfabric/shared";
 import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
+import type { ProjectManager } from "./projectManager.js";
 import type { RoomManager } from "./roomManager.js";
 import type { SessionManager } from "./sessionManager.js";
 import type { TaskStore } from "./taskStore.js";
@@ -33,6 +34,13 @@ export class WsHub {
   /** socket -> subscribed sessionIds with last sent seq */
   private subs = new Map<SocketLike, Map<string, number>>();
   /**
+   * socket -> the project it is looking at. **The active project is per-socket, not per-server**: a
+   * second tab watching another factory must not see this one's rooms, board or belts, and that is
+   * only true if every push is addressed by the socket's own scope rather than by a global "current
+   * project". Set at `attach` (to the last-opened project) and changed only by `open_project`.
+   */
+  private active = new Map<SocketLike, string>();
+  /**
    * One timer for every pushed list. A second mechanism per list would mean a burst of agent
    * activity costs one frame *per kind* per window instead of one frame, and would need its own
    * unref'd-timer discipline — so `sessions`, `tasks` and `messages` share this path.
@@ -47,6 +55,7 @@ export class WsHub {
     private store: EventStore,
     private mgr: SessionManager,
     private rooms: RoomManager,
+    private projects: ProjectManager,
     opts: WsHubOptions = {},
   ) {
     this.broadcastDebounceMs = opts.sessionsDebounceMs ?? BROADCAST_DEBOUNCE_MS;
@@ -77,8 +86,24 @@ export class WsHub {
     });
   }
 
-  attach(sock: SocketLike): void { this.subs.set(sock, new Map()); }
-  detach(sock: SocketLike): void { this.subs.delete(sock); }
+  /**
+   * A new socket starts on the last-opened project, so reloading a tab returns the operator to the
+   * factory they were in rather than to whichever folder the server was started from.
+   */
+  attach(sock: SocketLike): void {
+    this.subs.set(sock, new Map());
+    this.active.set(sock, this.projects.lastOpened().id);
+  }
+
+  detach(sock: SocketLike): void {
+    this.subs.delete(sock);
+    this.active.delete(sock);
+  }
+
+  /** Which factory a socket is looking at. Falls back to the default project for a socket we lost. */
+  private activeProject(sock: SocketLike): string {
+    return this.active.get(sock) ?? this.projects.defaultProject().id;
+  }
 
   /**
    * At most one broadcast per list per window, carrying whatever the state is when the timer fires —
@@ -136,8 +161,12 @@ export class WsHub {
           break;
         case "create_session": {
           // `autonomy` omitted => SessionManager applies the product default ("auto"); a `roomId`
-          // makes the room's folder the cwd, and an unknown one throws into the catch below.
-          const id = this.mgr.createSession({ cwd: msg.cwd, roomId: msg.roomId, autonomy: msg.autonomy });
+          // makes the room's folder the cwd, and an unknown one throws into the catch below. The
+          // active project is passed so a room from another factory is refused rather than adopted.
+          const id = this.mgr.createSession({
+            cwd: msg.cwd, roomId: msg.roomId, autonomy: msg.autonomy,
+            projectId: this.activeProject(sock),
+          });
           this.broadcastSessions();
           // The room's agentCount just changed; refresh it in the same round trip so the building's
           // label never lags behind the agent standing in it.
@@ -155,19 +184,41 @@ export class WsHub {
           break;
         // A query, not a state change: the answer belongs to the socket that asked. Broadcasting it
         // would make every tab's connect handshake spam every other tab with lists it already has.
-        case "list_sessions": this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions() }); break;
+        case "list_sessions":
+          this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions(this.activeProject(sock)) });
+          break;
         // Rooms: each case answers with the whole room list rather than a delta, so a client can
         // rebuild the floor from one message and never has to merge. A failure (duplicate name,
         // unknown id) throws into the catch below and is reported as an error instead.
         case "create_room":
-          this.rooms.createRoom(msg.name);
+          this.rooms.createRoom(msg.name, { projectId: this.activeProject(sock) });
           this.broadcastRooms();
           break;
         case "move_room":
+          this.requireRoomOnFloor(sock, msg.roomId);
           this.rooms.moveRoom(msg.roomId, msg.position);
           this.broadcastRooms();
           break;
-        case "list_rooms": this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms() }); break;
+        case "list_rooms":
+          this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms(this.activeProject(sock)) });
+          break;
+        // Projects. `list_projects` answers the asking socket; the other two change global state (a
+        // new project) or per-socket state (which floor this tab is on), and both end with this socket
+        // holding a complete, freshly scoped set of lists.
+        case "list_projects": this.sendProjects(sock); break;
+        case "create_project": {
+          const project = this.projects.create({
+            root: msg.root, ...(msg.name !== undefined ? { name: msg.name } : {}),
+          });
+          // A factory with no central building is not a factory: the floor would be empty and there
+          // would be nothing for the first room's belt to join.
+          this.rooms.ensureProjectRoom(project.id);
+          // The operator typed a path to go there, so go there — and tell every other tab that the
+          // switcher has a new entry.
+          this.openProject(sock, project.id);
+          break;
+        }
+        case "open_project": this.openProject(sock, msg.projectId); break;
         // Tasks. The board is global state like rooms are, so a change is broadcast — on the
         // coalescing path, because an agent driving `factory_task_update` can change it as fast as
         // it can call a tool. The broadcast is *not* scheduled here: the store announces its own
@@ -175,7 +226,10 @@ export class WsHub {
         // changes that never come through this hub. An unknown task or an assignee from the wrong
         // room throws into the catch below and is reported to the socket that asked.
         case "create_task":
-          this.taskStore().create({ title: msg.title, detail: msg.detail, roomId: msg.roomId });
+          this.taskStore().create({
+            title: msg.title, detail: msg.detail, roomId: msg.roomId,
+            projectId: this.activeProject(sock),
+          });
           break;
         case "update_task":
           this.taskStore().update(msg.taskId, {
@@ -184,10 +238,14 @@ export class WsHub {
             ...(msg.agentId !== undefined ? { agentId: msg.agentId } : {}),
           });
           break;
-        case "list_tasks": this.safeSend(sock, { kind: "tasks", tasks: this.taskStore().list() }); break;
+        case "list_tasks":
+          this.safeSend(sock, { kind: "tasks", tasks: this.taskStore().list(this.activeProject(sock)) });
+          break;
         // A query like the others: the socket that asked gets the bus's newest traffic, and nobody
         // else is spammed with a list they already hold.
-        case "list_messages": this.safeSend(sock, { kind: "messages", messages: this.busStore().list() }); break;
+        case "list_messages":
+          this.safeSend(sock, { kind: "messages", messages: this.busStore().list(this.activeProject(sock)) });
+          break;
       }
     } catch (err) {
       this.safeSend(sock, { kind: "error", message: String(err) });
@@ -195,34 +253,103 @@ export class WsHub {
   }
 
   /**
-   * Send a message to every attached socket. Room and session state is global to the factory, so a
-   * change made in one tab has to reach the others — otherwise a second tab shows a stale floor
-   * forever, and drag-to-move never propagates. Errors stay per-socket: they answer one request.
+   * Send a message to every attached socket **looking at the given project**. Room, session, board and
+   * bus state is global to a factory but not to the server, so a change made in one tab has to reach
+   * the other tabs on that floor — and must not reach a tab watching another one. The list is built
+   * once per project rather than once per socket, so ten tabs on one floor still cost one query.
+   *
+   * Errors stay per-socket: they answer one request.
    */
-  private broadcast(msg: ServerMessage): void {
+  private broadcastPerProject(build: (projectId: string) => ServerMessage | null): void {
+    const byProject = new Map<string, SocketLike[]>();
     // Snapshot the keys: a failed send detaches, and mutating the map while iterating it is how a
     // "cannot happen" skipped socket happens.
     for (const sock of [...this.subs.keys()]) {
-      if (!this.safeSend(sock, msg)) this.detach(sock);
+      const projectId = this.activeProject(sock);
+      const group = byProject.get(projectId);
+      if (group === undefined) byProject.set(projectId, [sock]);
+      else group.push(sock);
+    }
+    for (const [projectId, socks] of byProject) {
+      const msg = build(projectId);
+      if (msg === null) continue;
+      for (const sock of socks) {
+        if (!this.safeSend(sock, msg)) this.detach(sock);
+      }
     }
   }
 
   private broadcastRooms(): void {
-    this.broadcast({ kind: "rooms", rooms: this.rooms.listRooms() });
+    this.broadcastPerProject((p) => ({ kind: "rooms", rooms: this.rooms.listRooms(p) }));
   }
 
   private broadcastSessions(): void {
-    this.broadcast({ kind: "sessions", sessions: this.mgr.listSessions() });
+    this.broadcastPerProject((p) => ({ kind: "sessions", sessions: this.mgr.listSessions(p) }));
   }
 
   private broadcastTasks(): void {
     if (this.tasks === undefined) return;
-    this.broadcast({ kind: "tasks", tasks: this.tasks.list() });
+    this.broadcastPerProject((p) => ({ kind: "tasks", tasks: this.tasks!.list(p) }));
   }
 
   private broadcastMessages(): void {
     if (this.bus === undefined) return;
-    this.broadcast({ kind: "messages", messages: this.bus.list() });
+    this.broadcastPerProject((p) => ({ kind: "messages", messages: this.bus!.list(p) }));
+  }
+
+  /**
+   * The project list, plus which one *this* socket is on. Every socket gets the same projects and its
+   * own active id, so this is a per-socket frame even when the reason for sending it was global (a
+   * project someone else created).
+   */
+  private sendProjects(sock: SocketLike): void {
+    this.safeSend(sock, {
+      kind: "projects",
+      projects: this.projects.list(),
+      activeProjectId: this.activeProject(sock),
+    });
+  }
+
+  /**
+   * Point one socket at another factory. `ProjectManager.open` throws for an unknown id (reported as
+   * an error, nothing changed), then this socket is re-scoped and handed a complete fresh set of
+   * lists — rooms, agents, board, bus traffic — because the client throws away everything it held for
+   * the previous project rather than merging. Every other socket is only told that the switcher
+   * changed; their own floors are untouched.
+   */
+  private openProject(sock: SocketLike, projectId: string): void {
+    const project = this.projects.open(projectId);
+    this.active.set(sock, project.id);
+    // Session subscriptions belong to the floor this socket has just left: its transcripts are not
+    // this project's, and the client has dropped them too.
+    this.subs.set(sock, new Map());
+
+    this.sendProjects(sock);
+    this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms(project.id) });
+    this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions(project.id) });
+    if (this.tasks !== undefined) {
+      this.safeSend(sock, { kind: "tasks", tasks: this.tasks.list(project.id) });
+    }
+    if (this.bus !== undefined) {
+      this.safeSend(sock, { kind: "messages", messages: this.bus.list(project.id) });
+    }
+    // Other tabs: the switcher gained (or re-ordered) an entry, and their `lastOpenedAt` changed.
+    for (const other of [...this.subs.keys()]) {
+      if (other !== sock) this.sendProjects(other);
+    }
+  }
+
+  /**
+   * Refuse to touch a building that is not on the floor this socket is looking at. Room ids are
+   * globally unique, so without this a client holding another project's room id could move one — and
+   * the change would be broadcast to a floor that never asked for it.
+   */
+  private requireRoomOnFloor(sock: SocketLike, roomId: string): void {
+    const projectId = this.rooms.projectOf(roomId);
+    if (projectId === undefined) throw new Error(`unknown room ${roomId}`);
+    if (projectId !== this.activeProject(sock)) {
+      throw new Error(`room ${roomId} belongs to another project`);
+    }
   }
 
   /** A task request on a server with no task board is a routing error, not a silent no-op. */

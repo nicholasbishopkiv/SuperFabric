@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { TaskInfo, type TaskStatus } from "@superfabric/shared";
 import type { Db } from "./db.js";
+import type { ProjectManager } from "./projectManager.js";
 
 /** Row shape of `tasks`. */
 interface TaskRow {
   id: string;
+  project_id: string | null;
   title: string;
   detail: string;
   status: string;
@@ -20,6 +22,11 @@ export interface CreateTaskOptions {
   detail?: string;
   /** Owning room. Omitted (or null) means unassigned — the orchestrator routes it (M3b). */
   roomId?: string | null;
+  /**
+   * The factory this card belongs to. Defaults to the default project; the hub always passes the
+   * asking socket's active project, so a card can never land on another operator's board.
+   */
+  projectId?: string;
 }
 
 /**
@@ -51,30 +58,36 @@ export class TaskStore {
    * `now` is a seam, not a feature: `unixepoch()` has one-second resolution, so a test cannot
    * otherwise distinguish "updatedAt moved" from "the two writes landed in the same second".
    */
-  constructor(private db: Db, private now: () => number = () => Math.floor(Date.now() / 1000)) {
+  constructor(
+    private db: Db,
+    private projects: ProjectManager,
+    private now: () => number = () => Math.floor(Date.now() / 1000),
+  ) {
     this.stmts = {
       insert: db.prepare(`
-        INSERT INTO tasks (id, title, detail, status, room_id, created_at, updated_at)
-        VALUES (?, ?, ?, 'open', ?, ?, ?)
+        INSERT INTO tasks (id, project_id, title, detail, status, room_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'open', ?, ?, ?)
       `),
       one: db.prepare("SELECT * FROM tasks WHERE id = ?"),
       // Newest first, and `rowid` breaks the tie: at one-second resolution two tasks created in the
       // same second would otherwise come back in an order the operator cannot predict.
-      list: db.prepare("SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC"),
+      list: db.prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC, rowid DESC"),
       update: db.prepare(`
         UPDATE tasks
         SET title = ?, detail = ?, status = ?, room_id = ?, agent_id = ?,
             blocked_on_message_id = ?, updated_at = ?
         WHERE id = ?
       `),
-      room: db.prepare("SELECT id FROM rooms WHERE id = ?"),
+      room: db.prepare("SELECT project_id FROM rooms WHERE id = ?"),
+      taskProject: db.prepare("SELECT project_id FROM tasks WHERE id = ?"),
       sessionRoom: db.prepare("SELECT room_id FROM sessions WHERE id = ?"),
     };
   }
 
   create(opts: CreateTaskOptions): TaskInfo {
+    const projectId = opts.projectId ?? this.projects.defaultProject().id;
     const roomId = opts.roomId ?? null;
-    if (roomId !== null) this.requireRoom(roomId);
+    if (roomId !== null) this.requireRoomIn(projectId, roomId);
     const ts = this.now();
     const id = randomUUID();
     // Validate through the protocol shape rather than by hand: what the store accepts and what the
@@ -83,7 +96,9 @@ export class TaskStore {
       id, title: opts.title, detail: opts.detail ?? "", status: "open",
       roomId, agentId: null, blockedOnMessageId: null, createdAt: ts, updatedAt: ts,
     });
-    this.stmts.insert.run(draft.id, draft.title, draft.detail, draft.roomId, draft.createdAt, draft.updatedAt);
+    this.stmts.insert.run(
+      draft.id, projectId, draft.title, draft.detail, draft.roomId, draft.createdAt, draft.updatedAt,
+    );
     this.emitChange();
     return draft;
   }
@@ -109,7 +124,12 @@ export class TaskStore {
         : current.blockedOnMessageId,
       updatedAt: this.now(),
     };
-    if (next.roomId !== null && next.roomId !== current.roomId) this.requireRoom(next.roomId);
+    if (next.roomId !== null && next.roomId !== current.roomId) {
+      // A card may only move between rooms of its own factory: assigning it to a room on another
+      // floor would put work in front of an operator who cannot see the task that asked for it.
+      const row = this.stmts.taskProject.get(taskId) as { project_id: string | null } | null;
+      this.requireRoomIn(row?.project_id ?? null, next.roomId);
+    }
     if (next.agentId !== null) this.requireAgentInRoom(next.agentId, next.roomId);
 
     const parsed = TaskInfo.parse(next);
@@ -136,9 +156,9 @@ export class TaskStore {
     for (const l of this.listeners) l();
   }
 
-  /** Newest first: the board reads top-down and the newest card is the one being talked about. */
-  list(): TaskInfo[] {
-    return (this.stmts.list.all() as TaskRow[]).map(toTaskInfo);
+  /** One factory's board, newest first: it reads top-down and the newest card is the live one. */
+  list(projectId: string = this.projects.defaultProject().id): TaskInfo[] {
+    return (this.stmts.list.all(projectId) as TaskRow[]).map(toTaskInfo);
   }
 
   /** `undefined` for an unknown id — the absent-row shape the rest of the package speaks. */
@@ -148,8 +168,17 @@ export class TaskStore {
     return row == null ? undefined : toTaskInfo(row);
   }
 
-  private requireRoom(roomId: string): void {
-    if (this.stmts.room.get(roomId) == null) throw new Error(`unknown room ${roomId}`);
+  /**
+   * The room must exist *and* stand on the given factory. A room id is globally unique, so without
+   * this check a client that knew another project's room id could hang a card off it — and the card
+   * would then be listed on one board while naming a building on another.
+   */
+  private requireRoomIn(projectId: string | null, roomId: string): void {
+    const row = this.stmts.room.get(roomId) as { project_id: string } | null;
+    if (row == null) throw new Error(`unknown room ${roomId}`);
+    if (row.project_id !== projectId) {
+      throw new Error(`room ${roomId} belongs to another project`);
+    }
   }
 
   private requireAgentInRoom(agentId: string, roomId: string | null): void {

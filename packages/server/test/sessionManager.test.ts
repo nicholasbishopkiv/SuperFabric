@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
+import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
@@ -16,9 +17,27 @@ import type { SessionEvent } from "@superfabric/shared";
 function make(db = openDb(":memory:")) {
   const store = new EventStore(db);
   const exec = new FakeExecutor();
-  const rooms = new RoomManager(db, tmpdir());
-  const mgr = new SessionManager(db, store, exec, rooms);
-  return { db, store, exec, rooms, mgr };
+  const { projects, rooms } = factory(db);
+  const mgr = new SessionManager(db, store, exec, rooms, projects);
+  return { db, store, exec, projects, rooms, mgr };
+}
+
+/**
+ * The project- and room-scoped managers, built together because they share one `ProjectManager`.
+ * `root` is the default project's root, so a call that names no project lands there.
+ */
+function factory(db: ReturnType<typeof openDb>, root: string = tmpdir()) {
+  const projects = new ProjectManager(db, root);
+  return { projects, rooms: new RoomManager(db, projects) };
+}
+
+/**
+ * The last two `SessionManager` arguments (`rooms`, `projects`) for a case that does not care about
+ * either — spread, so a construction stays one line.
+ */
+function manager(db: ReturnType<typeof openDb>): [RoomManager, ProjectManager] {
+  const { projects, rooms } = factory(db);
+  return [rooms, projects];
 }
 
 describe("SessionManager", () => {
@@ -37,7 +56,7 @@ describe("SessionManager", () => {
     const db = openDb(":memory:");
     const store = new EventStore(db);
     const exec = new FakeExecutor({ script: [{ tool: "Bash", input: {} }] });
-    const mgr = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+    const mgr = new SessionManager(db, store, exec, ...manager(db));
     const id = mgr.createSession({ cwd: "/tmp" });
     mgr.prompt(id, "run it");
     // wait until the approval_request event lands in the store
@@ -61,7 +80,7 @@ describe("SessionManager", () => {
     mgr.prompt(id, "hi");
     await exec.settle();
     // new manager over the same db simulates a server restart
-    const mgr2 = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+    const mgr2 = new SessionManager(db, store, exec, ...manager(db));
     const resumed = mgr2.resumeAll();
     expect(resumed).toEqual([id]);
     mgr2.prompt(id, "again");
@@ -96,7 +115,7 @@ describe("SessionManager", () => {
       const db = openDb(":memory:");
       const store = new EventStore(db);
       const exec = new FakeExecutor({ script: [{ tool: "Bash", input: {} }] });
-      const mgr = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+      const mgr = new SessionManager(db, store, exec, ...manager(db));
       const id = mgr.createSession({ cwd: "/tmp" });
       mgr.prompt(id, "run it");
       await waitFor(() => {
@@ -143,7 +162,7 @@ describe("SessionManager", () => {
       const { db, store, exec, id, approvalId } = await withPendingApproval();
       // A fresh manager over the same db: the log still holds approval_request, but the resolver
       // died with the previous process.
-      const revived = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+      const revived = new SessionManager(db, store, exec, ...manager(db));
       revived.resumeAll();
       expect(() => revived.approve(id, approvalId, "allow")).toThrow(/expired with the previous process/);
       const rows = resolutions(store, id);
@@ -169,11 +188,11 @@ describe("SessionManager", () => {
     }
     const db = openDb(":memory:");
     const store = new EventStore(db);
-    const mgr = new SessionManager(db, store, new FailingExecutor(), new RoomManager(db, tmpdir()));
+    const mgr = new SessionManager(db, store, new FailingExecutor(), ...manager(db));
     const id = mgr.createSession({ cwd: "/tmp" });
     expect(mgr.listSessions()[0]).toMatchObject({ id, state: "error" });
     // a fresh manager (server restart) must not re-spawn a known-broken session
-    expect(new SessionManager(db, store, new FailingExecutor(), new RoomManager(db, tmpdir())).resumeAll()).toEqual([]);
+    expect(new SessionManager(db, store, new FailingExecutor(), ...manager(db)).resumeAll()).toEqual([]);
   });
 
   it("resumeAll reports only the sessions it actually started", async () => {
@@ -182,7 +201,7 @@ describe("SessionManager", () => {
     const id = mgr.createSession({ cwd: "/tmp" });
     // the same manager already holds a live handle for it
     expect(mgr.resumeAll()).toEqual([]);
-    const mgr2 = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+    const mgr2 = new SessionManager(db, store, exec, ...manager(db));
     expect(mgr2.resumeAll()).toEqual([id]);
     expect(mgr2.resumeAll()).toEqual([]);
   });
@@ -212,7 +231,7 @@ describe("SessionManager", () => {
     const cwd = mkdtempSync(join(tmpdir(), "superfabric-resume-"));
 
     const exec1 = new RecordingExecutor(providerId);
-    const mgr = new SessionManager(db, store, exec1, new RoomManager(db, tmpdir()));
+    const mgr = new SessionManager(db, store, exec1, ...manager(db));
     const id = mgr.createSession({ cwd });
     expect(exec1.starts).toHaveLength(1);
     expect(exec1.starts[0].cwd).toBe(cwd);
@@ -226,7 +245,7 @@ describe("SessionManager", () => {
 
     // restart: a second manager over the same db must hand the stored id back to the executor
     const exec2 = new RecordingExecutor(providerId);
-    const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
+    const mgr2 = new SessionManager(db, store, exec2, ...manager(db));
     expect(mgr2.resumeAll()).toEqual([id]);
     expect(exec2.starts).toHaveLength(1);
     expect(exec2.starts[0].resumeSessionId).toBe(providerId);
@@ -257,7 +276,7 @@ describe("SessionManager", () => {
     const setup = (db = openDb(":memory:")) => {
       const store = new EventStore(db);
       const exec = new RecordingExecutor();
-      return { db, store, exec, mgr: new SessionManager(db, store, exec, new RoomManager(db, tmpdir())) };
+      return { db, store, exec, mgr: new SessionManager(db, store, exec, ...manager(db)) };
     };
 
     const stored = (db: ReturnType<typeof openDb>, id: string) =>
@@ -350,7 +369,7 @@ describe("SessionManager", () => {
 
       // a second manager over the same db simulates a server restart
       const exec2 = new RecordingExecutor();
-      const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
+      const mgr2 = new SessionManager(db, store, exec2, ...manager(db));
       expect(mgr2.resumeAll()).toEqual([id]);
       expect(exec2.starts[0].autonomy).toBe("bypass");
       expect(mgr2.listSessions().find(s => s.id === id)!.autonomy).toBe("bypass");
@@ -363,7 +382,7 @@ describe("SessionManager", () => {
       db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?").run("nonsense", id);
       expect(mgr.listSessions()[0].autonomy).toBe("auto");
       const exec2 = new RecordingExecutor();
-      const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
+      const mgr2 = new SessionManager(db, store, exec2, ...manager(db));
       mgr2.resumeAll();
       expect(exec2.starts[0].autonomy).toBe("auto");
     });
@@ -391,17 +410,21 @@ describe("SessionManager", () => {
     /** A project root with one real room folder, plus a manager wired to it. */
     function withRoom<T>(fn: (ctx: {
       db: ReturnType<typeof openDb>; store: EventStore; exec: RecordingExecutor;
-      rooms: RoomManager; mgr: SessionManager; room: ReturnType<RoomManager["createRoom"]>;
+      rooms: RoomManager; projects: ProjectManager; mgr: SessionManager;
+      room: ReturnType<RoomManager["createRoom"]>;
     }) => T): T {
       const root = mkdtempSync(join(tmpdir(), "superfabric-session-room-"));
       const db = openDb(":memory:");
       try {
         const store = new EventStore(db);
         const exec = new RecordingExecutor();
-        const rooms = new RoomManager(db, root);
+        const { projects, rooms } = factory(db, root);
         rooms.ensureProjectRoom();
         const room = rooms.createRoom("backend");
-        return fn({ db, store, exec, rooms, mgr: new SessionManager(db, store, exec, rooms), room });
+        return fn({
+          db, store, exec, rooms, projects, room,
+          mgr: new SessionManager(db, store, exec, rooms, projects),
+        });
       } finally {
         // The db is in-memory and deliberately left open: a session's providerSessionId lands on a
         // later microtask, and closing underneath it turns a passing test into a stray rejection.
@@ -443,10 +466,10 @@ describe("SessionManager", () => {
     });
 
     it("keeps the room across a restart", () => {
-      withRoom(({ db, store, rooms, mgr, room }) => {
+      withRoom(({ db, store, rooms, projects, mgr, room }) => {
         const id = mgr.createSession({ roomId: room.id });
         const exec2 = new RecordingExecutor();
-        const revived = new SessionManager(db, store, exec2, rooms);
+        const revived = new SessionManager(db, store, exec2, rooms, projects);
         expect(revived.resumeAll()).toEqual([id]);
         expect(exec2.starts[0].cwd).toBe(room.path);
         expect(revived.listSessions().find((s) => s.id === id)!.roomId).toBe(room.id);
@@ -493,7 +516,7 @@ describe("SessionManager", () => {
     /** A manager wired to a real bus and task store over two real rooms. */
     function withBus<T>(fn: (ctx: {
       db: ReturnType<typeof openDb>; store: EventStore; exec: RecordingExecutor; rooms: RoomManager;
-      mgr: SessionManager; bus: FactoryBus; tasks: TaskStore;
+      projects: ProjectManager; mgr: SessionManager; bus: FactoryBus; tasks: TaskStore;
       chat: ReturnType<RoomManager["createRoom"]>; payments: ReturnType<RoomManager["createRoom"]>;
       delivered: { sessionId: string; text: string }[];
     }) => T): T {
@@ -502,19 +525,19 @@ describe("SessionManager", () => {
       try {
         const store = new EventStore(db);
         const exec = new RecordingExecutor();
-        const rooms = new RoomManager(db, root);
+        const { projects, rooms } = factory(db, root);
         rooms.ensureProjectRoom();
         const chat = rooms.createRoom("chat");
         const payments = rooms.createRoom("payments");
         const delivered: { sessionId: string; text: string }[] = [];
-        const tasks = new TaskStore(db);
+        const tasks = new TaskStore(db, projects);
         const bus = new FactoryBus({
-          db, rooms,
+          db, rooms, projects,
           deliver: (sessionId, text) => { delivered.push({ sessionId, text }); },
           roomAgents: () => [],
         });
-        const mgr = new SessionManager(db, store, exec, rooms, { bus, tasks });
-        return fn({ db, store, exec, rooms, mgr, bus, tasks, chat, payments, delivered });
+        const mgr = new SessionManager(db, store, exec, rooms, projects, { bus, tasks });
+        return fn({ db, store, exec, rooms, projects, mgr, bus, tasks, chat, payments, delivered });
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -563,11 +586,11 @@ describe("SessionManager", () => {
         const db = openDb(":memory:");
         const store = new EventStore(db);
         const exec = new RecordingExecutor();
-        const rooms = new RoomManager(db, root);
+        const { projects, rooms } = factory(db, root);
         rooms.ensureProjectRoom();
         const room = rooms.createRoom("chat");
         // an M0-shaped server: no bus, no task store, and rooms that simply have no tools
-        new SessionManager(db, store, exec, rooms).createSession({ roomId: room.id });
+        new SessionManager(db, store, exec, rooms, projects).createSession({ roomId: room.id });
         expect(exec.starts[0]!.mcpServers).toEqual({});
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -589,10 +612,10 @@ describe("SessionManager", () => {
     });
 
     it("keeps the tool set across a restart, built from the stored room", () => {
-      withBus(({ db, store, rooms, bus, tasks, mgr, chat }) => {
+      withBus(({ db, store, rooms, projects, bus, tasks, mgr, chat }) => {
         mgr.createSession({ roomId: chat.id });
         const exec2 = new RecordingExecutor();
-        const mgr2 = new SessionManager(db, store, exec2, rooms, { bus, tasks });
+        const mgr2 = new SessionManager(db, store, exec2, rooms, projects, { bus, tasks });
         expect(mgr2.resumeAll()).toHaveLength(1);
         expect(Object.keys(exec2.starts[0]!.mcpServers ?? {})).toEqual(["factory"]);
       });
@@ -621,21 +644,21 @@ describe("SessionManager", () => {
       const db = openDb(":memory:");
       try {
         const store = new EventStore(db);
-        const rooms = new RoomManager(db, root);
+        const { projects, rooms } = factory(db, root);
         rooms.ensureProjectRoom();
         const chat = rooms.createRoom("chat");
         const payments = rooms.createRoom("payments");
         const exec = new FakeExecutor();
-        const tasks = new TaskStore(db);
+        const tasks = new TaskStore(db, projects);
         // `mgr` is only read inside the callbacks, which cannot run before it is assigned — the same
         // knot index.ts unties, and the reason the bus takes callbacks at all.
         let mgr!: SessionManager;
         const bus = new FactoryBus({
-          db, rooms,
+          db, rooms, projects,
           deliver: (sessionId, text) => mgr.prompt(sessionId, text),
           roomAgents: (roomId) => mgr.roomAgents(roomId),
         });
-        mgr = new SessionManager(db, store, exec, rooms, { bus, tasks });
+        mgr = new SessionManager(db, store, exec, rooms, projects, { bus, tasks });
         return fn({ store, exec, mgr, bus, chat, payments });
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -754,7 +777,7 @@ describe("SessionManager", () => {
     function silent() {
       const db = openDb(":memory:");
       const store = new EventStore(db);
-      const mgr = new SessionManager(db, store, new SilentExecutor(), new RoomManager(db, tmpdir()));
+      const mgr = new SessionManager(db, store, new SilentExecutor(), ...manager(db));
       return { db, store, mgr };
     }
 
@@ -889,7 +912,7 @@ describe("SessionManager", () => {
       }
       const db = openDb(":memory:");
       const store = new EventStore(db);
-      const mgr = new SessionManager(db, store, new HangingExecutor(), new RoomManager(db, tmpdir()));
+      const mgr = new SessionManager(db, store, new HangingExecutor(), ...manager(db));
       const id = mgr.createSession({ cwd: "/tmp" });
 
       const start = Date.now();
@@ -903,6 +926,81 @@ describe("SessionManager", () => {
       mgr.createSession({ cwd: "/tmp" });
       await mgr.stopAll();
       await expect(mgr.stopAll()).resolves.toBeUndefined();
+    });
+  });
+
+  // ---- M1b: agents belong to a factory ----
+
+  describe("projects", () => {
+    /** Two factories over one db, each with a room called "backend". */
+    function twoFactories<T>(fn: (ctx: {
+      mgr: SessionManager;
+      rooms: RoomManager;
+      home: string;
+      away: string;
+      homeRoom: ReturnType<RoomManager["createRoom"]>;
+      awayRoom: ReturnType<RoomManager["createRoom"]>;
+    }) => T): T {
+      const homeRoot = mkdtempSync(join(tmpdir(), "superfabric-session-home-"));
+      const awayRoot = mkdtempSync(join(tmpdir(), "superfabric-session-away-"));
+      const db = openDb(":memory:");
+      try {
+        const store = new EventStore(db);
+        const { projects, rooms } = factory(db, homeRoot);
+        const home = projects.defaultProject().id;
+        const away = projects.create({ root: awayRoot }).id;
+        rooms.ensureProjectRoom(home);
+        rooms.ensureProjectRoom(away);
+        return fn({
+          mgr: new SessionManager(db, store, new FakeExecutor(), rooms, projects),
+          rooms, home, away,
+          homeRoom: rooms.createRoom("backend", { projectId: home }),
+          awayRoom: rooms.createRoom("backend", { projectId: away }),
+        });
+      } finally {
+        rmSync(homeRoot, { recursive: true, force: true });
+        rmSync(awayRoot, { recursive: true, force: true });
+      }
+    }
+
+    it("lists only one factory's agents", () => {
+      twoFactories(({ mgr, home, away, homeRoom, awayRoom }) => {
+        const here = mgr.createSession({ roomId: homeRoom.id });
+        const there = mgr.createSession({ roomId: awayRoom.id });
+        // and a roomless agent, which still belongs to whichever floor created it
+        const loose = mgr.createSession({ cwd: homeRoom.path, projectId: away });
+
+        expect(mgr.listSessions(home).map((s) => s.id)).toEqual([here]);
+        expect(mgr.listSessions(away).map((s) => s.id).sort()).toEqual([there, loose].sort());
+      });
+    });
+
+    it("takes the project from the room, and refuses a room on another floor", () => {
+      twoFactories(({ mgr, home, away, homeRoom, awayRoom }) => {
+        // No project named: the room decides, so an agent can never end up on a floor its own
+        // building does not stand on.
+        mgr.createSession({ roomId: awayRoom.id });
+        expect(mgr.listSessions(away)).toHaveLength(1);
+        expect(mgr.listSessions(home)).toHaveLength(0);
+
+        // Both named and disagreeing: refused rather than silently believing one of them.
+        expect(() => mgr.createSession({ roomId: awayRoom.id, projectId: home }))
+          .toThrow(/belongs to another project/);
+        expect(() => mgr.createSession({ roomId: homeRoom.id, projectId: away }))
+          .toThrow(/belongs to another project/);
+        expect(mgr.listSessions(away)).toHaveLength(1);
+        expect(mgr.listSessions(home)).toHaveLength(0);
+      });
+    });
+
+    it("reports a room's agents from that room alone, not from a same-named room elsewhere", () => {
+      twoFactories(({ mgr, homeRoom, awayRoom }) => {
+        const here = mgr.createSession({ roomId: homeRoom.id });
+        mgr.createSession({ roomId: awayRoom.id });
+        // The bus asks this at every turn boundary; a room id is unique, so the answer must be too.
+        expect(mgr.roomAgents(homeRoom.id).map((a) => a.sessionId)).toEqual([here]);
+        expect(mgr.roomAgents(awayRoom.id).map((a) => a.sessionId)).not.toContain(here);
+      });
     });
   });
 });

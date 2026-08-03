@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { MessageInfo, type MessageKind, type SessionStatus } from "@superfabric/shared";
 import type { Db } from "./db.js";
+import type { ProjectManager } from "./projectManager.js";
 import type { RoomManager } from "./roomManager.js";
 
 /** Row shape of `messages`. */
 interface MessageRow {
   id: string;
+  project_id: string | null;
   from_room_id: string;
   to_room_id: string;
   kind: string;
@@ -33,6 +35,8 @@ export interface SendOptions {
 export interface FactoryBusDeps {
   db: Db;
   rooms: RoomManager;
+  /** Only used to answer "which factory's traffic?" when a caller does not say. */
+  projects: ProjectManager;
   /**
    * Inject a turn into a live agent's input stream (`SessionManager.prompt`, wired in `index.ts`).
    * A callback rather than the manager itself: the dependency stays one-way and the bus is
@@ -72,6 +76,7 @@ function isAvailable(status: SessionStatus): boolean {
 export class FactoryBus {
   private readonly db: Db;
   private readonly rooms: RoomManager;
+  private readonly projects: ProjectManager;
   private readonly deliverTo: (sessionId: string, text: string) => void;
   private readonly roomAgents: (roomId: string) => RoomAgent[];
   private readonly now: () => number;
@@ -83,25 +88,30 @@ export class FactoryBus {
   constructor(deps: FactoryBusDeps) {
     this.db = deps.db;
     this.rooms = deps.rooms;
+    this.projects = deps.projects;
     this.deliverTo = deps.deliver;
     this.roomAgents = deps.roomAgents;
     this.now = deps.now ?? (() => Math.floor(Date.now() / 1000));
     this.stmts = {
       insert: this.db.prepare(`
-        INSERT INTO messages (id, from_room_id, to_room_id, kind, body, task_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO messages (id, project_id, from_room_id, to_room_id, kind, body, task_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `),
       one: this.db.prepare("SELECT * FROM messages WHERE id = ?"),
-      // Oldest first: a queue is answered in the order the questions were asked.
+      // Oldest first: a queue is answered in the order the questions were asked. Scoped by project as
+      // well as by room even though a room id already implies a project — the index still drives the
+      // lookup, and a mis-stamped row can then never be carried onto the wrong floor.
       undelivered: this.db.prepare(`
-        SELECT * FROM messages WHERE to_room_id = ? AND delivered_at IS NULL
+        SELECT * FROM messages WHERE project_id = ? AND to_room_id = ? AND delivered_at IS NULL
         ORDER BY created_at, rowid
       `),
       deliveredFor: this.db.prepare(`
-        SELECT * FROM messages WHERE to_room_id = ? AND delivered_at IS NOT NULL
+        SELECT * FROM messages WHERE project_id = ? AND to_room_id = ? AND delivered_at IS NOT NULL
         ORDER BY delivered_at DESC, rowid DESC LIMIT ?
       `),
-      list: this.db.prepare("SELECT * FROM messages ORDER BY created_at DESC, rowid DESC LIMIT ?"),
+      list: this.db.prepare(
+        "SELECT * FROM messages WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+      ),
       // `AND delivered_at IS NULL` is what makes delivery idempotent at the storage level: a
       // second flush of the same row changes nothing and reports 0 changes.
       markDelivered: this.db.prepare("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL"),
@@ -114,8 +124,13 @@ export class FactoryBus {
    * whose sender or recipient does not exist is not something the operator could ever act on.
    */
   send(opts: SendOptions): MessageInfo {
-    this.requireRoom(opts.fromRoomId);
-    this.requireRoom(opts.toRoomId);
+    const projectId = this.requireRoom(opts.fromRoomId);
+    // Both ends on the same floor. Rooms of two different factories are not departments of one
+    // company: a belt between them would be drawn on neither floor, and the message would show up in
+    // one operator's traffic and not the other's.
+    if (this.requireRoom(opts.toRoomId) !== projectId) {
+      throw new Error(`rooms ${opts.fromRoomId} and ${opts.toRoomId} belong to different projects`);
+    }
 
     // Validate through the protocol's own shape: what the bus accepts and what the wire accepts are
     // the same thing, and only one of them should own the limits.
@@ -130,7 +145,7 @@ export class FactoryBus {
       createdAt: this.now(),
     });
     this.stmts.insert.run(
-      msg.id, msg.fromRoomId, msg.toRoomId, msg.kind, msg.body, msg.taskId, msg.createdAt,
+      msg.id, projectId, msg.fromRoomId, msg.toRoomId, msg.kind, msg.body, msg.taskId, msg.createdAt,
     );
     this.emitChange();
 
@@ -146,13 +161,17 @@ export class FactoryBus {
    * which is empty whenever the room has nobody free — that is the normal, non-exceptional case.
    */
   flushRoom(roomId: string): MessageInfo[] {
+    // An unknown room has no queue. This is the normal shape of a stale call (a room removed while a
+    // turn was in flight), not an error worth throwing at an executor's event handler.
+    const projectId = this.rooms.projectOf(roomId);
+    if (projectId === undefined) return [];
     // A re-entrant call (an executor that reaches a turn boundary synchronously inside deliver())
     // would otherwise walk the same queue again before the first pass finished marking it.
     if (this.flushing.has(roomId)) return [];
     this.flushing.add(roomId);
     try {
       const carried: MessageInfo[] = [];
-      for (const row of this.stmts.undelivered.all(roomId) as MessageRow[]) {
+      for (const row of this.stmts.undelivered.all(projectId, roomId) as MessageRow[]) {
         const agent = this.roomAgents(roomId).find((a) => isAvailable(a.status));
         if (agent === undefined) break; // nobody free; the rest of the queue waits with it
         const msg = toMessageInfo(row);
@@ -178,17 +197,26 @@ export class FactoryBus {
 
   /** That room's queue, oldest first — what nobody has picked up yet. */
   undeliveredFor(roomId: string): MessageInfo[] {
-    return (this.stmts.undelivered.all(roomId) as MessageRow[]).map(toMessageInfo);
+    const projectId = this.rooms.projectOf(roomId);
+    if (projectId === undefined) return [];
+    return (this.stmts.undelivered.all(projectId, roomId) as MessageRow[]).map(toMessageInfo);
   }
 
   /** That room's recent carried traffic, newest first. */
   deliveredFor(roomId: string, limit = 20): MessageInfo[] {
-    return (this.stmts.deliveredFor.all(roomId, limit) as MessageRow[]).map(toMessageInfo);
+    const projectId = this.rooms.projectOf(roomId);
+    if (projectId === undefined) return [];
+    return (this.stmts.deliveredFor.all(projectId, roomId, limit) as MessageRow[]).map(toMessageInfo);
   }
 
-  /** All traffic, newest first. Includes undelivered messages: the operator must see a pile-up. */
-  list(limit = 200): MessageInfo[] {
-    return (this.stmts.list.all(limit) as MessageRow[]).map(toMessageInfo);
+  /**
+   * One factory's traffic, newest first. Includes undelivered messages: the operator must see a
+   * pile-up. Another project's traffic is never in here — a second tab watching another floor draws
+   * its own belts, and one factory's boxes appearing on another's is exactly the bug this scoping
+   * exists to make impossible.
+   */
+  list(projectId: string = this.projects.defaultProject().id, limit = 200): MessageInfo[] {
+    return (this.stmts.list.all(projectId, limit) as MessageRow[]).map(toMessageInfo);
   }
 
   /** `undefined` for an unknown id — the absent-row shape the rest of the package speaks. */
@@ -228,8 +256,11 @@ export class FactoryBus {
     return lines.join("\n");
   }
 
-  private requireRoom(roomId: string): void {
-    if (this.rooms.getRoom(roomId) === undefined) throw new Error(`unknown room ${roomId}`);
+  /** The room's project, or a throw. Returning it is how `send` learns which floor to stamp. */
+  private requireRoom(roomId: string): string {
+    const projectId = this.rooms.projectOf(roomId);
+    if (projectId === undefined) throw new Error(`unknown room ${roomId}`);
+    return projectId;
   }
 
   private emitChange(): void {

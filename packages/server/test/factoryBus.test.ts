@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { SessionStatus } from "@superfabric/shared";
 import { openDb } from "../src/db.js";
 import { FactoryBus, type RoomAgent } from "../src/factoryBus.js";
+import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
 
 /**
@@ -15,7 +16,8 @@ import { RoomManager } from "../src/roomManager.js";
 function makeBus() {
   const root = mkdtempSync(join(tmpdir(), "superfabric-bus-"));
   const db = openDb(":memory:");
-  const rooms = new RoomManager(db, root);
+  const projects = new ProjectManager(db, root);
+  const rooms = new RoomManager(db, projects);
   rooms.ensureProjectRoom();
   const chat = rooms.createRoom("chat");
   const payments = rooms.createRoom("payments");
@@ -29,6 +31,7 @@ function makeBus() {
   const bus = new FactoryBus({
     db,
     rooms,
+    projects,
     deliver: (sessionId, text) => {
       if (deliverThrows) throw new Error("no live session");
       delivered.push({ sessionId, text });
@@ -38,7 +41,7 @@ function makeBus() {
   });
 
   return {
-    db, rooms, bus, chat, payments, delivered, agents,
+    db, rooms, projects, bus, chat, payments, delivered, agents,
     tick: () => { now += 5; },
     setAgents: (roomId: string, list: { sessionId: string; status: SessionStatus }[]) =>
       agents.set(roomId, list),
@@ -280,19 +283,108 @@ describe("FactoryBus", () => {
   });
 
   it("survives a restart: an undelivered message is still queued for a new bus over the same db", () => {
-    withBus(({ db, rooms, bus, chat, payments }) => {
+    withBus(({ db, rooms, projects, bus, chat, payments }) => {
       // no agents in this bus's view, so the message can only be queued
       const msg = bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "durable" });
 
       const delivered: string[] = [];
       const resumed = new FactoryBus({
-        db, rooms,
+        db, rooms, projects,
         deliver: (sessionId) => { delivered.push(sessionId); },
         roomAgents: () => [{ sessionId: "pay-1", status: "idle" }],
       });
       expect(resumed.undeliveredFor(payments.id).map(m => m.id)).toEqual([msg.id]);
       expect(resumed.flushRoom(payments.id).map(m => m.id)).toEqual([msg.id]);
       expect(delivered).toEqual(["pay-1"]);
+    });
+  });
+
+  // ---- M1b: one bus, one factory's traffic ----
+
+  describe("projects", () => {
+    /** A second factory over the same db, with rooms of the same names as the first. */
+    function secondFactory(ctx: ReturnType<typeof makeBus>) {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-bus-other-"));
+      const id = ctx.projects.create({ root }).id;
+      ctx.rooms.ensureProjectRoom(id);
+      return {
+        id,
+        chat: ctx.rooms.createRoom("chat", { projectId: id }),
+        payments: ctx.rooms.createRoom("payments", { projectId: id }),
+        cleanup: () => rmSync(root, { recursive: true, force: true }),
+      };
+    }
+
+    it("lists only the asked-for factory's traffic", () => {
+      withBus((ctx) => {
+        const other = secondFactory(ctx);
+        try {
+          const here = ctx.bus.send({
+            fromRoomId: ctx.chat.id, toRoomId: ctx.payments.id, kind: "info", body: "ours",
+          });
+          const there = ctx.bus.send({
+            fromRoomId: other.chat.id, toRoomId: other.payments.id, kind: "info", body: "theirs",
+          });
+
+          const home = ctx.rooms.projectOf(ctx.chat.id)!;
+          expect(ctx.bus.list(home).map((m) => m.id)).toEqual([here.id]);
+          expect(ctx.bus.list(other.id).map((m) => m.id)).toEqual([there.id]);
+        } finally {
+          other.cleanup();
+        }
+      });
+    });
+
+    it("keeps each room's queue to its own factory, same room names and all", () => {
+      withBus((ctx) => {
+        const other = secondFactory(ctx);
+        try {
+          const here = ctx.bus.send({
+            fromRoomId: ctx.chat.id, toRoomId: ctx.payments.id, kind: "request", body: "ours",
+          });
+          ctx.bus.send({
+            fromRoomId: other.chat.id, toRoomId: other.payments.id, kind: "request", body: "theirs",
+          });
+
+          expect(ctx.bus.undeliveredFor(ctx.payments.id).map((m) => m.body)).toEqual(["ours"]);
+          expect(ctx.bus.undeliveredFor(other.payments.id).map((m) => m.body)).toEqual(["theirs"]);
+
+          // and a flush carries only this floor's message, to this floor's agent
+          ctx.setAgents(ctx.payments.id, [{ sessionId: "pay-here", status: "idle" }]);
+          expect(ctx.bus.flushRoom(ctx.payments.id).map((m) => m.id)).toEqual([here.id]);
+          expect(ctx.bus.undeliveredFor(other.payments.id)).toHaveLength(1);
+          expect(ctx.bus.deliveredFor(other.payments.id)).toEqual([]);
+        } finally {
+          other.cleanup();
+        }
+      });
+    });
+
+    it("refuses a message between two factories", () => {
+      withBus((ctx) => {
+        const other = secondFactory(ctx);
+        try {
+          // Rooms of two different projects are not departments of one company: a belt between them
+          // would be drawn on neither floor.
+          expect(() => ctx.bus.send({
+            fromRoomId: ctx.chat.id, toRoomId: other.payments.id, kind: "info", body: "across",
+          })).toThrow(/different projects/);
+          expect(ctx.bus.list(other.id)).toEqual([]);
+          expect(ctx.bus.list(ctx.rooms.projectOf(ctx.chat.id)!)).toEqual([]);
+        } finally {
+          other.cleanup();
+        }
+      });
+    });
+
+    it("treats an unknown room as an empty queue rather than a throw", () => {
+      withBus(({ bus }) => {
+        // A stale flush (a room removed while a turn was in flight) reaches this from an executor's
+        // event handler, where a throw would be an uncaught exception.
+        expect(bus.flushRoom("nope")).toEqual([]);
+        expect(bus.undeliveredFor("nope")).toEqual([]);
+        expect(bus.deliveredFor("nope")).toEqual([]);
+      });
     });
   });
 });

@@ -1,17 +1,23 @@
 import { describe, it, expect } from "bun:test";
+import { tmpdir } from "node:os";
 import { openDb, type Db } from "../src/db.js";
+import { ProjectManager } from "../src/projectManager.js";
 import { TaskStore } from "../src/taskStore.js";
 
 /**
  * A store over an in-memory db with a clock the test drives. `unixepoch()` has one-second
  * resolution, so a real clock cannot tell "updatedAt moved" from "the test ran fast"; the seam
  * makes the ordering assertions about the code rather than about the machine.
+ *
+ * `projectId` is the default project's: a `create` that names no project lands there, which is what
+ * every case below relies on unless it is specifically about two factories.
  */
-function makeStore(): { db: Db; tasks: TaskStore; tick: () => void } {
+function makeStore(): { db: Db; projects: ProjectManager; projectId: string; tasks: TaskStore; tick: () => void } {
   const db = openDb(":memory:");
   let now = 1_000;
-  const tasks = new TaskStore(db, () => now);
-  return { db, tasks, tick: () => { now += 5; } };
+  const projects = new ProjectManager(db, tmpdir());
+  const tasks = new TaskStore(db, projects, () => now);
+  return { db, projects, projectId: projects.defaultProject().id, tasks, tick: () => { now += 5; } };
 }
 
 /** A session row in a given room (or roomless), inserted directly — TaskStore only reads them. */
@@ -19,14 +25,16 @@ function addSession(db: Db, id: string, roomId: string | null): void {
   db.prepare("INSERT INTO sessions (id, cwd, room_id) VALUES (?, ?, ?)").run(id, "/tmp", roomId);
 }
 
-function addRoom(db: Db, id: string, name: string): void {
-  db.prepare("INSERT INTO rooms (id, name, path) VALUES (?, ?, ?)").run(id, name, `/p/${name}`);
+/** A room row on a given floor, inserted directly — TaskStore only reads them. */
+function addRoom(db: Db, id: string, name: string, projectId: string): void {
+  db.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
+    .run(id, projectId, name, `/p/${name}`);
 }
 
 describe("TaskStore", () => {
   it("creates, lists and reads a task back", () => {
-    const { db, tasks } = makeStore();
-    addRoom(db, "r1", "payments");
+    const { db, tasks, projectId } = makeStore();
+    addRoom(db, "r1", "payments", projectId);
     const created = tasks.create({ title: "Expose a webhook", detail: "for the chat room", roomId: "r1" });
 
     expect(created).toMatchObject({
@@ -68,8 +76,8 @@ describe("TaskStore", () => {
   });
 
   it("leaves fields the patch does not mention exactly as they were", () => {
-    const { db, tasks } = makeStore();
-    addRoom(db, "r1", "payments");
+    const { db, tasks, projectId } = makeStore();
+    addRoom(db, "r1", "payments", projectId);
     const t = tasks.create({ title: "Expose a webhook", detail: "with a signature", roomId: "r1" });
     const updated = tasks.update(t.id, { status: "review" });
     expect(updated).toMatchObject({ title: "Expose a webhook", detail: "with a signature", roomId: "r1" });
@@ -110,8 +118,8 @@ describe("TaskStore", () => {
   });
 
   it("assigns an agent that works in the task's room", () => {
-    const { db, tasks } = makeStore();
-    addRoom(db, "r1", "payments");
+    const { db, tasks, projectId } = makeStore();
+    addRoom(db, "r1", "payments", projectId);
     addSession(db, "s1", "r1");
     const t = tasks.create({ title: "Expose a webhook", roomId: "r1" });
     expect(tasks.update(t.id, { agentId: "s1" }).agentId).toBe("s1");
@@ -119,9 +127,9 @@ describe("TaskStore", () => {
   });
 
   it("refuses an agent whose session is not in the task's room", () => {
-    const { db, tasks } = makeStore();
-    addRoom(db, "r1", "payments");
-    addRoom(db, "r2", "chat");
+    const { db, tasks, projectId } = makeStore();
+    addRoom(db, "r1", "payments", projectId);
+    addRoom(db, "r2", "chat", projectId);
     addSession(db, "elsewhere", "r2");
     addSession(db, "roomless", null);
     const t = tasks.create({ title: "Expose a webhook", roomId: "r1" });
@@ -134,25 +142,25 @@ describe("TaskStore", () => {
   });
 
   it("refuses an agent on a task that has no room", () => {
-    const { db, tasks } = makeStore();
-    addRoom(db, "r1", "payments");
+    const { db, tasks, projectId } = makeStore();
+    addRoom(db, "r1", "payments", projectId);
     addSession(db, "s1", "r1");
     const t = tasks.create({ title: "Unassigned" });
     expect(() => tasks.update(t.id, { agentId: "s1" })).toThrow(/has no room/);
   });
 
   it("takes a room and an agent in the same patch", () => {
-    const { db, tasks } = makeStore();
-    addRoom(db, "r1", "payments");
+    const { db, tasks, projectId } = makeStore();
+    addRoom(db, "r1", "payments", projectId);
     addSession(db, "s1", "r1");
     const t = tasks.create({ title: "Expose a webhook" });
     expect(tasks.update(t.id, { roomId: "r1", agentId: "s1" })).toMatchObject({ roomId: "r1", agentId: "s1" });
   });
 
   it("refuses to move a task to a room its assignee does not work in", () => {
-    const { db, tasks } = makeStore();
-    addRoom(db, "r1", "payments");
-    addRoom(db, "r2", "chat");
+    const { db, tasks, projectId } = makeStore();
+    addRoom(db, "r1", "payments", projectId);
+    addRoom(db, "r2", "chat", projectId);
     addSession(db, "s1", "r1");
     const t = tasks.create({ title: "Expose a webhook", roomId: "r1" });
     tasks.update(t.id, { agentId: "s1" });
@@ -202,10 +210,53 @@ describe("TaskStore", () => {
     expect(changes).toBe(0);
   });
 
+  // ---- M1b: one board per factory ----
+
+  describe("projects", () => {
+    /** Two factories over one db, each with a room of the same name. */
+    function twoProjects() {
+      const ctx = makeStore();
+      const other = ctx.projects.create({ root: tmpdir() === "/tmp" ? "/usr" : "/tmp" }).id;
+      addRoom(ctx.db, "r1", "payments", ctx.projectId);
+      addRoom(ctx.db, "r2", "payments", other);
+      return { ...ctx, other };
+    }
+
+    it("lists only the asked-for project's board", () => {
+      const { tasks, projectId, other } = twoProjects();
+      const here = tasks.create({ title: "ours", roomId: "r1", projectId });
+      const there = tasks.create({ title: "theirs", roomId: "r2", projectId: other });
+
+      expect(tasks.list(projectId).map((t) => t.id)).toEqual([here.id]);
+      expect(tasks.list(other).map((t) => t.id)).toEqual([there.id]);
+      // and the unscoped call is the *default* project, not everything
+      expect(tasks.list().map((t) => t.id)).toEqual([here.id]);
+    });
+
+    it("refuses a card hung off another factory's room", () => {
+      const { tasks, projectId, other } = twoProjects();
+      // A room id is globally unique, so this is the mistake that would otherwise put work in front
+      // of an operator who cannot see the task asking for it.
+      expect(() => tasks.create({ title: "wrong floor", roomId: "r2", projectId }))
+        .toThrow(/belongs to another project/);
+      expect(() => tasks.create({ title: "wrong floor", roomId: "r1", projectId: other }))
+        .toThrow(/belongs to another project/);
+      expect(tasks.list(projectId)).toEqual([]);
+      expect(tasks.list(other)).toEqual([]);
+    });
+
+    it("refuses to move a card onto another factory's room", () => {
+      const { tasks, projectId } = twoProjects();
+      const t = tasks.create({ title: "ours", roomId: "r1", projectId });
+      expect(() => tasks.update(t.id, { roomId: "r2" })).toThrow(/belongs to another project/);
+      expect(tasks.get(t.id)!.roomId).toBe("r1");
+    });
+  });
+
   it("survives a reopen: tasks are rows, not process state", () => {
-    const { db, tasks } = makeStore();
+    const { db, projects, tasks } = makeStore();
     const t = tasks.create({ title: "Expose a webhook" });
-    const second = new TaskStore(db);
+    const second = new TaskStore(db, projects);
     expect(second.get(t.id)).toMatchObject({ title: "Expose a webhook" });
     expect(second.list()).toHaveLength(1);
   });

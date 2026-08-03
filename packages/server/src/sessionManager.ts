@@ -5,6 +5,7 @@ import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
 import type { FactoryBus, RoomAgent } from "./factoryBus.js";
+import type { ProjectManager } from "./projectManager.js";
 import type { RoomManager } from "./roomManager.js";
 import type { TaskStore } from "./taskStore.js";
 import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
@@ -26,6 +27,13 @@ export interface CreateSessionOptions {
   /** The room to work in. Its folder becomes the cwd. Unknown ids are rejected. */
   roomId?: string;
   autonomy?: AutonomyMode;
+  /**
+   * The factory this agent belongs to. With a `roomId` it is implied by the room and only has to be
+   * passed to be *checked* — the hub passes the asking socket's active project, so a client that knew
+   * another project's room id cannot put an agent on someone else's floor. Without one it defaults to
+   * the default project, which is where a roomless (M0-shaped) session lands.
+   */
+  projectId?: string;
 }
 
 /**
@@ -62,10 +70,13 @@ export class SessionManager {
     private store: EventStore,
     private executor: Executor,
     private rooms: RoomManager,
+    private projects: ProjectManager,
     private opts: SessionManagerOptions = {},
   ) {
     this.stmts = {
-      insertSession: db.prepare("INSERT INTO sessions (id, cwd, autonomy, room_id) VALUES (?, ?, ?, ?)"),
+      insertSession: db.prepare(
+        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id) VALUES (?, ?, ?, ?, ?)",
+      ),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
       activeSessions: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id FROM sessions WHERE state = 'active'"),
       markError: db.prepare("UPDATE sessions SET state = 'error' WHERE id = ? AND state = 'active'"),
@@ -75,26 +86,11 @@ export class SessionManager {
       // `status` and `blocked` are derived from the log by correlated subqueries rather than a
       // second round of queries per row, for the same reason — the 3D floor asks for this list on
       // every status tick, so it has to stay one statement.
-      listSessions: db.prepare(`
-        SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
-               s.autonomy AS autonomy, s.room_id AS room_id, COALESCE(MAX(e.seq), 0) AS last_seq,
-               -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
-               (SELECT json_extract(st.payload, '$.status')
-                  FROM events st
-                  WHERE st.session_id = s.id AND st.type = 'session_status'
-                  ORDER BY st.seq DESC LIMIT 1) AS status,
-               -- an approval_request with no approval_resolved carrying the same approvalId
-               EXISTS (SELECT 1
-                  FROM events req
-                  WHERE req.session_id = s.id AND req.type = 'approval_request'
-                    AND NOT EXISTS (SELECT 1
-                      FROM events res
-                      WHERE res.session_id = s.id AND res.type = 'approval_resolved'
-                        AND json_extract(res.payload, '$.approvalId')
-                            = json_extract(req.payload, '$.approvalId'))) AS blocked
-        FROM sessions s LEFT JOIN events e ON e.session_id = s.id
-        GROUP BY s.id ORDER BY s.created_at
-      `),
+      listSessions: db.prepare(sessionListSql("s.project_id = ?")),
+      // The same list, filtered to one room. The bus asks "who is standing here and free?" at every
+      // turn boundary; a room id already implies a project, so this needs no second scope — and
+      // filtering in SQL keeps that question one query rather than a whole floor's listing.
+      listRoomSessions: db.prepare(sessionListSql("s.room_id = ?")),
     };
   }
 
@@ -107,10 +103,18 @@ export class SessionManager {
     const autonomy = opts.autonomy ?? DEFAULT_AUTONOMY;
     let roomId: string | null = null;
     let cwd = opts.cwd ?? process.cwd();
+    let projectId = opts.projectId ?? this.projects.defaultProject().id;
 
     if (opts.roomId !== undefined) {
       const room = this.rooms.getRoom(opts.roomId);
       if (room === undefined) throw new Error(`unknown room ${opts.roomId}`);
+      const roomProject = this.rooms.projectOf(room.id)!;
+      // A caller that named both must mean both: putting an agent in a room the asking socket is not
+      // even looking at is either a bug or a client reaching across factories.
+      if (opts.projectId !== undefined && roomProject !== opts.projectId) {
+        throw new Error(`room ${room.id} belongs to another project`);
+      }
+      projectId = roomProject;
       roomId = room.id;
       cwd = room.path;
     }
@@ -123,7 +127,7 @@ export class SessionManager {
     if (!isDir) throw new Error(`cwd is not a directory: ${cwd}`);
 
     const id = randomUUID();
-    this.stmts.insertSession.run(id, cwd, autonomy, roomId);
+    this.stmts.insertSession.run(id, projectId, cwd, autonomy, roomId);
     this.startExecutor(id, cwd, null, autonomy, roomId);
     return id;
   }
@@ -330,8 +334,8 @@ export class SessionManager {
    * gone cannot carry a message, and offering it would make the bus mark one delivered to nobody.
    */
   roomAgents(roomId: string): RoomAgent[] {
-    return this.listSessions()
-      .filter((s) => s.roomId === roomId && this.handles.has(s.id))
+    return this.toSessionInfo(this.stmts.listRoomSessions.all(roomId))
+      .filter((s) => this.handles.has(s.id))
       .map((s) => ({
         sessionId: s.id,
         // See `turnInFlight`: the log's `working` outlives the turn by one event.
@@ -339,8 +343,13 @@ export class SessionManager {
       }));
   }
 
-  listSessions(): SessionInfo[] {
-    return (this.stmts.listSessions.all() as {
+  /** The agents of one factory. Another project's sessions are never in here. */
+  listSessions(projectId: string = this.projects.defaultProject().id): SessionInfo[] {
+    return this.toSessionInfo(this.stmts.listSessions.all(projectId));
+  }
+
+  private toSessionInfo(rows: unknown[]): SessionInfo[] {
+    return (rows as {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
       autonomy: string; room_id: string | null; last_seq: number;
       status: string | null; blocked: number;
@@ -355,6 +364,34 @@ export class SessionManager {
       blocked: r.blocked === 1,
     }));
   }
+}
+
+/**
+ * The session listing, with a caller-chosen `WHERE`. The clause is a literal from the two call sites
+ * below — never anything from the wire — and both statements are prepared once at construction.
+ */
+function sessionListSql(where: string): string {
+  return `
+    SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
+           s.autonomy AS autonomy, s.room_id AS room_id, COALESCE(MAX(e.seq), 0) AS last_seq,
+           -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
+           (SELECT json_extract(st.payload, '$.status')
+              FROM events st
+              WHERE st.session_id = s.id AND st.type = 'session_status'
+              ORDER BY st.seq DESC LIMIT 1) AS status,
+           -- an approval_request with no approval_resolved carrying the same approvalId
+           EXISTS (SELECT 1
+              FROM events req
+              WHERE req.session_id = s.id AND req.type = 'approval_request'
+                AND NOT EXISTS (SELECT 1
+                  FROM events res
+                  WHERE res.session_id = s.id AND res.type = 'approval_resolved'
+                    AND json_extract(res.payload, '$.approvalId')
+                        = json_extract(req.payload, '$.approvalId'))) AS blocked
+    FROM sessions s LEFT JOIN events e ON e.session_id = s.id
+    WHERE ${where}
+    GROUP BY s.id ORDER BY s.created_at
+  `;
 }
 
 /** Row shape of the columns the manager needs off `sessions`. */

@@ -7,6 +7,7 @@ import { FACTORY_MCP_SERVER_NAME, busToolDefinitions, busTools } from "../src/bu
 import { z } from "zod";
 import { openDb } from "../src/db.js";
 import { FactoryBus, type RoomAgent } from "../src/factoryBus.js";
+import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
 import { TaskStore } from "../src/taskStore.js";
 
@@ -18,7 +19,8 @@ import { TaskStore } from "../src/taskStore.js";
 function makeTools() {
   const root = mkdtempSync(join(tmpdir(), "superfabric-bustools-"));
   const db = openDb(":memory:");
-  const rooms = new RoomManager(db, root);
+  const projects = new ProjectManager(db, root);
+  const rooms = new RoomManager(db, projects);
   rooms.ensureProjectRoom();
   const chat = rooms.createRoom("chat");
   const payments = rooms.createRoom("payments");
@@ -27,11 +29,11 @@ function makeTools() {
   const delivered: { sessionId: string; text: string }[] = [];
   const reported: string[] = [];
   const bus = new FactoryBus({
-    db, rooms,
+    db, rooms, projects,
     deliver: (sessionId, text) => { delivered.push({ sessionId, text }); },
     roomAgents: (roomId) => agents.get(roomId) ?? [],
   });
-  const tasks = new TaskStore(db);
+  const tasks = new TaskStore(db, projects);
   // the calling room is "chat": this tool set belongs to a session standing in it
   const deps = { bus, tasks, rooms, roomId: chat.id, reportStatus: (s: string) => { reported.push(s); } };
   const defs = busToolDefinitions(deps);
@@ -43,7 +45,7 @@ function makeTools() {
   };
 
   return {
-    db, rooms, bus, tasks, chat, payments, defs, deps, call, delivered, reported, agents,
+    db, rooms, projects, bus, tasks, chat, payments, defs, deps, call, delivered, reported, agents,
     setAgents: (roomId: string, list: RoomAgent[]) => agents.set(roomId, list),
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
@@ -299,6 +301,50 @@ describe("busTools", () => {
     await withTools(async ({ call, reported }) => {
       expect(resultOf(await call("factory_report_status", { summary: "" })).isError).toBe(true);
       expect(reported).toEqual([]);
+    });
+  });
+
+  // ---- M1b: an agent addresses its own factory ----
+
+  it("resolves a room name on the caller's own floor, never another project's", async () => {
+    await withTools(async ({ rooms, projects, bus, call, chat, payments }) => {
+      const otherRoot = mkdtempSync(join(tmpdir(), "superfabric-bustools-other-"));
+      try {
+        const other = projects.create({ root: otherRoot }).id;
+        rooms.ensureProjectRoom(other);
+        // The same department name on another floor. Names are unique per project, so "payments" is
+        // ambiguous across the server and must be resolved within the sending room's own project.
+        const theirPayments = rooms.createRoom("payments", { projectId: other });
+
+        const res = resultOf(await call("factory_send", { to_room: "payments", kind: "info", body: "hello" }));
+        expect(res.isError).toBe(false);
+
+        const sent = bus.list(rooms.projectOf(chat.id)!);
+        expect(sent).toHaveLength(1);
+        expect(sent[0]!.toRoomId).toBe(payments.id);
+        expect(sent[0]!.toRoomId).not.toBe(theirPayments.id);
+        // and nothing at all landed on the other factory's floor
+        expect(bus.list(other)).toEqual([]);
+      } finally {
+        rmSync(otherRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("lists only this floor's rooms when a name is wrong", async () => {
+    await withTools(async ({ rooms, projects, call }) => {
+      const otherRoot = mkdtempSync(join(tmpdir(), "superfabric-bustools-other-"));
+      try {
+        const other = projects.create({ root: otherRoot }).id;
+        rooms.createRoom("vendor", { projectId: other });
+        const res = resultOf(await call("factory_send", { to_room: "nope", kind: "info", body: "hello" }));
+        expect(res.isError).toBe(true);
+        // an agent must not be told about departments it cannot reach
+        expect(res.text).toContain("payments");
+        expect(res.text).not.toContain("vendor");
+      } finally {
+        rmSync(otherRoot, { recursive: true, force: true });
+      }
     });
   });
 });

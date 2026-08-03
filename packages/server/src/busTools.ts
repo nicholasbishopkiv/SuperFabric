@@ -96,7 +96,7 @@ export function busToolDefinitions(deps: BusToolsDeps): SdkMcpToolDefinition<any
         .describe("The task this message is about, if any. A request naming a task blocks that task on this message."),
     },
     (args) => {
-      const to = roomByName(rooms, args.to_room);
+      const to = roomByName(rooms, roomId, args.to_room);
       const msg = bus.send({
         // The sending room is this tool set's room — the session's — never anything from `args`.
         fromRoomId: roomId,
@@ -196,11 +196,15 @@ function describe(rooms: RoomManager, m: MessageInfo): string {
 }
 
 /**
- * Resolve a room *name* — what an agent can actually know — to a room. An unknown name lists what
- * does exist: an agent that guessed "backend" when the room is called "api" can fix that itself.
+ * Resolve a room *name* — what an agent can actually know — to a room **on the caller's own floor**.
+ * Names are unique per project, not per server, so the search has to be scoped or an agent in one
+ * factory could address a same-named department in another. An unknown name lists what does exist:
+ * an agent that guessed "backend" when the room is called "api" can fix that itself.
  */
-function roomByName(rooms: RoomManager, name: string): { id: string; name: string } {
-  const all = rooms.listRooms();
+function roomByName(rooms: RoomManager, fromRoomId: string, name: string): { id: string; name: string } {
+  const projectId = rooms.projectOf(fromRoomId);
+  if (projectId === undefined) throw new Error(`unknown room ${fromRoomId}`);
+  const all = rooms.listRooms(projectId);
   const room = all.find((r) => r.name === name);
   if (room === undefined) {
     throw new Error(`unknown room ${JSON.stringify(name)}; rooms are: ${all.map((r) => r.name).join(", ")}`);

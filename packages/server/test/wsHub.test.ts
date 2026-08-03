@@ -2,9 +2,10 @@ import { describe, it, expect } from "bun:test";
 import { waitFor } from "./_waitFor.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
+import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
@@ -32,23 +33,24 @@ function makeHub(opts: {
   const db = openDb(":memory:");
   const store = new EventStore(db);
   const exec = new FakeExecutor(opts.script ? { script: opts.script } : {});
-  const rooms = new RoomManager(db, opts.root ?? tmpdir());
-  const tasks = new TaskStore(db);
-  const mgr = new SessionManager(db, store, exec, rooms, { tasks });
+  const projects = new ProjectManager(db, opts.root ?? tmpdir());
+  const rooms = new RoomManager(db, projects);
+  const tasks = new TaskStore(db, projects);
+  const mgr = new SessionManager(db, store, exec, rooms, projects, { tasks });
   const bus = new FactoryBus({
-    db, rooms,
+    db, rooms, projects,
     deliver: (sessionId, text) => mgr.prompt(sessionId, text),
     roomAgents: (roomId) => mgr.roomAgents(roomId),
   });
   const withStores = opts.stores !== false;
-  const hub = new WsHub(store, mgr, rooms, {
+  const hub = new WsHub(store, mgr, rooms, projects, {
     sessionsDebounceMs: opts.sessionsDebounceMs,
     tasks: withStores ? tasks : undefined,
     bus: withStores ? bus : undefined,
   });
   const { sock, sent } = fakeSocket();
   if (opts.attach !== false) hub.attach(sock);
-  return { db, store, exec, rooms, tasks, bus, mgr, hub, sock, sent };
+  return { db, store, exec, projects, rooms, tasks, bus, mgr, hub, sock, sent };
 }
 
 /** The hub's private socket -> watermark table; asserted directly, it is the thing I1 broke. */
@@ -70,9 +72,10 @@ describe("WsHub", () => {
     const db = openDb(":memory:");
     const store = new EventStore(db);
     const exec = new FakeExecutor();
-    const rooms = new RoomManager(db, tmpdir());
-    const mgr = new SessionManager(db, store, exec, rooms);
-    const hub = new WsHub(store, mgr, rooms);
+    const projects = new ProjectManager(db, tmpdir());
+    const rooms = new RoomManager(db, projects);
+    const mgr = new SessionManager(db, store, exec, rooms, projects);
+    const hub = new WsHub(store, mgr, rooms, projects);
     const id = mgr.createSession({ cwd: "/tmp" });
     mgr.prompt(id, "first");
     await exec.settle();
@@ -97,9 +100,10 @@ describe("WsHub", () => {
     const db = openDb(":memory:");
     const store = new EventStore(db);
     const exec = new FakeExecutor({ script: [{ tool: "Bash", input: {} }] });
-    const rooms = new RoomManager(db, tmpdir());
-    const mgr = new SessionManager(db, store, exec, rooms);
-    const hub = new WsHub(store, mgr, rooms);
+    const projects = new ProjectManager(db, tmpdir());
+    const rooms = new RoomManager(db, projects);
+    const mgr = new SessionManager(db, store, exec, rooms, projects);
+    const hub = new WsHub(store, mgr, rooms, projects);
     const { sock, sent } = fakeSocket();
     hub.attach(sock);
 
@@ -126,9 +130,10 @@ describe("WsHub", () => {
     const db = openDb(":memory:");
     const store = new EventStore(db);
     const exec = new FakeExecutor();
-    const rooms = new RoomManager(db, tmpdir());
-    const mgr = new SessionManager(db, store, exec, rooms);
-    const hub = new WsHub(store, mgr, rooms);
+    const projects = new ProjectManager(db, tmpdir());
+    const rooms = new RoomManager(db, projects);
+    const mgr = new SessionManager(db, store, exec, rooms, projects);
+    const hub = new WsHub(store, mgr, rooms, projects);
     const { sock, sent } = fakeSocket();
     hub.attach(sock);
     hub.handleMessage(sock, "not json");
@@ -889,4 +894,167 @@ describe("WsHub", () => {
     expect(seqs.length).toBeGreaterThan(0);
     expect(Math.min(...seqs)).toBe(maxSeq + 1);
   });
+
+  // ---- M1b: several factories, one server, one socket each ----
+
+  describe("projects", () => {
+    /**
+     * A hub with two factories: the boot project (`home`, root `homeRoot`) and a second one (`away`),
+     * each with its own throwaway root. `sock` starts on `home`.
+     */
+    function withTwoProjects<T>(fn: (ctx: ReturnType<typeof makeHub> & {
+      homeRoot: string; awayRoot: string; home: string; away: string;
+    }) => T): T {
+      const homeRoot = mkdtempSync(join(tmpdir(), "superfabric-hub-home-"));
+      const awayRoot = mkdtempSync(join(tmpdir(), "superfabric-hub-away-"));
+      const ctx = makeHub({ root: homeRoot, sessionsDebounceMs: 20 });
+      const home = ctx.projects.defaultProject().id;
+      const away = ctx.projects.create({ root: awayRoot }).id;
+      ctx.rooms.ensureProjectRoom(home);
+      ctx.rooms.ensureProjectRoom(away);
+      try {
+        return fn({ ...ctx, homeRoot, awayRoot, home, away });
+      } finally {
+        rmSync(homeRoot, { recursive: true, force: true });
+        rmSync(awayRoot, { recursive: true, force: true });
+      }
+    }
+
+    const last = (sent: any[], kind: string) => sent.filter((m) => m.kind === kind).at(-1);
+    const names = (sent: any[]) => (last(sent, "rooms")?.rooms as any[] | undefined)?.map((r) => r.name);
+
+    it("list_projects answers with every project and this socket's active one", () => {
+      withTwoProjects(({ hub, sock, sent, home, homeRoot, awayRoot }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "list_projects" }));
+        const msg = last(sent, "projects");
+        expect(msg.activeProjectId).toBe(home);
+        expect(msg.projects.map((p: any) => p.root)).toEqual([homeRoot, awayRoot]);
+      });
+    });
+
+    it("open_project re-scopes the socket and hands it a whole fresh factory", () => {
+      withTwoProjects(({ hub, rooms, tasks, sock, sent, home, away }) => {
+        rooms.createRoom("backend", { projectId: home });
+        const awayRoom = rooms.createRoom("vendor", { projectId: away });
+        tasks.create({ title: "ours", projectId: home });
+        tasks.create({ title: "theirs", roomId: awayRoom.id, projectId: away });
+        sent.length = 0;
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "open_project", projectId: away }));
+
+        expect(last(sent, "projects").activeProjectId).toBe(away);
+        // the whole set arrives unasked, because the client throws away what it held
+        expect(names(sent)).toEqual([rooms.listRooms(away)[0]!.name, "vendor"]);
+        expect(last(sent, "tasks").tasks.map((t: any) => t.title)).toEqual(["theirs"]);
+        expect(last(sent, "messages")).toBeDefined();
+        expect(sent.some((m) => m.kind === "error")).toBe(false);
+      });
+    });
+
+    it("open_project forgets the previous floor's session subscriptions", async () => {
+      await withTwoProjects(async ({ hub, mgr, exec, sock, sent, home, away }) => {
+        const id = mgr.createSession({ cwd: "/tmp", projectId: home });
+        hub.handleMessage(sock, JSON.stringify({ kind: "subscribe", sessionId: id, afterSeq: 0 }));
+        hub.handleMessage(sock, JSON.stringify({ kind: "open_project", projectId: away }));
+        sent.length = 0;
+
+        // That transcript belongs to a floor this socket is no longer looking at.
+        mgr.prompt(id, "hi");
+        await exec.settle();
+        expect(sent.filter((m) => m.kind === "event")).toEqual([]);
+      });
+    });
+
+    it("replies error without throwing for an unknown project, leaving the socket where it was", () => {
+      withTwoProjects(({ hub, rooms, sock, sent, home }) => {
+        rooms.createRoom("backend", { projectId: home });
+        hub.handleMessage(sock, JSON.stringify({ kind: "open_project", projectId: "nope" }));
+        expect(sent.some((m) => m.kind === "error" && /unknown project/.test(m.message))).toBe(true);
+
+        sent.length = 0;
+        hub.handleMessage(sock, JSON.stringify({ kind: "list_rooms" }));
+        expect(names(sent)).toEqual([rooms.listRooms(home)[0]!.name, "backend"]);
+      });
+    });
+
+    it("create_project adds a factory with its central building and opens it", () => {
+      withTwoProjects(({ hub, projects, sock, sent }) => {
+        const third = mkdtempSync(join(tmpdir(), "superfabric-hub-third-"));
+        try {
+          hub.handleMessage(sock, JSON.stringify({ kind: "create_project", root: third, name: "Third" }));
+
+          const created = projects.list().find((p) => p.root === third)!;
+          expect(created.name).toBe("Third");
+          expect(last(sent, "projects").activeProjectId).toBe(created.id);
+          // a factory with no central building would draw an empty floor with nothing to join
+          expect(names(sent)).toEqual([basename(third).toLowerCase()]);
+          expect(sent.some((m) => m.kind === "error")).toBe(false);
+        } finally {
+          rmSync(third, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("replies error without throwing for a project root that is not a directory", () => {
+      withTwoProjects(({ hub, projects, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_project", root: "/definitely/not/here" }));
+        expect(sent.some((m) => m.kind === "error" && /does not exist/.test(m.message))).toBe(true);
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_project", root: "relative/dir" }));
+        expect(sent.some((m) => m.kind === "error" && /absolute path/.test(m.message))).toBe(true);
+        expect(projects.list()).toHaveLength(2);
+      });
+    });
+
+    it("keeps two sockets on two floors apart: rooms, board and belts", async () => {
+      await withTwoProjects(async ({ hub, rooms, tasks, bus, sock, sent, home, away }) => {
+        const second = fakeSocket();
+        hub.attach(second.sock);
+        hub.handleMessage(second.sock, JSON.stringify({ kind: "open_project", projectId: away }));
+        const awayChat = rooms.createRoom("chat", { projectId: away });
+        const awayPay = rooms.createRoom("payments", { projectId: away });
+        sent.length = 0;
+        second.sent.length = 0;
+
+        // A room created on the home floor, by the home socket.
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_room", name: "backend" }));
+        expect(names(sent)).toEqual([rooms.listRooms(home)[0]!.name, "backend"]);
+        // The other tab is watching another factory: this building is not on its floor.
+        expect(names(second.sent) ?? []).not.toContain("backend");
+
+        // The board is per factory too.
+        tasks.create({ title: "ours", projectId: home });
+        await waitFor(() => { expect(last(sent, "tasks")).toBeDefined(); });
+        expect(last(sent, "tasks").tasks.map((t: any) => t.title)).toEqual(["ours"]);
+        expect(last(second.sent, "tasks").tasks).toEqual([]);
+
+        // …and so are the belts.
+        bus.send({ fromRoomId: awayChat.id, toRoomId: awayPay.id, kind: "info", body: "theirs" });
+        await waitFor(() => { expect(last(second.sent, "messages")).toBeDefined(); });
+        expect(last(second.sent, "messages").messages.map((m: any) => m.body)).toEqual(["theirs"]);
+        expect(last(sent, "messages").messages).toEqual([]);
+      });
+    });
+
+    it("refuses to create a session in a room on another floor", () => {
+      withTwoProjects(({ hub, rooms, mgr, sock, sent, home, away }) => {
+        const awayRoom = rooms.createRoom("vendor", { projectId: away });
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_session", roomId: awayRoom.id }));
+        expect(sent.some((m) => m.kind === "error" && /another project/.test(m.message))).toBe(true);
+        expect(mgr.listSessions(away)).toEqual([]);
+        expect(mgr.listSessions(home)).toEqual([]);
+      });
+    });
+
+    it("refuses to move a building on another floor", () => {
+      withTwoProjects(({ hub, rooms, sock, sent, away }) => {
+        const awayRoom = rooms.createRoom("vendor", { projectId: away });
+        hub.handleMessage(sock, JSON.stringify({
+          kind: "move_room", roomId: awayRoom.id, position: { x: 1, z: 2 },
+        }));
+        expect(sent.filter((m) => m.kind === "error" && /another project/.test(m.message))).toHaveLength(1);
+        expect(rooms.getRoom(awayRoom.id)!.position).toEqual(awayRoom.position);
+      });
+    });
+  });
+
 });

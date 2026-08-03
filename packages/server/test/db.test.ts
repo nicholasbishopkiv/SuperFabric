@@ -126,17 +126,20 @@ describe("db", () => {
 
   // ---- migration 3: rooms ----
 
-  it("creates the rooms table with a unique name and origin-defaulted position", () => {
+  it("creates the rooms table with a per-project unique name and origin-defaulted position", () => {
     const db = openDb(":memory:");
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[];
     expect(tables.map(t => t.name)).toContain("rooms");
 
-    db.prepare("INSERT INTO rooms (id, name, path) VALUES (?, ?, ?)").run("r1", "backend", "/p/backend");
+    const insert = db.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)");
+    insert.run("r1", "p1", "backend", "/p1/backend");
     expect(db.prepare("SELECT kind, pos_x, pos_z FROM rooms WHERE id = 'r1'").get())
       .toEqual({ kind: "room", pos_x: 0, pos_z: 0 });
-    // one folder, one room: the name is the folder segment, so it cannot repeat
-    expect(() => db.prepare("INSERT INTO rooms (id, name, path) VALUES (?, ?, ?)").run("r2", "backend", "/other"))
-      .toThrow(/UNIQUE/);
+    // one folder, one room: within a project the name is the folder segment, so it cannot repeat
+    expect(() => insert.run("r2", "p1", "backend", "/p1/other")).toThrow(/UNIQUE/);
+    // but two factories may each have a "backend" — migration 5 moved the uniqueness onto the pair
+    insert.run("r3", "p2", "backend", "/p2/backend");
+    expect((db.prepare("SELECT COUNT(*) c FROM rooms WHERE name = 'backend'").get() as { c: number }).c).toBe(2);
   });
 
   it("upgrades a user_version = 2 database to rooms + sessions.room_id, keeping its rows", () => {
@@ -174,9 +177,9 @@ describe("db", () => {
         .toEqual({ cwd: "/m0/cwd", autonomy: "bypass", room_id: null });
       expect((db.prepare("SELECT payload FROM events WHERE session_id='m0' AND seq=1").get() as { payload: string }).payload)
         .toContain("from M0");
-      // and rooms are now available to fill
-      db.prepare("INSERT INTO rooms (id, name, path, kind) VALUES (?, ?, ?, ?)")
-        .run("r1", "backend", "/m0/backend", "room");
+      // and rooms are now available to fill (migration 5 added the project they stand on)
+      db.prepare("INSERT INTO rooms (id, project_id, name, path, kind) VALUES (?, ?, ?, ?, ?)")
+        .run("r1", "p1", "backend", "/m0/backend", "room");
       db.prepare("UPDATE sessions SET room_id = ? WHERE id = 'm0'").run("r1");
       expect(db.prepare("SELECT room_id FROM sessions WHERE id = 'm0'").get()).toEqual({ room_id: "r1" });
       db.close();
@@ -262,5 +265,159 @@ describe("db", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // ---- migration 5: projects ----
+
+  /**
+   * A database exactly as migration 4 left it, optionally holding a whole M3a factory. This is the
+   * shape of the `.fabrica/fabrica.db` an operator already has, so the upgrade has to be tested
+   * against it rather than against a fresh file.
+   */
+  function writeV4(path: string, fill?: (db: Database) => void): void {
+    const v4 = new Database(path);
+    v4.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, claude_session_id TEXT,
+        state TEXT NOT NULL DEFAULT 'active', cwd TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+        autonomy TEXT NOT NULL DEFAULT 'auto', room_id TEXT
+      );
+      CREATE TABLE events (
+        session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+        ts INTEGER NOT NULL DEFAULT (unixepoch()),
+        type TEXT NOT NULL, payload TEXT NOT NULL,
+        PRIMARY KEY (session_id, seq)
+      );
+      CREATE TABLE rooms (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'room',
+        pos_x REAL NOT NULL DEFAULT 0, pos_z REAL NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      );
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'open', room_id TEXT, agent_id TEXT,
+        blocked_on_message_id TEXT,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+      );
+      CREATE TABLE messages (
+        id TEXT PRIMARY KEY, from_room_id TEXT NOT NULL, to_room_id TEXT NOT NULL,
+        kind TEXT NOT NULL, body TEXT NOT NULL, task_id TEXT, delivered_at INTEGER,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      );
+      CREATE INDEX messages_undelivered ON messages (to_room_id, delivered_at);
+    `);
+    v4.exec("PRAGMA user_version = 4");
+    fill?.(v4);
+    v4.close();
+  }
+
+  it("creates the projects table with a unique root and a nullable last_opened_at", () => {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
+    expect(db.prepare("SELECT name, last_opened_at FROM projects WHERE id = 'p1'").get())
+      .toEqual({ name: "shop", last_opened_at: null });
+    // one folder is one factory
+    expect(() => db.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p2", "again", "/code/shop"))
+      .toThrow(/UNIQUE/);
+  });
+
+  it("leaves a fresh database with no project at all", () => {
+    // Nothing to backfill means nothing to invent: boot's ProjectManager.defaultProject() creates
+    // the first project, and a migration seeding one from a test's cwd would be a surprise.
+    const db = openDb(":memory:");
+    expect((db.prepare("SELECT COUNT(*) c FROM projects").get() as { c: number }).c).toBe(0);
+    for (const table of ["sessions", "tasks", "messages"]) {
+      const cols = db.prepare(`SELECT name FROM pragma_table_info('${table}')`).all() as { name: string }[];
+      expect(cols.map(c => c.name)).toContain("project_id");
+    }
+  });
+
+  it("upgrades an existing factory into a one-project world, backfilling every row", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-v4-"));
+    try {
+      const path = join(dir, "v4.db");
+      writeV4(path, (v4) => {
+        // The central building records the folder this factory was running on.
+        v4.prepare("INSERT INTO rooms (id, name, path, kind) VALUES (?, ?, ?, ?)")
+          .run("root", "shop", "/code/shop", "project");
+        v4.prepare("INSERT INTO rooms (id, name, path) VALUES (?, ?, ?)").run("r1", "payments", "/code/shop/payments");
+        v4.prepare("INSERT INTO sessions (id, cwd, room_id) VALUES (?, ?, ?)").run("s1", "/code/shop/payments", "r1");
+        v4.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("s0", "/code/shop");
+        v4.prepare("INSERT INTO tasks (id, title, room_id) VALUES (?, ?, ?)").run("t1", "Expose a webhook", "r1");
+        v4.prepare("INSERT INTO messages (id, from_room_id, to_room_id, kind, body) VALUES (?, ?, ?, ?, ?)")
+          .run("m1", "root", "r1", "request", "please expose a webhook");
+      });
+
+      const db = openDb(path);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(5);
+
+      // exactly one project, named and rooted after the central building's folder — not after the
+      // directory this test process happens to be running in
+      const projects = db.prepare("SELECT id, name, root FROM projects").all() as
+        { id: string; name: string; root: string }[];
+      expect(projects).toHaveLength(1);
+      expect(projects[0]!).toMatchObject({ name: "shop", root: "/code/shop" });
+      const pid = projects[0]!.id;
+
+      // and every row that existed now stands on it, including the roomless M0 session
+      for (const [table, ids] of [
+        ["rooms", ["root", "r1"]], ["sessions", ["s0", "s1"]], ["tasks", ["t1"]], ["messages", ["m1"]],
+      ] as const) {
+        for (const id of ids) {
+          expect(db.prepare(`SELECT project_id FROM ${table} WHERE id = ?`).get(id))
+            .toEqual({ project_id: pid });
+        }
+      }
+      // the rest of each row survived the rooms rebuild
+      expect(db.prepare("SELECT name, path, kind, pos_x FROM rooms WHERE id = 'r1'").get())
+        .toEqual({ name: "payments", path: "/code/shop/payments", kind: "room", pos_x: 0 });
+      expect(db.prepare("SELECT cwd, room_id FROM sessions WHERE id = 's1'").get())
+        .toEqual({ cwd: "/code/shop/payments", room_id: "r1" });
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to SUPERFABRIC_PROJECT for a file with no central building", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-v4-m0-"));
+    const previous = process.env.SUPERFABRIC_PROJECT;
+    try {
+      const path = join(dir, "v4.db");
+      // An M0-era file: sessions and events, no rooms at all, so there is nothing on disk that
+      // records which folder this was. The environment the server runs in is the only answer left.
+      writeV4(path, (v4) => {
+        v4.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("s0", "/somewhere");
+      });
+      process.env.SUPERFABRIC_PROJECT = "/code/from-env";
+
+      const db = openDb(path);
+      expect(db.prepare("SELECT name, root FROM projects").get())
+        .toEqual({ name: "from-env", root: "/code/from-env" });
+      db.close();
+    } finally {
+      if (previous === undefined) delete process.env.SUPERFABRIC_PROJECT;
+      else process.env.SUPERFABRIC_PROJECT = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("indexes the project scope of every list the operator looks at", () => {
+    const db = openDb(":memory:");
+    const indexes = (table: string) =>
+      (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name = ?").all(table) as
+        { name: string }[]).map(i => i.name);
+    expect(indexes("sessions")).toContain("sessions_project");
+    expect(indexes("tasks")).toContain("tasks_project");
+    expect(indexes("messages")).toEqual(expect.arrayContaining(["messages_project", "messages_undelivered"]));
+    // the queue lookup the bus runs at every turn boundary still rides its own index
+    const plan = db.prepare(
+      "EXPLAIN QUERY PLAN SELECT id FROM messages WHERE project_id = ? AND to_room_id = ? AND delivered_at IS NULL",
+    ).all("p1", "r2") as { detail: string }[];
+    expect(plan.map(p => p.detail).join(" ")).toMatch(/messages_undelivered|messages_project/);
   });
 });

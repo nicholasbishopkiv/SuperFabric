@@ -4,18 +4,40 @@ import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { ringPosition } from "@superfabric/shared";
 import { openDb } from "../src/db.js";
+import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
 
-/** A throwaway project root plus a manager over an in-memory db, cleaned up afterwards. */
-function withProject<T>(fn: (ctx: { root: string; db: ReturnType<typeof openDb>; mgr: RoomManager }) => T): T {
+/**
+ * A throwaway project root plus a manager over an in-memory db, cleaned up afterwards. The root is
+ * the *default* project's root, so a call that names no project (as most of these do) resolves its
+ * folders against this directory.
+ */
+function withProject<T>(fn: (ctx: {
+  root: string;
+  db: ReturnType<typeof openDb>;
+  projects: ProjectManager;
+  projectId: string;
+  mgr: RoomManager;
+}) => T): T {
   const root = mkdtempSync(join(tmpdir(), "superfabric-rooms-"));
   const db = openDb(":memory:");
   try {
-    return fn({ root, db, mgr: new RoomManager(db, root) });
+    const projects = new ProjectManager(db, root);
+    return fn({
+      root, db, projects,
+      projectId: projects.defaultProject().id,
+      mgr: new RoomManager(db, projects),
+    });
   } finally {
     db.close();
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+/** A second factory: a throwaway root, its project row, and the id to scope calls with. */
+function addProject(projects: ProjectManager, label: string): { root: string; id: string } {
+  const root = mkdtempSync(join(tmpdir(), `superfabric-rooms-${label}-`));
+  return { root, id: projects.create({ root }).id };
 }
 
 const roomCount = (db: ReturnType<typeof openDb>, kind?: string) =>
@@ -39,7 +61,7 @@ describe("RoomManager", () => {
         const second = mgr.ensureProjectRoom();
         expect(second.id).toBe(first.id);
         // a fresh manager over the same db (a server restart) must not add another one
-        expect(new RoomManager(db, root).ensureProjectRoom().id).toBe(first.id);
+        expect(new RoomManager(db, new ProjectManager(db, root)).ensureProjectRoom().id).toBe(first.id);
         expect(roomCount(db, "project").c).toBe(1);
         expect(roomCount(db).c).toBe(1);
       });
@@ -54,7 +76,7 @@ describe("RoomManager", () => {
           const root = join(parent, folder);
           mkdirSync(root);
           const db = openDb(":memory:");
-          expect(new RoomManager(db, root).ensureProjectRoom().name).toBe(expected);
+          expect(new RoomManager(db, new ProjectManager(db, root)).ensureProjectRoom().name).toBe(expected);
           db.close();
         }
       } finally {
@@ -219,7 +241,7 @@ describe("RoomManager", () => {
         expect(moved.position).toEqual({ x: -12.5, z: 4 });
         expect(mgr.listRooms().find((r) => r.id === room.id)!.position).toEqual({ x: -12.5, z: 4 });
         // and it survives a restart, because it is in the db and not in memory
-        expect(new RoomManager(db, root).listRooms().find((r) => r.id === room.id)!.position)
+        expect(new RoomManager(db, new ProjectManager(db, root)).listRooms().find((r) => r.id === room.id)!.position)
           .toEqual({ x: -12.5, z: 4 });
       });
     });
@@ -242,4 +264,64 @@ describe("RoomManager", () => {
       });
     });
   });
+
+  // ---- M1b: several factories in one server ----
+
+  describe("projects", () => {
+    it("keeps each project's floor to itself, same room names and all", () => {
+      withProject(({ projects, projectId, mgr }) => {
+        const other = addProject(projects, "other");
+        try {
+          const homeProject = mgr.ensureProjectRoom(projectId);
+          const homeBackend = mgr.createRoom("backend", { projectId });
+          const awayProject = mgr.ensureProjectRoom(other.id);
+          // The same name on two floors: uniqueness is per project, which is the whole point.
+          const awayBackend = mgr.createRoom("backend", { projectId: other.id });
+
+          expect(awayBackend.id).not.toBe(homeBackend.id);
+          expect(mgr.listRooms(projectId).map((r) => r.id)).toEqual([homeProject.id, homeBackend.id]);
+          expect(mgr.listRooms(other.id).map((r) => r.id)).toEqual([awayProject.id, awayBackend.id]);
+          // …and each room's folder is under its own root, not the other's
+          expect(homeBackend.path.startsWith(mgr.getRoom(homeProject.id)!.path)).toBe(true);
+          expect(awayBackend.path.startsWith(other.root)).toBe(true);
+          // a duplicate *within* one project is still refused
+          expect(() => mgr.createRoom("backend", { projectId })).toThrow(/already exists/);
+        } finally {
+          rmSync(other.root, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("scopes the ring so a second factory's first room is not pushed outwards", () => {
+      withProject(({ projects, projectId, mgr }) => {
+        const other = addProject(projects, "ring");
+        try {
+          mgr.ensureProjectRoom(projectId);
+          mgr.ensureProjectRoom(other.id);
+          mgr.createRoom("a", { projectId });
+          mgr.createRoom("b", { projectId });
+          // Two rooms already exist — but not on *this* floor, so this one starts at slot 0.
+          expect(mgr.createRoom("a", { projectId: other.id }).position).toEqual(ringPosition(0));
+        } finally {
+          rmSync(other.root, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("answers projectOf with the floor a room stands on", () => {
+      withProject(({ projects, projectId, mgr }) => {
+        const other = addProject(projects, "of");
+        try {
+          const here = mgr.createRoom("here", { projectId });
+          const there = mgr.createRoom("there", { projectId: other.id });
+          expect(mgr.projectOf(here.id)).toBe(projectId);
+          expect(mgr.projectOf(there.id)).toBe(other.id);
+          expect(mgr.projectOf("nope")).toBeUndefined();
+        } finally {
+          rmSync(other.root, { recursive: true, force: true });
+        }
+      });
+    });
+  });
+
 });
