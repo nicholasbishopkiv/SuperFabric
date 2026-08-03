@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RING_RADIUS, RING_SLOTS, RING_STEP, ringPosition } from "../src/layout.js";
+import { RING_ANGLE_OFFSET, RING_RADIUS, RING_SLOTS, RING_STEP, ringPosition } from "../src/layout.js";
 
 /**
  * The formula is shared because the server assigns positions with it and the browser previews with
@@ -7,25 +7,36 @@ import { RING_RADIUS, RING_SLOTS, RING_STEP, ringPosition } from "../src/layout.
  * factory's buildings would be previewed, so they are pinned deliberately.
  */
 describe("ringPosition", () => {
-  it("puts the first room on the +x axis at the first ring's radius", () => {
-    expect(ringPosition(0)).toEqual({ x: 14, z: 0 });
+  it("puts the first room half a slot off the +x axis, at the first ring's radius", () => {
+    // 14 * cos(22.5°) = 12.9344…, 14 * sin(22.5°) = 5.3583…
+    expect(ringPosition(0)).toEqual({ x: 12.934, z: 5.358 });
     expect(RING_RADIUS).toBe(14);
   });
 
   it("steps a quarter-turn every two slots", () => {
-    expect(ringPosition(2)).toEqual({ x: 0, z: 14 });
-    expect(ringPosition(4)).toEqual({ x: -14, z: 0 });
-    expect(ringPosition(6)).toEqual({ x: -0, z: -14 });
+    expect(ringPosition(2)).toEqual({ x: -5.358, z: 12.934 });
+    expect(ringPosition(4)).toEqual({ x: -12.934, z: -5.358 });
+    expect(ringPosition(6)).toEqual({ x: 5.358, z: -12.934 });
   });
 
   it("rounds to three decimals", () => {
-    // 14 * cos(pi/4) = 9.89949…
-    expect(ringPosition(1)).toEqual({ x: 9.899, z: 9.899 });
+    expect(ringPosition(1)).toEqual({ x: 5.358, z: 12.934 });
   });
 
   it("steps outwards once a ring is full", () => {
-    expect(ringPosition(RING_SLOTS)).toEqual({ x: 19, z: 0 });
-    expect(ringPosition(RING_SLOTS * 2)).toEqual({ x: 24, z: 0 });
+    expect(ringPosition(RING_SLOTS)).toEqual({ x: 17.554, z: 7.271 });
+    expect(ringPosition(RING_SLOTS * 2)).toEqual({ x: 22.173, z: 9.184 });
+  });
+
+  it("keeps every slot off the isometric camera's 45° view axis", () => {
+    // The camera sits on x = z, so a room at 45° (or 225°) hides behind the project block and its
+    // belt is occluded for its whole length. Half a slot of offset is what guarantees that.
+    expect(RING_ANGLE_OFFSET).toBeCloseTo(Math.PI / 8, 10);
+    for (let i = 0; i < 24; i++) {
+      const { x, z } = ringPosition(i);
+      // On the diagonal |x| === |z|; every slot must be comfortably clear of it.
+      expect(Math.abs(Math.abs(x) - Math.abs(z))).toBeGreaterThan(1);
+    }
   });
 
   it("keeps every position on its ring's radius", () => {

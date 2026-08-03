@@ -30,10 +30,20 @@ describe("ringPosition", () => {
   });
 
   it("matches the known ring values a preview has to agree with", () => {
-    expect(ringPosition(0)).toEqual({ x: 14, z: 0 });
-    expect(ringPosition(1)).toEqual({ x: 9.899, z: 9.899 });
-    expect(ringPosition(2)).toEqual({ x: 0, z: 14 });
-    expect(ringPosition(8)).toEqual({ x: 19, z: 0 });
+    expect(ringPosition(0)).toEqual({ x: 12.934, z: 5.358 });
+    expect(ringPosition(1)).toEqual({ x: 5.358, z: 12.934 });
+    expect(ringPosition(2)).toEqual({ x: -5.358, z: 12.934 });
+    expect(ringPosition(8)).toEqual({ x: 17.554, z: 7.271 });
+  });
+
+  it("never puts a room on the camera's own diagonal, where the project block would hide it", () => {
+    // ISO_CAMERA_POSITION has equal x and z, so |x| === |z| on the floor is the one line of sight
+    // a building must never stand on.
+    expect(ISO_CAMERA_POSITION[0]).toBe(ISO_CAMERA_POSITION[2]);
+    for (let i = 0; i < 24; i++) {
+      const { x, z } = ringPosition(i);
+      expect(Math.abs(Math.abs(x) - Math.abs(z))).toBeGreaterThan(1);
+    }
   });
 });
 

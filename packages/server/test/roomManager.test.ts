@@ -95,10 +95,12 @@ describe("RoomManager", () => {
         mgr.ensureProjectRoom();
         const a = mgr.createRoom("a");
         const b = mgr.createRoom("b");
-        // shared `ringPosition`: radius RING_RADIUS + floor(n / 8) * RING_STEP, angle (n % 8) * (PI / 4)
+        // shared `ringPosition`: radius RING_RADIUS + floor(n / 8) * RING_STEP, angle
+        // RING_ANGLE_OFFSET + (n % 8) * (PI / 4)
         expect(a.position).toEqual(ringPosition(0));
         expect(b.position).toEqual(ringPosition(1));
-        expect(a.position).toEqual({ x: 14, z: 0 });
+        // The ring is rotated half a slot off the axes so no room stands on the camera's diagonal.
+        expect(a.position).toEqual({ x: 12.934, z: 5.358 });
         expect(a.position).not.toEqual(b.position);
       });
     });
