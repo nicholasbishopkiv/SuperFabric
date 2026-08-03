@@ -1,5 +1,5 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { Options, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { McpServerConfig, Options, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AutonomyMode, SessionEvent } from "@superfabric/shared";
 import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../executor.js";
 
@@ -31,6 +31,25 @@ export function classifyExecutorError(err: unknown): "rate_limited" | "unknown" 
 
 /** The SDK's own `query` signature — the injection seam used by tests. */
 export type QueryFn = typeof sdkQuery;
+
+/**
+ * Tool-name prefixes that belong to **our own in-process MCP servers** — today, the factory bus.
+ *
+ * The SDK namespaces every MCP tool as `mcp__<serverName>__<toolName>` (verified in
+ * `notes/agent-sdk-api.md`), so the bus's `factory_send` reaches `canUseTool` as
+ * `mcp__factory__factory_send`. The prefixes are derived from the servers this session was actually
+ * given rather than hard-coded, and only from the `type: "sdk"` variant: an in-process server is code
+ * in this process that we wrote, while a stdio/http MCP server is a third party reaching outside and
+ * stays gated like every other outside-facing tool.
+ *
+ * See `docs/decisions/0002-factory-tools-are-not-gated.md`.
+ */
+export function inProcessToolPrefixes(servers: Record<string, McpServerConfig> | undefined): string[] {
+  if (servers === undefined) return [];
+  return Object.entries(servers)
+    .filter(([, config]) => (config as { type?: string }).type === "sdk")
+    .map(([name]) => `mcp__${name}__`);
+}
 
 export interface ClaudeCodeExecutorOptions {
   /** Model id, e.g. "claude-fable-5". Omitted => the CLI's own default. */
@@ -114,6 +133,24 @@ export class ClaudeCodeExecutor implements Executor {
 
     ev.onEvent({ type: "session_status", status: "starting" });
 
+    // tool_use_id -> toolName, so a `tool_result` block (which only carries the id) can be
+    // reported under the name the operator saw on the matching tool_use line. It is also what
+    // keeps an ungated factory tool to exactly one `tool_use` event, whichever of the two paths
+    // (canUseTool, or the assistant message's tool_use block) observes the call first.
+    const toolNames = new Map<string, string>();
+    /** Record that a tool call happened, once per tool_use id. */
+    const noteToolUse = (toolUseId: string, toolName: string, input: unknown): void => {
+      if (toolNames.has(toolUseId)) return;
+      toolNames.set(toolUseId, toolName);
+      ev.onEvent({ type: "tool_use", toolName, input });
+    };
+
+    // The factory's own bus tools are never gated — see the ADR. Computed once per session because
+    // the tool set is baked in at query() time.
+    const ownToolPrefixes = inProcessToolPrefixes(opts.mcpServers);
+    const isOwnTool = (toolName: string): boolean =>
+      ownToolPrefixes.some((prefix) => toolName.startsWith(prefix));
+
     // Per-session autonomy wins; then the process-wide default; then the product default.
     const permissionMode: SdkPermissionMode = opts.autonomy !== undefined
       ? sdkPermissionMode(opts.autonomy)
@@ -138,7 +175,16 @@ export class ClaudeCodeExecutor implements Executor {
       //     folder and are meant to apply.
       permissionMode,
       settingSources: ["project", "local"],
-      canUseTool: async (toolName, input): Promise<PermissionResult> => {
+      canUseTool: async (toolName, input, { toolUseID }): Promise<PermissionResult> => {
+        // The factory's own bus tools are the factory's nervous system, not the agent reaching
+        // outside it: an approval card for "tell the payments room I need a webhook" is noise, and
+        // it would deadlock inter-room work whenever the operator is away. So they are allowed
+        // without asking, in every autonomy mode — but the call is still recorded, because "not
+        // asked about" must never mean "not visible".
+        if (isOwnTool(toolName)) {
+          noteToolUse(toolUseID, toolName, input);
+          return { behavior: "allow", updatedInput: input };
+        }
         const behavior = await ev.requestApproval(toolName, input);
         // SessionManager owns approval_request/approval_resolved events; don't double-emit here.
         return behavior === "allow"
@@ -168,13 +214,9 @@ export class ClaudeCodeExecutor implements Executor {
 
     const q: Query = this.queryFn({ prompt: queue, options });
 
-    // tool_use_id -> toolName, so a `tool_result` block (which only carries the id) can be
-    // reported under the name the operator saw on the matching tool_use line.
-    const toolNames = new Map<string, string>();
-
     const pump = (async () => {
       try {
-        for await (const msg of q) this.handleMessage(msg, ev, resolveSessionId, toolNames);
+        for await (const msg of q) this.handleMessage(msg, ev, resolveSessionId, toolNames, noteToolUse);
       } catch (err) {
         if (stopped) return; // close()/abort() teardown, not a session failure
         const kind = classifyExecutorError(err);
@@ -216,6 +258,7 @@ export class ClaudeCodeExecutor implements Executor {
     ev: ExecutorEvents,
     resolveSessionId: (id: string) => void,
     toolNames: Map<string, string>,
+    noteToolUse: (toolUseId: string, toolName: string, input: unknown) => void,
   ): void {
     if (msg.type === "system" && msg.subtype === "init") {
       resolveSessionId(msg.session_id);
@@ -225,10 +268,9 @@ export class ClaudeCodeExecutor implements Executor {
       for (const block of msg.message.content) {
         if (block.type === "text") ev.onEvent({ type: "agent_text", text: block.text });
         else if (block.type === "thinking") ev.onEvent({ type: "agent_thinking" });
-        else if (block.type === "tool_use") {
-          toolNames.set(block.id, block.name);
-          ev.onEvent({ type: "tool_use", toolName: block.name, input: block.input });
-        }
+        // `noteToolUse`, not a bare append: an ungated factory tool is already recorded from
+        // canUseTool, and the operator must see the call once rather than twice.
+        else if (block.type === "tool_use") noteToolUse(block.id, block.name, block.input);
       }
       return;
     }
