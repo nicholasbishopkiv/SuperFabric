@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { RoomName, type RoomInfo, type ScenePosition } from "@superfabric/shared";
+import { RoomName, ringPosition, type RoomInfo, type ScenePosition } from "@superfabric/shared";
 import type { Db } from "./db.js";
 
 /** Charter template written into a new room's folder. Rooms are folders; this is the room's brief. */
@@ -31,21 +31,6 @@ interface RoomRow {
   pos_x: number;
   pos_z: number;
   agent_count: number;
-}
-
-/** Rooms of the same "ring" sit this far apart in angle; each full ring steps outwards. */
-const RING_SLOTS = 8;
-
-/**
- * Where the n-th workshop stands, so the first buildings never stack on each other. The client
- * computes the same positions for previews (`web/src/scene/layout.ts`), so this formula is a shared
- * contract: radius `8 + floor(n / 8) * 5`, angle `(n % 8) * (PI / 4)`, rounded to 3 decimals.
- */
-export function ringPosition(index: number): ScenePosition {
-  const radius = 8 + Math.floor(index / RING_SLOTS) * 5;
-  const angle = (index % RING_SLOTS) * (Math.PI / 4);
-  const round = (v: number) => Math.round(v * 1000) / 1000;
-  return { x: round(radius * Math.cos(angle)), z: round(radius * Math.sin(angle)) };
 }
 
 /**
