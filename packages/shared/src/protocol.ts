@@ -72,6 +72,48 @@ export const RoomInfo = z.object({
 });
 export type RoomInfo = z.infer<typeof RoomInfo>;
 
+// ---- M3a: tasks and the factory bus ----
+
+/** The board's columns. `blocked` specifically means "waiting on another room", see `TaskInfo`. */
+export const TaskStatus = z.enum(["open", "in_progress", "blocked", "review", "done"]);
+export type TaskStatus = z.infer<typeof TaskStatus>;
+
+export const TaskInfo = z.object({
+  id: z.string(),
+  title: z.string().min(1).max(200),
+  detail: z.string().max(4000).default(""),
+  status: TaskStatus,
+  /** Owning room; null means unassigned — the orchestrator routes it (M3b). */
+  roomId: z.string().nullable(),
+  /** Assigned agent session, when a room has more than one. */
+  agentId: z.string().nullable(),
+  /** Message this task is waiting on, when status is "blocked". */
+  blockedOnMessageId: z.string().nullable(),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+});
+export type TaskInfo = z.infer<typeof TaskInfo>;
+
+/**
+ * What one room is saying to another. `request` expects an answer (and is what blocks a task),
+ * `response` answers one, `info` expects nothing back.
+ */
+export const MessageKind = z.enum(["request", "response", "info"]);
+export type MessageKind = z.infer<typeof MessageKind>;
+
+export const MessageInfo = z.object({
+  id: z.string(),
+  fromRoomId: z.string(),
+  toRoomId: z.string(),
+  kind: MessageKind,
+  body: z.string().min(1).max(8000),
+  taskId: z.string().nullable(),
+  /** null until the recipient's turn actually carried it. */
+  deliveredAt: z.number().int().nullable(),
+  createdAt: z.number().int(),
+});
+export type MessageInfo = z.infer<typeof MessageInfo>;
+
 // ---- client -> server ----
 export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("subscribe"), sessionId: z.string(), afterSeq: z.number().int().nonnegative() }),
@@ -90,6 +132,23 @@ export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("create_room"), name: RoomName }),
   z.object({ kind: z.literal("move_room"), roomId: z.string(), position: ScenePosition }),
   z.object({ kind: z.literal("list_rooms") }),
+  // Tasks. `roomId` omitted on create means unassigned, which is the intended path: the
+  // orchestrator routes it (M3b). On update, `null` is how the operator *clears* an assignment —
+  // omitted means "leave it alone", so the two have to be distinguishable on the wire.
+  z.object({
+    kind: z.literal("create_task"),
+    title: z.string().min(1).max(200),
+    detail: z.string().max(4000).optional(),
+    roomId: z.string().optional(),
+  }),
+  z.object({
+    kind: z.literal("update_task"),
+    taskId: z.string(),
+    status: TaskStatus.optional(),
+    roomId: z.string().nullable().optional(),
+    agentId: z.string().nullable().optional(),
+  }),
+  z.object({ kind: z.literal("list_tasks") }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -122,6 +181,12 @@ export const ServerMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("event"), sessionId: z.string(), seq: z.number().int(), event: SessionEvent }),
   z.object({ kind: z.literal("sessions"), sessions: z.array(SessionInfo) }),
   z.object({ kind: z.literal("rooms"), rooms: z.array(RoomInfo) }),
+  z.object({ kind: z.literal("tasks"), tasks: z.array(TaskInfo) }),
+  /**
+   * The bus's traffic. This is what drives the conveyor animation, so it carries `deliveredAt`:
+   * a message nobody has picked up yet looks different from one in flight.
+   */
+  z.object({ kind: z.literal("messages"), messages: z.array(MessageInfo) }),
   z.object({ kind: z.literal("error"), message: z.string() }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;

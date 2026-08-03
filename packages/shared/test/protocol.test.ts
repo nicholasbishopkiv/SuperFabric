@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, RoomInfo, ServerMessage, SessionEvent, SessionStatus } from "../src/protocol.js";
+import {
+  AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, MessageInfo, MessageKind, RoomInfo, ServerMessage,
+  SessionEvent, SessionStatus, TaskInfo, TaskStatus,
+} from "../src/protocol.js";
 
 /** Every field `SessionInfo` requires, so a case can vary exactly the one it is about. */
 const SESSION_INFO = {
@@ -131,6 +134,111 @@ describe("protocol", () => {
         .toMatchObject({ sessions: [{ roomId: null }] });
       expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...info, roomId: "r1" }] }))
         .toMatchObject({ sessions: [{ roomId: "r1" }] });
+    });
+  });
+
+  // ---- M3a: tasks and the factory bus ----
+
+  describe("tasks", () => {
+    it("exposes the five board columns", () => {
+      expect(TaskStatus.options).toEqual(["open", "in_progress", "blocked", "review", "done"]);
+      expect(() => TaskStatus.parse("todo")).toThrow();
+    });
+
+    it("parses a task and defaults its detail to an empty string", () => {
+      const t = TaskInfo.parse({
+        id: "t1", title: "Add the webhook", status: "open",
+        roomId: null, agentId: null, blockedOnMessageId: null,
+        createdAt: 1, updatedAt: 2,
+      });
+      expect(t.detail).toBe("");
+      expect(t.roomId).toBeNull();
+    });
+
+    it("keeps roomId, agentId and blockedOnMessageId explicit and nullable", () => {
+      const base = {
+        id: "t1", title: "Add the webhook", detail: "", status: "open",
+        roomId: null, agentId: null, blockedOnMessageId: null, createdAt: 1, updatedAt: 2,
+      };
+      // null is a value ("unassigned" / "not blocked"), never a forgotten field
+      for (const field of ["roomId", "agentId", "blockedOnMessageId"] as const) {
+        const { [field]: _omitted, ...missing } = base;
+        expect(() => TaskInfo.parse(missing)).toThrow();
+      }
+      expect(TaskInfo.parse({ ...base, roomId: "r1", agentId: "s1", blockedOnMessageId: "m1" }))
+        .toMatchObject({ roomId: "r1", agentId: "s1", blockedOnMessageId: "m1" });
+    });
+
+    it("rejects an empty or oversized title, an oversized detail, and a bad status", () => {
+      const base = {
+        id: "t1", title: "ok", status: "open",
+        roomId: null, agentId: null, blockedOnMessageId: null, createdAt: 1, updatedAt: 2,
+      };
+      expect(() => TaskInfo.parse({ ...base, title: "" })).toThrow();
+      expect(() => TaskInfo.parse({ ...base, title: "t".repeat(201) })).toThrow();
+      expect(() => TaskInfo.parse({ ...base, detail: "d".repeat(4001) })).toThrow();
+      expect(() => TaskInfo.parse({ ...base, status: "shipped" })).toThrow();
+      expect(() => TaskInfo.parse({ ...base, createdAt: 1.5 })).toThrow();
+    });
+
+    it("parses the task client messages", () => {
+      expect(ClientMessage.parse({ kind: "create_task", title: "Add the webhook" }))
+        .toEqual({ kind: "create_task", title: "Add the webhook" });
+      expect(ClientMessage.parse({ kind: "create_task", title: "t", detail: "d", roomId: "r1" }))
+        .toMatchObject({ detail: "d", roomId: "r1" });
+      expect(ClientMessage.parse({ kind: "update_task", taskId: "t1", status: "done" }))
+        .toMatchObject({ taskId: "t1", status: "done" });
+      // unassigning is expressible: null clears the room / the assignee
+      expect(ClientMessage.parse({ kind: "update_task", taskId: "t1", roomId: null, agentId: null }))
+        .toMatchObject({ roomId: null, agentId: null });
+      expect(ClientMessage.parse({ kind: "list_tasks" }).kind).toBe("list_tasks");
+
+      expect(() => ClientMessage.parse({ kind: "create_task" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "create_task", title: "" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "update_task", status: "done" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "update_task", taskId: "t1", status: "shipped" })).toThrow();
+    });
+
+    it("parses a tasks server message", () => {
+      expect(ServerMessage.parse({ kind: "tasks", tasks: [] }).kind).toBe("tasks");
+      expect(() => ServerMessage.parse({ kind: "tasks" })).toThrow();
+    });
+  });
+
+  describe("bus messages", () => {
+    const MESSAGE_INFO = {
+      id: "m1", fromRoomId: "r1", toRoomId: "r2", kind: "request",
+      body: "Please expose a webhook", taskId: null, deliveredAt: null, createdAt: 10,
+    } as const;
+
+    it("parses a message and keeps deliveredAt nullable but required", () => {
+      const m = MessageInfo.parse(MESSAGE_INFO);
+      expect(m.deliveredAt).toBeNull();
+      expect(MessageInfo.parse({ ...MESSAGE_INFO, deliveredAt: 11 }).deliveredAt).toBe(11);
+      const { deliveredAt: _omitted, ...missing } = MESSAGE_INFO;
+      // the belt animates on this field, so "undelivered" must be a value on the wire
+      expect(() => MessageInfo.parse(missing)).toThrow();
+    });
+
+    it("exposes the three message kinds and rejects anything else", () => {
+      expect(MessageKind.options).toEqual(["request", "response", "info"]);
+      expect(() => MessageInfo.parse({ ...MESSAGE_INFO, kind: "shout" })).toThrow();
+    });
+
+    it("requires both endpoints, a non-empty body, and an explicit taskId", () => {
+      for (const field of ["fromRoomId", "toRoomId", "taskId"] as const) {
+        const { [field]: _omitted, ...missing } = MESSAGE_INFO;
+        expect(() => MessageInfo.parse(missing)).toThrow();
+      }
+      expect(() => MessageInfo.parse({ ...MESSAGE_INFO, body: "" })).toThrow();
+      expect(() => MessageInfo.parse({ ...MESSAGE_INFO, body: "b".repeat(8001) })).toThrow();
+      expect(MessageInfo.parse({ ...MESSAGE_INFO, taskId: "t1" }).taskId).toBe("t1");
+    });
+
+    it("parses a messages server message carrying deliveredAt", () => {
+      const m = ServerMessage.parse({ kind: "messages", messages: [MESSAGE_INFO] });
+      expect(m).toMatchObject({ kind: "messages", messages: [{ deliveredAt: null }] });
+      expect(() => ServerMessage.parse({ kind: "messages" })).toThrow();
     });
   });
 });
