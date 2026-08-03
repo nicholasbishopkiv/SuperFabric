@@ -1,5 +1,6 @@
 import type { RoomInfo, ServerMessage, SessionEvent, SessionInfo } from "@superfabric/shared";
 import { create } from "zustand";
+import { useShallow } from "zustand/react/shallow";
 
 export interface EventRow {
   seq: number;
@@ -380,6 +381,24 @@ export const useRoomAgentCount = (roomId: string): number =>
  */
 export const useRoomStatus = (roomId: string): FactoryStatus =>
   useFabric((s) => s.roomStatus[roomId] ?? "idle");
+
+/**
+ * The agents standing in one room: exactly the sessions `liveAgentCount` counts, so the figures on
+ * the floor and the number on the building's label can never disagree. A `done` or `error` session is
+ * history rather than an agent — an error still reaches the operator, through the room's beacon.
+ */
+export function roomAgents(sessions: readonly SessionInfo[], roomId: string): SessionInfo[] {
+  return sessions.filter((s) => s.roomId === roomId && s.state !== "done" && s.state !== "error");
+}
+
+/**
+ * One room's agents. `useShallow` is load-bearing twice over: without an equality function a selector
+ * that builds an array would make React re-render forever, and with it a rebroadcast session list that
+ * changed nothing about *this* room does not touch these figures at all (which is why `applySessions`
+ * preserves row identity).
+ */
+export const useRoomAgents = (roomId: string): SessionInfo[] =>
+  useFabric(useShallow((s) => roomAgents(s.sessions, roomId)));
 
 /**
  * Whether anything in the scene needs animating. The canvas runs `frameloop="demand"` and only

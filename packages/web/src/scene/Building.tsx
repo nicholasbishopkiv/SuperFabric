@@ -2,6 +2,7 @@ import { Html } from "@react-three/drei";
 import type { ThreeEvent } from "@react-three/fiber";
 import { memo, useCallback } from "react";
 import { useFabric, useIsSelected, useRoom, useRoomAgentCount, useRoomStatus } from "../store";
+import { Agents } from "./Agents";
 import {
   beaconHeight,
   buildingSize,
@@ -88,6 +89,10 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
       )}
 
       <StatusBeacon status={status} y={beaconHeight(room.kind)} />
+
+      {/* Figures stand at the project block too, not only at the workshops: an agent created in the
+          project room is a real agent, and a floor that hid it would be lying about what is running. */}
+      <Agents roomId={roomId} kind={room.kind} />
 
       {selected && (
         // An unmistakable ground ring under the selection: the emissive bump alone is subtle on a

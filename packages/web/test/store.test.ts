@@ -1,6 +1,13 @@
 import type { RoomInfo, SessionInfo } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
-import { agentStatus, hasMotion, initialFabricState, liveAgentCount, useFabric } from "../src/store";
+import {
+  agentStatus,
+  hasMotion,
+  initialFabricState,
+  liveAgentCount,
+  roomAgents,
+  useFabric,
+} from "../src/store";
 
 const apply = (msg: Parameters<ReturnType<typeof useFabric.getState>["apply"]>[0]) =>
   useFabric.getState().apply(msg);
@@ -387,6 +394,46 @@ describe("liveAgentCount", () => {
 
   it("attributes a roomless session to no room at all", () => {
     expect(liveAgentCount([session({ roomId: null })], "r1")).toBe(0);
+  });
+});
+
+describe("roomAgents", () => {
+  const crowd = [
+    session({ id: "a", roomId: "r1", status: "working" }),
+    session({ id: "b", roomId: "r1", status: "idle", blocked: true }),
+    session({ id: "c", roomId: "r2", status: "starting", autonomy: "bypass" }),
+    session({ id: "d", roomId: null, status: "working" }),
+  ];
+
+  it("groups the agents by the room they stand in", () => {
+    expect(roomAgents(crowd, "r1").map((s) => s.id)).toEqual(["a", "b"]);
+    expect(roomAgents(crowd, "r2").map((s) => s.id)).toEqual(["c"]);
+    expect(roomAgents(crowd, "nobody")).toEqual([]);
+  });
+
+  it("puts a roomless agent in no room at all", () => {
+    expect(roomAgents(crowd, "r1").some((s) => s.id === "d")).toBe(false);
+    expect(roomAgents(crowd, "r2").some((s) => s.id === "d")).toBe(false);
+  });
+
+  it("derives status per agent, so two agents in one room can differ", () => {
+    expect(roomAgents(crowd, "r1").map(agentStatus)).toEqual(["working", "blocked"]);
+  });
+
+  it("carries each agent's own autonomy, so the ungated one can be marked", () => {
+    expect(roomAgents(crowd, "r2").map((s) => s.autonomy)).toEqual(["bypass"]);
+  });
+
+  it("stands exactly the agents the building's label counts", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1", state: "active" }),
+      session({ id: "b", roomId: "r1", state: "paused" }),
+      session({ id: "c", roomId: "r1", state: "done" }),
+      session({ id: "d", roomId: "r1", state: "error" }),
+    ];
+    // a figure standing next to a label that says "2 agents" would be a lie either way round
+    expect(roomAgents(sessions, "r1")).toHaveLength(liveAgentCount(sessions, "r1"));
+    expect(roomAgents(sessions, "r1").map((s) => s.id)).toEqual(["a", "b"]);
   });
 });
 
