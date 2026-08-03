@@ -89,7 +89,13 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
         </mesh>
       )}
 
-      <Html position={[0, labelHeight, 0]} center distanceFactor={30} occlude>
+      {/*
+        No `distanceFactor`: on an *orthographic* camera drei multiplies the label's scale by
+        `camera.zoom`, which at zoom 38 blows a 13px label up 1140× and covers the whole floor with a
+        white rectangle. A constant screen-space size is also the right behaviour for a plan view —
+        the label stays exactly as readable at every zoom level, which is what the factor was for.
+      */}
+      <Html position={[0, labelHeight, 0]} center occlude>
         <div
           style={{
             font: "600 13px system-ui, sans-serif",

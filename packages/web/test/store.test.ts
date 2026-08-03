@@ -291,9 +291,14 @@ describe("hasMotion", () => {
     }
   });
 
-  it("is true while any agent is starting or working", () => {
-    for (const status of ["starting", "working"] as const) {
-      expect(hasMotion({ sessions: [session({ status: "idle" }), session({ id: "s2", status })] })).toBe(true);
-    }
+  it("is true while any agent is working", () => {
+    expect(hasMotion({ sessions: [session({ status: "idle" }), session({ id: "s2", status: "working" })] }))
+      .toBe(true);
+  });
+
+  it("is false for an agent that is only 'starting'", () => {
+    // A Claude Code session that has been spawned but never prompted reports `starting` forever;
+    // counting it would leave the canvas on frameloop="always" for the rest of the session.
+    expect(hasMotion({ sessions: [session({ status: "starting" })] })).toBe(false);
   });
 });

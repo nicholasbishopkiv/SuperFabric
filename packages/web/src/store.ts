@@ -165,9 +165,14 @@ export const useRoomAgentCount = (roomId: string): number =>
  * switches to `"always"` while this is true, so an idle factory does not spin the GPU. Tasks 6 and 7
  * must keep this accurate: a beacon or a package that looks frozen is this returning false when it
  * should not.
+ *
+ * `starting` deliberately does **not** count, even though Task 6's beacon colours it like `working`.
+ * A Claude Code session reports `starting` when its executor spawns and only leaves that status when
+ * its first turn completes — so a freshly created agent nobody has prompted yet stays `starting`
+ * indefinitely, and counting it would pin the frameloop to `"always"` for the rest of the session.
  */
 export function hasMotion(state: Pick<FabricState, "sessions">): boolean {
-  return state.sessions.some((s) => s.status === "working" || s.status === "starting");
+  return state.sessions.some((s) => s.status === "working");
 }
 
 export const useHasMotion = (): boolean => useFabric(hasMotion);
