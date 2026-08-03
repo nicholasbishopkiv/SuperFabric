@@ -29,7 +29,8 @@ export type ClientMessage = z.infer<typeof ClientMessage>;
 // ---- server -> client ----
 export const SessionInfo = z.object({
   id: z.string(),
-  state: z.enum(["active", "paused", "done"]),
+  // "error": the executor reported a terminal failure, so the session is not re-spawned on boot.
+  state: z.enum(["active", "paused", "done", "error"]),
   claudeSessionId: z.string().nullable(),
   lastSeq: z.number().int(),
 });
