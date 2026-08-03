@@ -4,8 +4,10 @@ import Fastify from "fastify";
 import { WebSocketServer, type WebSocket } from "ws";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
+import { FactoryBus } from "./factoryBus.js";
 import { RoomManager } from "./roomManager.js";
 import { SessionManager } from "./sessionManager.js";
+import { TaskStore } from "./taskStore.js";
 import { ClaudeCodeExecutor } from "./executors/claudeCode.js";
 import { isOriginAllowed } from "./origin.js";
 import { WsHub } from "./wsHub.js";
@@ -20,8 +22,20 @@ const projectRoot = path.resolve(process.env.SUPERFABRIC_PROJECT ?? process.cwd(
 const db = openDb(path.join(dataDir, "fabrica.db"));
 const store = new EventStore(db);
 const rooms = new RoomManager(db, projectRoot);
-const mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms);
-const hub = new WsHub(store, mgr, rooms);
+const tasks = new TaskStore(db);
+// The bus and the session runner need each other: the bus delivers *through* the runner, and the
+// runner hands every agent the bus as tools and flushes the bus at each turn boundary. The bus takes
+// callbacks rather than the runner itself, so the dependency stays one-way in the module graph — and
+// the callbacks are only ever invoked after `mgr` exists.
+let mgr!: SessionManager;
+const bus = new FactoryBus({
+  db,
+  rooms,
+  deliver: (sessionId, text) => mgr.prompt(sessionId, text),
+  roomAgents: (roomId) => mgr.roomAgents(roomId),
+});
+mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, { bus, tasks });
+const hub = new WsHub(store, mgr, rooms, { tasks, bus });
 
 const projectRoom = rooms.ensureProjectRoom();
 console.log(`project root: ${projectRoot} (project room "${projectRoom.name}", ${rooms.listRooms().length - 1} room(s))`);
@@ -29,6 +43,13 @@ console.log(`project root: ${projectRoot} (project room "${projectRoom.name}", $
 const resumed = mgr.resumeAll();
 if (resumed.length > 0) console.log(`resumed sessions: ${resumed.join(", ")}`);
 else console.log("no sessions to resume");
+
+// A message that was queued when the server went down is still queued now — that is the whole point
+// of persisting before delivering. Flush every room so a resumed agent gets its mail without the
+// operator having to prompt it first; delivery is idempotent, so a room with an empty queue costs
+// nothing, and a room with nobody available simply keeps waiting.
+const carried = rooms.listRooms().flatMap((r) => bus.flushRoom(r.id));
+if (carried.length > 0) console.log(`delivered ${carried.length} message(s) queued before the restart`);
 
 const app = Fastify();
 app.get("/healthz", async () => ({ ok: true }));

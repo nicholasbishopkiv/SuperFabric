@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { FACTORY_MCP_SERVER_NAME, busToolDefinitions, busTools } from "../src/busTools.js";
+import { z } from "zod";
 import { openDb } from "../src/db.js";
 import { FactoryBus, type RoomAgent } from "../src/factoryBus.js";
 import { RoomManager } from "../src/roomManager.js";
@@ -92,6 +93,27 @@ describe("busTools", () => {
           expect(field).not.toBe("room_id");
         }
       }
+    });
+  });
+
+  it("declares schemas the MCP layer can turn into JSON Schema for the model", async () => {
+    await withTools(({ defs }) => {
+      // This is the conversion `@modelcontextprotocol/sdk` performs for a zod-4 shape when it lists
+      // tools to the CLI (`zod-json-schema-compat` → `zod/v4-mini`'s toJSONSchema). A shape that
+      // cannot convert would leave an agent with no bus tools at all, and only at runtime.
+      for (const d of defs) {
+        const json = z.toJSONSchema(z.object(d.inputSchema), { io: "input" }) as {
+          properties?: Record<string, { description?: string }>;
+          required?: string[];
+        };
+        expect(Object.keys(json.properties ?? {})).toEqual(Object.keys(d.inputSchema));
+        // every declared field is documented for the model
+        for (const field of Object.values(json.properties ?? {})) {
+          expect(field.description ?? "").not.toBe("");
+        }
+      }
+      const sendJson = z.toJSONSchema(z.object(defs[0]!.inputSchema), { io: "input" }) as { required?: string[] };
+      expect(sendJson.required).toEqual(["to_room", "kind", "body"]); // task_id is optional
     });
   });
 

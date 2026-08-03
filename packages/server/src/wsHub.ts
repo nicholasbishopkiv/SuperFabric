@@ -1,7 +1,9 @@
 import { ClientMessage, type ServerMessage } from "@superfabric/shared";
 import type { EventStore } from "./eventStore.js";
+import type { FactoryBus } from "./factoryBus.js";
 import type { RoomManager } from "./roomManager.js";
 import type { SessionManager } from "./sessionManager.js";
+import type { TaskStore } from "./taskStore.js";
 
 export interface SocketLike { send(data: string): void; }
 
@@ -12,10 +14,17 @@ export interface SocketLike { send(data: string): void; }
  */
 const SESSION_SHAPE_EVENTS = new Set(["session_status", "approval_request", "approval_resolved", "session_error"]);
 
-/** Coalescing window for the `sessions` broadcast. */
-const SESSIONS_DEBOUNCE_MS = 250;
+/** Coalescing window for the pushed state broadcasts. */
+const BROADCAST_DEBOUNCE_MS = 250;
+
+/** State the server pushes on its own, as opposed to answering a query. */
+type PushedList = "sessions" | "tasks" | "messages";
 
 export interface WsHubOptions {
+  /** The task board. Absent => `create_task`/`update_task`/`list_tasks` are refused with an error. */
+  tasks?: TaskStore;
+  /** The factory bus. Absent => no `messages` broadcasts (there is no traffic to report). */
+  bus?: FactoryBus;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -23,9 +32,16 @@ export interface WsHubOptions {
 export class WsHub {
   /** socket -> subscribed sessionIds with last sent seq */
   private subs = new Map<SocketLike, Map<string, number>>();
-  /** Non-null while a coalesced `sessions` broadcast is pending. */
-  private sessionsTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly sessionsDebounceMs: number;
+  /**
+   * One timer for every pushed list. A second mechanism per list would mean a burst of agent
+   * activity costs one frame *per kind* per window instead of one frame, and would need its own
+   * unref'd-timer discipline — so `sessions`, `tasks` and `messages` share this path.
+   */
+  private broadcastTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingBroadcasts = new Set<PushedList>();
+  private readonly broadcastDebounceMs: number;
+  private readonly tasks: TaskStore | undefined;
+  private readonly bus: FactoryBus | undefined;
 
   constructor(
     private store: EventStore,
@@ -33,7 +49,12 @@ export class WsHub {
     private rooms: RoomManager,
     opts: WsHubOptions = {},
   ) {
-    this.sessionsDebounceMs = opts.sessionsDebounceMs ?? SESSIONS_DEBOUNCE_MS;
+    this.broadcastDebounceMs = opts.sessionsDebounceMs ?? BROADCAST_DEBOUNCE_MS;
+    this.tasks = opts.tasks;
+    this.bus = opts.bus;
+    // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
+    // boundary), so the hub learns about traffic by subscribing rather than by being called.
+    opts.bus?.onChange(() => this.scheduleBroadcast("messages"));
     store.onAppend((sessionId, seq, event) => {
       const msg: ServerMessage = { kind: "event", sessionId, seq, event };
       for (const [sock, sessions] of this.subs) {
@@ -49,7 +70,7 @@ export class WsHub {
       // must not have to subscribe to (and replay) every session to keep them right. So a status
       // change pushes the whole session list to everyone — but only for the handful of event types
       // that can change it, and coalesced, because a working agent emits events continuously.
-      if (SESSION_SHAPE_EVENTS.has(event.type)) this.scheduleSessionsBroadcast();
+      if (SESSION_SHAPE_EVENTS.has(event.type)) this.scheduleBroadcast("sessions");
     });
   }
 
@@ -57,20 +78,31 @@ export class WsHub {
   detach(sock: SocketLike): void { this.subs.delete(sock); }
 
   /**
-   * At most one `sessions` broadcast per window, carrying whatever the state is when the timer
-   * fires — so a burst of transitions costs one frame per client and the frame is the newest truth,
-   * not the first change that started the burst.
+   * At most one broadcast per list per window, carrying whatever the state is when the timer fires —
+   * so a burst of transitions costs one frame per client and the frame is the newest truth, not the
+   * first change that started the burst.
    */
-  private scheduleSessionsBroadcast(): void {
-    if (this.sessionsTimer !== null) return;
-    this.sessionsTimer = setTimeout(() => {
-      this.sessionsTimer = null;
-      // Reading the list can throw only if the db is gone (shutdown); a throw here would be an
-      // uncaught exception on a timer callback, which takes the process with it.
-      try { this.broadcastSessions(); } catch { /* the db is closing; nothing to tell anyone */ }
-    }, this.sessionsDebounceMs);
+  private scheduleBroadcast(kind: PushedList): void {
+    this.pendingBroadcasts.add(kind);
+    if (this.broadcastTimer !== null) return;
+    this.broadcastTimer = setTimeout(() => {
+      this.broadcastTimer = null;
+      const kinds = [...this.pendingBroadcasts];
+      this.pendingBroadcasts.clear();
+      for (const k of kinds) {
+        // Reading a list can throw only if the db is gone (shutdown); a throw here would be an
+        // uncaught exception on a timer callback, which takes the process with it.
+        try { this.broadcastList(k); } catch { /* the db is closing; nothing to tell anyone */ }
+      }
+    }, this.broadcastDebounceMs);
     // A pending broadcast must never be the reason the process refuses to exit.
-    this.sessionsTimer.unref?.();
+    this.broadcastTimer.unref?.();
+  }
+
+  private broadcastList(kind: PushedList): void {
+    if (kind === "sessions") this.broadcastSessions();
+    else if (kind === "tasks") this.broadcastTasks();
+    else this.broadcastMessages();
   }
 
   handleMessage(sock: SocketLike, raw: string): void {
@@ -133,6 +165,23 @@ export class WsHub {
           this.broadcastRooms();
           break;
         case "list_rooms": this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms() }); break;
+        // Tasks. The board is global state like rooms are, so a change is broadcast — but on the
+        // coalescing path, because an agent driving `factory_task_update` can change it as fast as
+        // it can call a tool. An unknown task or an assignee from the wrong room throws into the
+        // catch below and is reported to the socket that asked.
+        case "create_task":
+          this.taskStore().create({ title: msg.title, detail: msg.detail, roomId: msg.roomId });
+          this.scheduleBroadcast("tasks");
+          break;
+        case "update_task":
+          this.taskStore().update(msg.taskId, {
+            ...(msg.status !== undefined ? { status: msg.status } : {}),
+            ...(msg.roomId !== undefined ? { roomId: msg.roomId } : {}),
+            ...(msg.agentId !== undefined ? { agentId: msg.agentId } : {}),
+          });
+          this.scheduleBroadcast("tasks");
+          break;
+        case "list_tasks": this.safeSend(sock, { kind: "tasks", tasks: this.taskStore().list() }); break;
       }
     } catch (err) {
       this.safeSend(sock, { kind: "error", message: String(err) });
@@ -158,6 +207,22 @@ export class WsHub {
 
   private broadcastSessions(): void {
     this.broadcast({ kind: "sessions", sessions: this.mgr.listSessions() });
+  }
+
+  private broadcastTasks(): void {
+    if (this.tasks === undefined) return;
+    this.broadcast({ kind: "tasks", tasks: this.tasks.list() });
+  }
+
+  private broadcastMessages(): void {
+    if (this.bus === undefined) return;
+    this.broadcast({ kind: "messages", messages: this.bus.list() });
+  }
+
+  /** A task request on a server with no task board is a routing error, not a silent no-op. */
+  private taskStore(): TaskStore {
+    if (this.tasks === undefined) throw new Error("this server has no task board");
+    return this.tasks;
   }
 
   /** Replay the log after `afterSeq`, then keep tailing from wherever the replay ended. */

@@ -4,7 +4,7 @@ import { FACTORY_MCP_SERVER_NAME, busTools } from "./busTools.js";
 import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
-import type { FactoryBus } from "./factoryBus.js";
+import type { FactoryBus, RoomAgent } from "./factoryBus.js";
 import type { RoomManager } from "./roomManager.js";
 import type { TaskStore } from "./taskStore.js";
 import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
@@ -46,6 +46,13 @@ export class SessionManager {
    * (or a bogus) session id alongside a valid approvalId.
    */
   private approvals = new Map<string, PendingApproval>();
+  /**
+   * Sessions with a turn in flight. The event log knows this too, but it lags by one event: at
+   * `turn_complete` the newest `session_status` is still `working` and the `idle` that follows has
+   * not been appended yet — which is exactly the instant the bus asks "who is free?". This set is
+   * the live answer, so the bus never has to guess.
+   */
+  private turnInFlight = new Set<string>();
   /** Set by stopAll(): no new executor may be started once shutdown has begun. */
   private stopping = false;
   private readonly stmts;
@@ -153,6 +160,8 @@ export class SessionManager {
     // Order matters: the old executor must be gone before a new one resumes the same provider
     // session. Pending approvals belong to the turn that is being torn down, so deny them.
     this.handles.delete(id);
+    // Whatever turn was in flight died with that executor; the replacement starts idle.
+    this.turnInFlight.delete(id);
     this.denyPendingApprovals(id);
     // A wedged CLI subprocess must not wedge the toggle; the abort in stop() still fires.
     await this.stopWithTimeout(handle, 5000).catch(() => {});
@@ -210,6 +219,17 @@ export class SessionManager {
           // A terminal executor failure must move the session off 'active', otherwise resumeAll()
           // re-spawns a known-broken session on every boot, forever.
           if (event.type === "session_error") this.stmts.markError.run(id);
+          if (event.type === "session_status") {
+            if (event.status === "working") this.turnInFlight.add(id);
+            else this.turnInFlight.delete(id);
+          }
+          if (event.type === "turn_complete") {
+            this.turnInFlight.delete(id);
+            // The turn boundary: the one moment a message from another room may be injected into
+            // this agent without interrupting anything. Delivery is idempotent, so flushing here on
+            // every boundary costs nothing when the room's queue is empty.
+            if (roomId !== null) this.opts.bus?.flushRoom(roomId);
+          }
         },
         requestApproval: (toolName, input) =>
           new Promise((resolve) => {
@@ -289,6 +309,7 @@ export class SessionManager {
     for (const id of this.handles.keys()) this.denyPendingApprovals(id);
     const handles = [...this.handles.values()];
     this.handles.clear();
+    this.turnInFlight.clear();
     await Promise.allSettled(handles.map((h) => this.stopWithTimeout(h, timeoutMs)));
   }
 
@@ -301,6 +322,21 @@ export class SessionManager {
         (err) => { clearTimeout(timer); reject(err); },
       );
     });
+  }
+
+  /**
+   * The live agents standing in a room, with the status the bus uses to decide whether it may inject
+   * a turn now. Only sessions with a live executor are listed: a row marked active whose process is
+   * gone cannot carry a message, and offering it would make the bus mark one delivered to nobody.
+   */
+  roomAgents(roomId: string): RoomAgent[] {
+    return this.listSessions()
+      .filter((s) => s.roomId === roomId && this.handles.has(s.id))
+      .map((s) => ({
+        sessionId: s.id,
+        // See `turnInFlight`: the log's `working` outlives the turn by one event.
+        status: s.status === "working" && !this.turnInFlight.has(s.id) ? "idle" : s.status,
+      }));
   }
 
   listSessions(): SessionInfo[] {

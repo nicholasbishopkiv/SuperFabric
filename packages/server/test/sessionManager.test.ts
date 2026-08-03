@@ -11,6 +11,7 @@ import { FakeExecutor } from "../src/executors/fake.js";
 import { FactoryBus } from "../src/factoryBus.js";
 import { TaskStore } from "../src/taskStore.js";
 import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../src/executor.js";
+import type { SessionEvent } from "@superfabric/shared";
 
 function make(db = openDb(":memory:")) {
   const store = new EventStore(db);
@@ -604,6 +605,119 @@ describe("SessionManager", () => {
         expect(exec.starts).toHaveLength(2);
         // the restarted executor must still have the bus, or a mode toggle would silently mute an agent
         expect(Object.keys(exec.starts[1]!.mcpServers ?? {})).toEqual(["factory"]);
+      });
+    });
+
+    /**
+     * The wiring `index.ts` builds: a bus whose `deliver`/`roomAgents` point at the manager, and a
+     * manager that holds the bus. A scripted `FakeExecutor` supplies the turn boundaries, which is
+     * the whole subject of these cases.
+     */
+    function withWiredBus<T>(fn: (ctx: {
+      store: EventStore; exec: FakeExecutor; mgr: SessionManager; bus: FactoryBus;
+      chat: ReturnType<RoomManager["createRoom"]>; payments: ReturnType<RoomManager["createRoom"]>;
+    }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-session-flush-"));
+      const db = openDb(":memory:");
+      try {
+        const store = new EventStore(db);
+        const rooms = new RoomManager(db, root);
+        rooms.ensureProjectRoom();
+        const chat = rooms.createRoom("chat");
+        const payments = rooms.createRoom("payments");
+        const exec = new FakeExecutor();
+        const tasks = new TaskStore(db);
+        // `mgr` is only read inside the callbacks, which cannot run before it is assigned — the same
+        // knot index.ts unties, and the reason the bus takes callbacks at all.
+        let mgr!: SessionManager;
+        const bus = new FactoryBus({
+          db, rooms,
+          deliver: (sessionId, text) => mgr.prompt(sessionId, text),
+          roomAgents: (roomId) => mgr.roomAgents(roomId),
+        });
+        mgr = new SessionManager(db, store, exec, rooms, { bus, tasks });
+        return fn({ store, exec, mgr, bus, chat, payments });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    it("reports a room's live agents to the bus, and only the live ones", async () => {
+      await withWiredBus(async ({ exec, mgr, chat, payments }) => {
+        const id = mgr.createSession({ roomId: chat.id });
+
+        expect(mgr.roomAgents(chat.id)).toEqual([{ sessionId: id, status: "idle" }]);
+        expect(mgr.roomAgents(payments.id)).toEqual([]);
+
+        mgr.prompt(id, "get to work");
+        expect(mgr.roomAgents(chat.id)).toEqual([{ sessionId: id, status: "working" }]);
+        await exec.settle();
+        expect(mgr.roomAgents(chat.id)).toEqual([{ sessionId: id, status: "idle" }]);
+
+        // a session whose executor is gone cannot carry anything, so it must not be offered
+        await mgr.stopAll();
+        expect(mgr.roomAgents(chat.id)).toEqual([]);
+      });
+    });
+
+    it("delivers a message queued for a busy room at that room's next turn boundary", async () => {
+      await withWiredBus(async ({ store, exec, mgr, bus, chat, payments }) => {
+        const id = mgr.createSession({ roomId: payments.id });
+
+        mgr.prompt(id, "get to work");
+        const queued = bus.send({
+          fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "Please expose a webhook",
+        });
+        // mid-turn: persisted, not injected
+        expect(queued.deliveredAt).toBeNull();
+
+        await exec.settle();
+        expect(bus.get(queued.id)!.deliveredAt).not.toBeNull();
+        // the injected turn is queued into the executor by the flush, so it runs one turn later
+        await exec.settle();
+        const prompts = store.listAfter(id, 0)
+          .map((e) => e.event)
+          .filter((e): e is Extract<SessionEvent, { type: "user_prompt" }> => e.type === "user_prompt");
+        expect(prompts.some((p) => p.text.includes("Please expose a webhook"))).toBe(true);
+        expect(prompts.some((p) => p.text.includes("chat"))).toBe(true);
+      });
+    });
+
+    it("does not deliver the same message again at the next turn boundary", async () => {
+      await withWiredBus(async ({ store, exec, mgr, bus, chat, payments }) => {
+        const id = mgr.createSession({ roomId: payments.id });
+
+        mgr.prompt(id, "get to work");
+        bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "exactly once" });
+        await exec.settle();
+        await exec.settle();
+        mgr.prompt(id, "another turn");
+        await exec.settle();
+        await exec.settle();
+
+        const carried = store.listAfter(id, 0)
+          .map((e) => e.event)
+          .filter((e) => e.type === "user_prompt" && e.text.includes("exactly once"));
+        expect(carried).toHaveLength(1);
+      });
+    });
+
+    it("does not flush anything for a roomless session's turn boundary", async () => {
+      await withWiredBus(async ({ store, exec, mgr, bus, chat, payments }) => {
+        // an agent standing in payments, but busy, so the message stays queued
+        const busyAgent = mgr.createSession({ roomId: payments.id });
+        mgr.prompt(busyAgent, "busy");
+        bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "for payments only" });
+
+        const roomless = mgr.createSession({ cwd: tmpdir() });
+        mgr.prompt(roomless, "hello");
+        await exec.settle();
+
+        // the roomless session's boundary must not have carried payments' mail
+        const gotIt = store.listAfter(roomless, 0)
+          .map((e) => e.event)
+          .some((e) => e.type === "user_prompt" && e.text.includes("for payments only"));
+        expect(gotIt).toBe(false);
       });
     });
 

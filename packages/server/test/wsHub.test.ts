@@ -8,6 +8,8 @@ import { EventStore } from "../src/eventStore.js";
 import { RoomManager } from "../src/roomManager.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
+import { FactoryBus } from "../src/factoryBus.js";
+import { TaskStore } from "../src/taskStore.js";
 import { WsHub, type SocketLike } from "../src/wsHub.js";
 
 function fakeSocket() {
@@ -24,21 +26,43 @@ function fakeSocket() {
 function makeHub(opts: {
   script?: { tool: string; input: unknown }[]; attach?: boolean; root?: string;
   sessionsDebounceMs?: number;
+  /** false builds an M0-shaped hub with no task board and no bus. */
+  stores?: boolean;
 } = {}) {
   const db = openDb(":memory:");
   const store = new EventStore(db);
   const exec = new FakeExecutor(opts.script ? { script: opts.script } : {});
   const rooms = new RoomManager(db, opts.root ?? tmpdir());
-  const mgr = new SessionManager(db, store, exec, rooms);
-  const hub = new WsHub(store, mgr, rooms, { sessionsDebounceMs: opts.sessionsDebounceMs });
+  const tasks = new TaskStore(db);
+  const mgr = new SessionManager(db, store, exec, rooms, { tasks });
+  const bus = new FactoryBus({
+    db, rooms,
+    deliver: (sessionId, text) => mgr.prompt(sessionId, text),
+    roomAgents: (roomId) => mgr.roomAgents(roomId),
+  });
+  const withStores = opts.stores !== false;
+  const hub = new WsHub(store, mgr, rooms, {
+    sessionsDebounceMs: opts.sessionsDebounceMs,
+    tasks: withStores ? tasks : undefined,
+    bus: withStores ? bus : undefined,
+  });
   const { sock, sent } = fakeSocket();
   if (opts.attach !== false) hub.attach(sock);
-  return { db, store, exec, rooms, mgr, hub, sock, sent };
+  return { db, store, exec, rooms, tasks, bus, mgr, hub, sock, sent };
 }
 
 /** The hub's private socket -> watermark table; asserted directly, it is the thing I1 broke. */
 function subsFor(hub: WsHub): Map<SocketLike, Map<string, number>> {
   return (hub as unknown as { subs: Map<SocketLike, Map<string, number>> }).subs;
+}
+
+/**
+ * The hub's single coalescing timer, shared by every pushed list (`sessions`, `tasks`, `messages`).
+ * A pending broadcast must never be the reason the process refuses to exit, so tests assert it is
+ * unref'd — whichever list scheduled it.
+ */
+function pendingTimer(hub: WsHub): { hasRef?: () => boolean } | null {
+  return (hub as unknown as { broadcastTimer: { hasRef?: () => boolean } | null }).broadcastTimer;
 }
 
 describe("WsHub", () => {
@@ -498,10 +522,253 @@ describe("WsHub", () => {
     it("does not keep the process alive: the pending timer is unref'd", async () => {
       const { store, id, hub } = await withWatcher();
       store.append(id, { type: "session_status", status: "working" });
-      const timer = (hub as unknown as { sessionsTimer: { hasRef?: () => boolean } | null }).sessionsTimer;
+      const timer = pendingTimer(hub);
       expect(timer).not.toBeNull();
       // Bun's Timer exposes hasRef() like Node's; an unref'd timer reports false.
       expect(timer!.hasRef?.()).toBe(false);
+    });
+  });
+
+  // ---- M3a: tasks and bus traffic over the wire ----
+
+  describe("tasks and messages", () => {
+    const DEBOUNCE_MS = 20;
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+    /** A hub with a throwaway project root, two rooms, and a short coalescing window. */
+    async function withRooms<T>(fn: (ctx: ReturnType<typeof makeHub> & {
+      chat: ReturnType<RoomManager["createRoom"]>; payments: ReturnType<RoomManager["createRoom"]>;
+      settle: () => Promise<void>;
+    }) => T | Promise<T>): Promise<T> {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-tasks-"));
+      const ctx = makeHub({ root, sessionsDebounceMs: DEBOUNCE_MS });
+      ctx.rooms.ensureProjectRoom();
+      const chat = ctx.rooms.createRoom("chat");
+      const payments = ctx.rooms.createRoom("payments");
+      try {
+        return await fn({ ...ctx, chat, payments, settle: () => sleep(DEBOUNCE_MS * 3) });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    const lastTasks = (sent: any[]) => sent.filter(m => m.kind === "tasks").at(-1)?.tasks as any[] | undefined;
+    const lastMessages = (sent: any[]) => sent.filter(m => m.kind === "messages").at(-1)?.messages as any[] | undefined;
+
+    it("create_task persists the task and broadcasts the board", async () => {
+      await withRooms(async ({ hub, tasks, sock, sent, chat, settle }) => {
+        hub.handleMessage(sock, JSON.stringify({
+          kind: "create_task", title: "Expose a webhook", detail: "for receipts", roomId: chat.id,
+        }));
+        await settle();
+
+        expect(tasks.list()).toHaveLength(1);
+        expect(lastTasks(sent)![0]).toMatchObject({
+          title: "Expose a webhook", detail: "for receipts", roomId: chat.id, status: "open",
+        });
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+      });
+    });
+
+    it("create_task without a room lands unassigned rather than being refused", async () => {
+      await withRooms(async ({ hub, sock, sent, settle }) => {
+        // leaving the room out is the intended path: the orchestrator routes it (M3b)
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_task", title: "Someone should do this" }));
+        await settle();
+        expect(lastTasks(sent)![0]).toMatchObject({ roomId: null, agentId: null });
+      });
+    });
+
+    it("update_task routes status, room and assignee, and broadcasts", async () => {
+      await withRooms(async ({ hub, mgr, tasks, sock, sent, chat, settle }) => {
+        const agent = mgr.createSession({ roomId: chat.id });
+        const task = tasks.create({ title: "Expose a webhook" });
+
+        hub.handleMessage(sock, JSON.stringify({
+          kind: "update_task", taskId: task.id, status: "in_progress", roomId: chat.id, agentId: agent,
+        }));
+        await settle();
+
+        expect(lastTasks(sent)![0]).toMatchObject({ status: "in_progress", roomId: chat.id, agentId: agent });
+        expect(tasks.get(task.id)).toMatchObject({ status: "in_progress", agentId: agent });
+      });
+    });
+
+    it("update_task with an explicit null clears the assignment", async () => {
+      await withRooms(async ({ hub, mgr, tasks, sock, settle, chat }) => {
+        const agent = mgr.createSession({ roomId: chat.id });
+        const task = tasks.create({ title: "Expose a webhook", roomId: chat.id });
+        tasks.update(task.id, { agentId: agent });
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "update_task", taskId: task.id, agentId: null }));
+        await settle();
+        expect(tasks.get(task.id)!.agentId).toBeNull();
+      });
+    });
+
+    it("list_tasks answers only the socket that asked", async () => {
+      await withRooms(({ hub, tasks, sock, sent }) => {
+        tasks.create({ title: "Expose a webhook" });
+        const second = fakeSocket();
+        hub.attach(second.sock);
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "list_tasks" }));
+        expect(lastTasks(sent)!.map(t => t.title)).toEqual(["Expose a webhook"]);
+        expect(second.sent).toHaveLength(0);
+      });
+    });
+
+    it("broadcasts a messages list when the bus carries a message", async () => {
+      await withRooms(async ({ hub, mgr, bus, sent, chat, payments, settle }) => {
+        mgr.createSession({ roomId: payments.id });
+        const second = fakeSocket();
+        hub.attach(second.sock);
+
+        const msg = bus.send({
+          fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "Please expose a webhook",
+        });
+        await settle();
+
+        for (const seen of [sent, second.sent]) {
+          const messages = lastMessages(seen)!;
+          expect(messages).toHaveLength(1);
+          // the belt animates off deliveredAt, so it has to be on the wire
+          expect(messages[0]).toMatchObject({ id: msg.id, fromRoomId: chat.id, toRoomId: payments.id });
+          expect(messages[0].deliveredAt).not.toBeNull();
+        }
+      });
+    });
+
+    it("reports an undelivered message as undelivered", async () => {
+      await withRooms(async ({ hub, bus, sock, sent, chat, payments, settle }) => {
+        hub.attach(sock);
+        bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "nobody home" });
+        await settle();
+        expect(lastMessages(sent)![0].deliveredAt).toBeNull();
+      });
+    });
+
+    // ---- the dispatch guard keeps holding for every new case ----
+
+    it("replies error without throwing for update_task on an unknown task", async () => {
+      await withRooms(async ({ hub, sock, sent, settle }) => {
+        expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "update_task", taskId: "nope", status: "done" })))
+          .not.toThrow();
+        await settle();
+        expect(sent.filter(m => m.kind === "error")).toHaveLength(1);
+        expect(sent.some(m => m.kind === "tasks")).toBe(false);
+      });
+    });
+
+    it("replies error without throwing for create_task in an unknown room", async () => {
+      await withRooms(async ({ hub, tasks, sock, sent, settle }) => {
+        expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "create_task", title: "t", roomId: "nope" })))
+          .not.toThrow();
+        await settle();
+        expect(sent.filter(m => m.kind === "error")).toHaveLength(1);
+        expect(tasks.list()).toEqual([]);
+      });
+    });
+
+    it("replies error without throwing for an assignee from another room", async () => {
+      await withRooms(async ({ hub, mgr, tasks, sock, sent, chat, payments, settle }) => {
+        const elsewhere = mgr.createSession({ roomId: payments.id });
+        const task = tasks.create({ title: "Expose a webhook", roomId: chat.id });
+        expect(() => hub.handleMessage(sock, JSON.stringify({
+          kind: "update_task", taskId: task.id, agentId: elsewhere,
+        }))).not.toThrow();
+        await settle();
+        expect(sent.filter(m => m.kind === "error")).toHaveLength(1);
+        expect(tasks.get(task.id)!.agentId).toBeNull();
+      });
+    });
+
+    it("rejects a task frame the protocol refuses before it reaches the store", async () => {
+      await withRooms(async ({ hub, tasks, sock, sent, settle }) => {
+        for (const frame of [
+          { kind: "create_task" },
+          { kind: "create_task", title: "" },
+          { kind: "update_task", status: "done" },
+          { kind: "update_task", taskId: "t1", status: "shipped" },
+        ]) {
+          hub.handleMessage(sock, JSON.stringify(frame));
+        }
+        await settle();
+        expect(sent.filter(m => m.kind === "error")).toHaveLength(4);
+        expect(sent.every(m => m.kind === "error" && m.message === "bad message")).toBe(true);
+        expect(tasks.list()).toEqual([]);
+      });
+    });
+
+    it("replies error without throwing on a server with no task board", () => {
+      const { hub, sock, sent } = makeHub({ stores: false });
+      for (const frame of [
+        { kind: "create_task", title: "t" },
+        { kind: "update_task", taskId: "t1", status: "done" },
+        { kind: "list_tasks" },
+      ]) {
+        expect(() => hub.handleMessage(sock, JSON.stringify(frame))).not.toThrow();
+      }
+      expect(sent.filter(m => m.kind === "error")).toHaveLength(3);
+      expect(sent.some(m => m.kind === "tasks")).toBe(false);
+    });
+
+    // ---- the same coalescing path as `sessions`, not a second timer ----
+
+    it("coalesces a burst of task changes into one broadcast carrying the newest state", async () => {
+      await withRooms(async ({ hub, tasks, sock, sent, settle }) => {
+        const task = tasks.create({ title: "Expose a webhook" });
+        for (const status of ["in_progress", "review", "done"]) {
+          hub.handleMessage(sock, JSON.stringify({ kind: "update_task", taskId: task.id, status }));
+        }
+        await settle();
+
+        expect(sent.filter(m => m.kind === "tasks")).toHaveLength(1);
+        expect(lastTasks(sent)![0].status).toBe("done");
+      });
+    });
+
+    it("coalesces a burst of bus traffic into one messages broadcast", async () => {
+      await withRooms(async ({ bus, sent, chat, payments, settle }) => {
+        for (let i = 0; i < 5; i++) {
+          bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "info", body: `note ${i}` });
+        }
+        await settle();
+        expect(sent.filter(m => m.kind === "messages")).toHaveLength(1);
+        expect(lastMessages(sent)!).toHaveLength(5);
+      });
+    });
+
+    it("shares one timer with sessions: a mixed burst is one frame per list", async () => {
+      await withRooms(async ({ hub, store, mgr, bus, tasks, sock, sent, chat, payments, settle }) => {
+        const id = mgr.createSession({ roomId: chat.id });
+        await settle();
+        const before = {
+          sessions: sent.filter(m => m.kind === "sessions").length,
+          tasks: sent.filter(m => m.kind === "tasks").length,
+          messages: sent.filter(m => m.kind === "messages").length,
+        };
+
+        const task = tasks.create({ title: "Expose a webhook" });
+        store.append(id, { type: "session_status", status: "working" });
+        hub.handleMessage(sock, JSON.stringify({ kind: "update_task", taskId: task.id, status: "review" }));
+        bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "info", body: "note" });
+        store.append(id, { type: "session_status", status: "idle" });
+        await settle();
+
+        expect(sent.filter(m => m.kind === "sessions").length).toBe(before.sessions + 1);
+        expect(sent.filter(m => m.kind === "tasks").length).toBe(before.tasks + 1);
+        expect(sent.filter(m => m.kind === "messages").length).toBe(before.messages + 1);
+      });
+    });
+
+    it("does not keep the process alive: a pending tasks broadcast is unref'd too", async () => {
+      await withRooms(({ hub, sock }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_task", title: "Expose a webhook" }));
+        const timer = pendingTimer(hub);
+        expect(timer).not.toBeNull();
+        expect(timer!.hasRef?.()).toBe(false);
+      });
     });
   });
 
