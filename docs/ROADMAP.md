@@ -27,17 +27,28 @@ contiguous. 44 tests green (+1 live-quota test, run manually).
 
 ## M1 — The floor: 3D factory, project block, rooms
 
-- 3D scene (react-three-fiber, isometric camera, low-poly): the main building = the
-  project (click → CLAUDE.md/README), creating workshop rooms → folders, conveyor paths
-  between buildings.
-- 2D overlay: **task panel** (manual task creation, department picked manually for
-  now), room panel (charter, per-agent model/skills/MCP), working/idle/blocked statuses
-  on the buildings.
-- **Roles library v1**: ~10 starter presets (architect, backend, frontend, designer,
-  QA, DevOps…) — role = prompt + skills/superpowers + plugins/MCP + model; one-click
-  assignment, file format `roles/*.yaml` (growing to 50+ roles and user presets in M5).
-- Onboarding agent for an empty project (interview → documents).
-- Scene layout persisted to `.fabrica/layout.json`.
+**M1a is complete (2026-08-03)** — rooms as folders and the 3D floor:
+
+- [x] 3D scene (react-three-fiber, isometric orthographic camera, low-poly): the project
+      block as headquarters, workshop buildings on a ring, a bounded concrete shell,
+      conveyor belts that enter loading bays, animated package meshes, status beacons and
+      agent figures with hard hats and status vests.
+- [x] Rooms are folders: creating one makes `<root>/<name>/` with a `CLAUDE.md` charter,
+      and an agent in that room runs with the room's folder as its cwd.
+- [x] 2D overlay: room panel (create, select, per-room agents, per-agent autonomy,
+      unassigned sessions) and the M0 console as a collapsible drawer.
+- [x] Live status: `SessionInfo` carries a server-derived `status` and `blocked`, broadcast
+      to every client with a 250 ms debounce, so the floor is correct after a reload
+      without replaying transcripts.
+- [x] Drag a building to move its room; the position persists. Camera frames the factory
+      into the strip the HUD panels leave uncovered, and yields to manual pan/zoom.
+- [x] `frameloop="demand"`: an idle factory does zero `requestAnimationFrame` calls.
+
+Still open for M1:
+
+- [ ] Task panel with manual task entry (auto-routing needs the orchestrator — M3).
+- [ ] Roles library v1: ~10 presets (role = prompt + skills/superpowers + plugins/MCP + model).
+- [ ] Onboarding agent for an empty project (interview → CLAUDE.md / README).
 
 ## M2 — Multi-account and the limit monitor
 
