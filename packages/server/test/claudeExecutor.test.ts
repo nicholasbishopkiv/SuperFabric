@@ -43,6 +43,28 @@ function assistantMsg(content: Block[]): SDKMessage {
   };
 }
 
+/**
+ * The CLI reports tool outcomes as `type: "user"` messages carrying tool_result content blocks
+ * (per notes/agent-sdk-api.md — `SDKUserMessage` is in the emitted union).
+ */
+type ToolResultBlock = {
+  type: "tool_result";
+  tool_use_id: string;
+  content?: string | { type: string; text?: string }[];
+  is_error?: boolean;
+};
+
+function userMsg(content: string | ToolResultBlock[], extra: Record<string, unknown> = {}): SDKMessage {
+  return {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "sess-1",
+    ...extra,
+  } as unknown as SDKMessage;
+}
+
 function resultMsg(total_cost_usd: number): SDKMessage {
   // `usage: NonNullableUsage` requires every field of the peer SDK's BetaUsage; the executor
   // only reads `total_cost_usd`, so the message is cast once instead of fabricating a full usage.
@@ -197,6 +219,75 @@ describe("ClaudeCodeExecutor", () => {
       { type: "tool_use", toolName: "Bash", input: { command: "ls" } },
       { type: "agent_text", text: "bye" },
     ]);
+  });
+
+  describe("tool_result blocks on user messages", () => {
+    it("correlates the tool name from the earlier tool_use and normalizes string content", async () => {
+      const { fq, events } = harness();
+      fq.emit(initMsg("sess-tr"));
+      fq.emit(assistantMsg([{ type: "tool_use", id: "tu_7", name: "Bash", input: { command: "ls" } }]));
+      fq.emit(userMsg([{ type: "tool_result", tool_use_id: "tu_7", content: "a.txt\nb.txt" }]));
+      await until(() => events.some((e) => e.type === "tool_result"));
+      expect(events.slice(1)).toEqual([
+        { type: "tool_use", toolName: "Bash", input: { command: "ls" } },
+        { type: "tool_result", toolName: "Bash", isError: false, output: "a.txt\nb.txt" },
+      ]);
+    });
+
+    it("maps is_error: true to isError: true", async () => {
+      const { fq, events } = harness();
+      fq.emit(initMsg("sess-tr2"));
+      fq.emit(assistantMsg([{ type: "tool_use", id: "tu_8", name: "Write", input: { file_path: "/etc/x" } }]));
+      fq.emit(userMsg([{ type: "tool_result", tool_use_id: "tu_8", content: "permission denied", is_error: true }]));
+      await until(() => events.some((e) => e.type === "tool_result"));
+      expect(events.at(-1)).toEqual({
+        type: "tool_result", toolName: "Write", isError: true, output: "permission denied",
+      });
+    });
+
+    it("falls back to the tool_use_id when the name was never seen, and flattens block content", async () => {
+      const { fq, events } = harness();
+      fq.emit(initMsg("sess-tr3"));
+      fq.emit(userMsg([{
+        type: "tool_result",
+        tool_use_id: "tu_orphan",
+        content: [{ type: "text", text: "line one" }, { type: "image" }, { type: "text", text: "line two" }],
+      }]));
+      await until(() => events.some((e) => e.type === "tool_result"));
+      expect(events.at(-1)).toEqual({
+        type: "tool_result", toolName: "tu_orphan", isError: false, output: "line one\n[image]\nline two",
+      });
+    });
+
+    it("emits one event per tool_result block and omits output when there is none", async () => {
+      const { fq, events } = harness();
+      fq.emit(initMsg("sess-tr4"));
+      fq.emit(assistantMsg([
+        { type: "tool_use", id: "tu_a", name: "Read", input: {} },
+        { type: "tool_use", id: "tu_b", name: "Grep", input: {} },
+      ]));
+      fq.emit(userMsg([
+        { type: "tool_result", tool_use_id: "tu_a" },
+        { type: "tool_result", tool_use_id: "tu_b", content: "hit" },
+      ]));
+      await until(() => events.filter((e) => e.type === "tool_result").length === 2);
+      expect(events.filter((e) => e.type === "tool_result")).toEqual([
+        { type: "tool_result", toolName: "Read", isError: false },
+        { type: "tool_result", toolName: "Grep", isError: false, output: "hit" },
+      ]);
+    });
+
+    it("ignores plain-text user turns and replayed history", async () => {
+      const { fq, events } = harness();
+      fq.emit(initMsg("sess-tr5"));
+      fq.emit(assistantMsg([{ type: "tool_use", id: "tu_r", name: "Bash", input: {} }]));
+      fq.emit(userMsg("just a prompt echoed back"));
+      // isReplay marks history the CLI re-emits on resume; our log already holds those rows.
+      fq.emit(userMsg([{ type: "tool_result", tool_use_id: "tu_r", content: "old" }], { isReplay: true }));
+      fq.emit(resultMsg(0.1));
+      await until(() => events.some((e) => e.type === "turn_complete"));
+      expect(events.some((e) => e.type === "tool_result")).toBe(false);
+    });
   });
 
   it("emits turn_complete with costUsd then session_status idle on result", async () => {

@@ -1,5 +1,6 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { Options, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { SessionEvent } from "@superfabric/shared";
 import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../executor.js";
 
 /**
@@ -133,9 +134,13 @@ export class ClaudeCodeExecutor implements Executor {
 
     const q: Query = this.queryFn({ prompt: queue, options });
 
+    // tool_use_id -> toolName, so a `tool_result` block (which only carries the id) can be
+    // reported under the name the operator saw on the matching tool_use line.
+    const toolNames = new Map<string, string>();
+
     const pump = (async () => {
       try {
-        for await (const msg of q) this.handleMessage(msg, ev, resolveSessionId);
+        for await (const msg of q) this.handleMessage(msg, ev, resolveSessionId, toolNames);
       } catch (err) {
         if (stopped) return; // close()/abort() teardown, not a session failure
         const kind = classifyExecutorError(err);
@@ -172,7 +177,12 @@ export class ClaudeCodeExecutor implements Executor {
     };
   }
 
-  private handleMessage(msg: SDKMessage, ev: ExecutorEvents, resolveSessionId: (id: string) => void): void {
+  private handleMessage(
+    msg: SDKMessage,
+    ev: ExecutorEvents,
+    resolveSessionId: (id: string) => void,
+    toolNames: Map<string, string>,
+  ): void {
     if (msg.type === "system" && msg.subtype === "init") {
       resolveSessionId(msg.session_id);
       return;
@@ -181,7 +191,32 @@ export class ClaudeCodeExecutor implements Executor {
       for (const block of msg.message.content) {
         if (block.type === "text") ev.onEvent({ type: "agent_text", text: block.text });
         else if (block.type === "thinking") ev.onEvent({ type: "agent_thinking" });
-        else if (block.type === "tool_use") ev.onEvent({ type: "tool_use", toolName: block.name, input: block.input });
+        else if (block.type === "tool_use") {
+          toolNames.set(block.id, block.name);
+          ev.onEvent({ type: "tool_use", toolName: block.name, input: block.input });
+        }
+      }
+      return;
+    }
+    // The CLI reports tool outcomes as `type: "user"` messages carrying tool_result content
+    // blocks — there is no dedicated tool_result message type. `isReplay` marks history the CLI
+    // re-emits when a session is resumed; our own log already holds those rows, so skip them
+    // instead of appending a duplicate transcript on every restart.
+    if (msg.type === "user") {
+      if ("isReplay" in msg && msg.isReplay === true) return;
+      const content = msg.message.content;
+      if (typeof content === "string") return; // our own injected prompts round-tripping back
+      for (const block of content) {
+        if (block.type !== "tool_result") continue;
+        const event: Extract<SessionEvent, { type: "tool_result" }> = {
+          type: "tool_result",
+          toolName: toolNames.get(block.tool_use_id) ?? block.tool_use_id,
+          isError: block.is_error === true,
+        };
+        toolNames.delete(block.tool_use_id);
+        const output = toolResultText(block.content);
+        if (output !== undefined) event.output = output;
+        ev.onEvent(event);
       }
       return;
     }
@@ -191,3 +226,13 @@ export class ClaudeCodeExecutor implements Executor {
     }
   }
 }
+
+/** `tool_result.content` is a string or a block array; our event carries a plain string. */
+function toolResultText(content: ToolResultContent): string | undefined {
+  if (content === undefined) return undefined;
+  if (typeof content === "string") return content;
+  return content.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("\n");
+}
+
+/** Structural stand-in for `ToolResultBlockParam["content"]` (peer `@anthropic-ai/sdk`). */
+type ToolResultContent = string | { type: string; text?: string }[] | undefined;
