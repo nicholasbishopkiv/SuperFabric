@@ -1,6 +1,6 @@
-import type { SessionInfo } from "@superfabric/shared";
+import type { RoomInfo, SessionInfo } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
-import { hasMotion, initialFabricState, useFabric } from "../src/store";
+import { hasMotion, initialFabricState, liveAgentCount, useFabric } from "../src/store";
 
 const apply = (msg: Parameters<ReturnType<typeof useFabric.getState>["apply"]>[0]) =>
   useFabric.getState().apply(msg);
@@ -8,7 +8,8 @@ const apply = (msg: Parameters<ReturnType<typeof useFabric.getState>["apply"]>[0
 beforeEach(() => {
   useFabric.setState({
     ...initialFabricState,
-    events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [],
+    events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
+    selectedRoomId: null,
   });
 });
 
@@ -16,6 +17,11 @@ beforeEach(() => {
 const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
   autonomy: "auto", roomId: null, status: "idle", blocked: false, ...over,
+});
+
+const room = (over: Partial<RoomInfo> = {}): RoomInfo => ({
+  id: "r1", name: "backend", path: "/p/backend", position: { x: 8, z: 0 },
+  kind: "room", agentCount: 0, ...over,
 });
 
 describe("event store", () => {
@@ -165,7 +171,114 @@ describe("event store", () => {
   });
 });
 
-// ---- the frameloop contract: "always" only while something animates ----
+// ---- M1a: the factory floor ----
+
+describe("rooms", () => {
+  const project = room({ id: "p", name: "fabrica", path: "/p", kind: "project", position: { x: 0, z: 0 } });
+
+  it("applies a rooms message as the whole floor", () => {
+    apply({ kind: "rooms", rooms: [project, room()] });
+    expect(useFabric.getState().rooms.map((r) => r.name)).toEqual(["fabrica", "backend"]);
+    expect(useFabric.getState().roomIds).toEqual(["p", "r1"]);
+  });
+
+  it("replaces the list rather than merging into it", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "gone", name: "old" })] });
+    apply({ kind: "rooms", rooms: [project, room({ id: "r2", name: "web" })] });
+    expect(useFabric.getState().roomIds).toEqual(["p", "r2"]);
+    expect(useFabric.getState().rooms.some((r) => r.id === "gone")).toBe(false);
+  });
+
+  it("keeps roomIds referentially stable when an unrelated session event arrives", () => {
+    apply({ kind: "rooms", rooms: [project, room()] });
+    const ids = useFabric.getState().roomIds;
+
+    apply({ kind: "event", sessionId: "s", seq: 1, event: { type: "session_status", status: "working" } });
+    apply({ kind: "sessions", sessions: [session({ roomId: "r1", status: "working" })] });
+
+    // This is what stops every building re-rendering on every token: same contents, same array.
+    expect(useFabric.getState().roomIds).toBe(ids);
+  });
+
+  it("keeps roomIds stable when a rooms message repeats the same rooms", () => {
+    apply({ kind: "rooms", rooms: [project, room()] });
+    const ids = useFabric.getState().roomIds;
+    const rooms = useFabric.getState().rooms;
+
+    // a fresh broadcast of an unchanged floor (a second tab connected, say)
+    apply({ kind: "rooms", rooms: [{ ...project }, { ...room(), position: { x: 8, z: 0 } }] });
+
+    expect(useFabric.getState().roomIds).toBe(ids);
+    expect(useFabric.getState().rooms).toBe(rooms);
+  });
+
+  it("keeps the identity of rooms that did not change when one of them moves", () => {
+    apply({ kind: "rooms", rooms: [project, room(), room({ id: "r2", name: "web" })] });
+    const before = useFabric.getState().rooms;
+
+    apply({
+      kind: "rooms",
+      rooms: [project, room({ position: { x: -3, z: 4 } }), room({ id: "r2", name: "web" })],
+    });
+
+    const after = useFabric.getState().rooms;
+    expect(after[0]).toBe(before[0]);          // the project block did not move
+    expect(after[1]).not.toBe(before[1]);      // this one did
+    expect(after[1].position).toEqual({ x: -3, z: 4 });
+    expect(after[2]).toBe(before[2]);          // and its neighbour must not re-render for it
+  });
+
+  it("notices a changed agent count", () => {
+    apply({ kind: "rooms", rooms: [project, room()] });
+    const before = useFabric.getState().rooms[1];
+    apply({ kind: "rooms", rooms: [project, room({ agentCount: 2 })] });
+    expect(useFabric.getState().rooms[1]).not.toBe(before);
+    expect(useFabric.getState().rooms[1].agentCount).toBe(2);
+  });
+
+  it("selects and deselects a room", () => {
+    apply({ kind: "rooms", rooms: [project, room()] });
+    useFabric.getState().selectRoom("r1");
+    expect(useFabric.getState().selectedRoomId).toBe("r1");
+    useFabric.getState().selectRoom(null);
+    expect(useFabric.getState().selectedRoomId).toBeNull();
+  });
+
+  it("drops a selection whose room disappeared from the floor", () => {
+    apply({ kind: "rooms", rooms: [project, room()] });
+    useFabric.getState().selectRoom("r1");
+    apply({ kind: "rooms", rooms: [project] });
+    expect(useFabric.getState().selectedRoomId).toBeNull();
+  });
+
+  it("keeps a selection that survived a rebuild", () => {
+    apply({ kind: "rooms", rooms: [project, room()] });
+    useFabric.getState().selectRoom("r1");
+    apply({ kind: "rooms", rooms: [project, room({ agentCount: 1 }), room({ id: "r2", name: "web" })] });
+    expect(useFabric.getState().selectedRoomId).toBe("r1");
+  });
+});
+
+describe("liveAgentCount", () => {
+  it("counts only the sessions still standing in the room", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1", state: "active" }),
+      session({ id: "b", roomId: "r1", state: "paused" }),
+      session({ id: "c", roomId: "r1", state: "done" }),
+      session({ id: "d", roomId: "r1", state: "error" }),
+      session({ id: "e", roomId: "r2", state: "active" }),
+      session({ id: "f", roomId: null, state: "active" }),
+    ];
+    // the server's agentCount would say 4 here: it counts the finished and failed rows too
+    expect(liveAgentCount(sessions, "r1")).toBe(2);
+    expect(liveAgentCount(sessions, "r2")).toBe(1);
+    expect(liveAgentCount(sessions, "nobody")).toBe(0);
+  });
+
+  it("attributes a roomless session to no room at all", () => {
+    expect(liveAgentCount([session({ roomId: null })], "r1")).toBe(0);
+  });
+});
 
 describe("hasMotion", () => {
   it("is false for an empty factory", () => {

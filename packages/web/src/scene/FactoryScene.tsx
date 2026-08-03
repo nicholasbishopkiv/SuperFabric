@@ -2,6 +2,7 @@ import { MapControls } from "@react-three/drei";
 import { Canvas, useThree } from "@react-three/fiber";
 import { useEffect } from "react";
 import { useFabric, useHasMotion } from "../store";
+import { Buildings } from "./Buildings";
 import { Floor } from "./Floor";
 import { ISO_CAMERA_POSITION, ISO_ZOOM, ISO_ZOOM_MAX, ISO_ZOOM_MIN } from "./layout";
 
@@ -43,6 +44,7 @@ export function FactoryScene() {
         shadow-camera-far={200}
       />
       <Floor />
+      <Buildings />
       <MapControls
         makeDefault
         enableRotate={false}
@@ -62,11 +64,13 @@ export function FactoryScene() {
  */
 function RedrawOnStoreChange() {
   const invalidate = useThree((s) => s.invalidate);
+  const rooms = useFabric((s) => s.rooms);
   const sessions = useFabric((s) => s.sessions);
+  const selectedRoomId = useFabric((s) => s.selectedRoomId);
 
   useEffect(() => {
     invalidate();
-  }, [invalidate, sessions]);
+  }, [invalidate, rooms, sessions, selectedRoomId]);
 
   return null;
 }

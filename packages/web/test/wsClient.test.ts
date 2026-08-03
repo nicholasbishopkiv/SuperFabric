@@ -54,6 +54,27 @@ const subscribes = (sock: FakeWebSocket) =>
 beforeEach(() => { FakeWebSocket.instances = []; });
 afterEach(() => { delete globals.WebSocket; delete globals.location; });
 
+describe("wsClient", () => {
+  it("asks for the whole floor on open: sessions and rooms", async () => {
+    const { sock } = await freshClient();
+    expect(sock.sent.map((m) => m.kind)).toEqual(["list_sessions", "list_rooms"]);
+  });
+
+  it("re-asks for the floor after a reconnect", async () => {
+    const { client, sock } = await freshClient();
+    sock.onclose?.();
+    vi.useFakeTimers();
+    try {
+      client.connect();
+    } finally {
+      vi.useRealTimers();
+    }
+    const reconnected = FakeWebSocket.instances.at(-1)!;
+    reconnected.onopen?.();
+    expect(reconnected.sent.map((m) => m.kind)).toContain("list_rooms");
+  });
+});
+
 describe("wsClient gap handling", () => {
   it("does not resubscribe while the tail is contiguous", async () => {
     const { client, sock } = await freshClient();
