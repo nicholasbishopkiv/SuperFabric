@@ -174,6 +174,10 @@ function RoomFolder({ roomId, path: current, connected }: { roomId: string; path
   const [editing, setEditing] = useState(false);
   const [path, setPath] = useState(current);
   const clearError = useFabric((s) => s.clearError);
+  // How many agents would *not* move with the room. Said before the change rather than after: the
+  // server cannot report it as an error (the change succeeded), and an operator who learns it
+  // afterwards has already been surprised.
+  const running = useRoomAgentCount(roomId);
 
   function submit(e: React.FormEvent): void {
     e.preventDefault();
@@ -223,9 +227,16 @@ function RoomFolder({ roomId, path: current, connected }: { roomId: string; path
       </div>
       <div style={{ color: HUD.dim, fontSize: 12, marginTop: 4 }}>
         An absolute path, typed by hand — the browser cannot hand the server a real folder path, so
-        there is no picker. Nothing is moved: this re-points the room. Agents already running here keep
-        their old folder until they are restarted; new ones use the new one.
+        there is no picker. Nothing is moved: this re-points the room, and new agents start in the new
+        folder.
       </div>
+      {running > 0 && (
+        <div style={{ color: HUD.card, fontSize: 12, marginTop: 4 }}>
+          {running} agent{running === 1 ? "" : "s"} already running here will keep the folder{" "}
+          {running === 1 ? "it was" : "they were"} started in until restarted — the SDK owns a live
+          session's working directory.
+        </div>
+      )}
     </form>
   );
 }

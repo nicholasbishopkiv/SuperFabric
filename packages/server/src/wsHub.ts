@@ -204,24 +204,16 @@ export class WsHub {
           this.rooms.moveRoom(msg.roomId, msg.position);
           this.broadcastRooms();
           break;
-        case "set_room_path": {
+        // Re-point a room. Agents already running there keep the cwd their SDK session was started
+        // with, which the operator has to know — but that is a fact about the room, not a failure of
+        // this request, so it is said by the panel next to the folder rather than pushed back down
+        // the one channel this protocol has for errors. Sending it as an `error` would label a
+        // successful change as a failed one, which is worse than saying nothing.
+        case "set_room_path":
           this.requireRoomOnFloor(sock, msg.roomId);
-          const room = this.rooms.setPath(msg.roomId, msg.path);
+          this.rooms.setPath(msg.roomId, msg.path);
           this.broadcastRooms();
-          // Not an error, but not nothing either: an agent already running in that room keeps the cwd
-          // its SDK session was started with, and an operator who is not told that will think the
-          // running agent moved with the room.
-          const running = this.mgr.listSessions(this.activeProject(sock))
-            .filter((s) => s.roomId === room.id && s.state === "active").length;
-          if (running > 0) {
-            this.safeSend(sock, {
-              kind: "error",
-              message: `room "${room.name}" now points at ${room.path}; ${running} agent(s) already `
-                + "running there keep their old folder until they are restarted",
-            });
-          }
           break;
-        }
         case "list_rooms":
           this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms(this.activeProject(sock)) });
           break;

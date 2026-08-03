@@ -1112,8 +1112,8 @@ describe("WsHub", () => {
       });
     });
 
-    it("says so when agents already running keep their old folder", () => {
-      withRoot(({ hub, rooms, mgr, sock, sent }) => {
+    it("leaves a running agent's cwd alone, and does not report the change as a failure", () => {
+      withRoot(({ hub, rooms, mgr, db, sock, sent }) => {
         const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-hub-elsewhere-"));
         try {
           const room = rooms.createRoom("backend");
@@ -1121,11 +1121,12 @@ describe("WsHub", () => {
           sent.length = 0;
           hub.handleMessage(sock, JSON.stringify({ kind: "set_room_path", roomId: room.id, path: elsewhere }));
 
-          // The SDK owns a live session's cwd; a silent half-change would be the worst version of it.
-          const notice = sent.find((m) => m.kind === "error" && /keep their old folder/.test(m.message));
-          expect(notice).toBeDefined();
-          expect(notice.message).toContain(elsewhere);
-          expect(mgr.listSessions().find((s) => s.id === id)).toBeDefined();
+          // The SDK owns a live session's cwd, so the agent keeps the folder it started in — the room
+          // moved, the running agent did not. The panel says so; this is not an error and must not be
+          // reported as one, or a successful change reads as a failed one.
+          expect(sent.some((m) => m.kind === "error")).toBe(false);
+          expect(db.prepare("SELECT cwd FROM sessions WHERE id = ?").get(id)).toEqual({ cwd: room.path });
+          expect(lastRooms(sent).find((r) => r.id === room.id).path).toBe(elsewhere);
         } finally {
           rmSync(elsewhere, { recursive: true, force: true });
         }
