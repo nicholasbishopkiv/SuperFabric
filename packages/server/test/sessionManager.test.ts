@@ -3,6 +3,7 @@ import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
+import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../src/executor.js";
 
 function make(db = openDb(":memory:")) {
   const store = new EventStore(db);
@@ -63,5 +64,45 @@ describe("SessionManager", () => {
     const { mgr } = make();
     expect(() => mgr.prompt("nope", "hi")).toThrow();
     expect(() => mgr.approve("nope", "also-nope", "allow")).not.toThrow();
+  });
+
+  describe("stopAll", () => {
+    it("stops every live executor; prompt() on a stopped session then throws", async () => {
+      const { mgr } = make();
+      const id = mgr.createSession("/tmp");
+      await mgr.stopAll();
+      expect(() => mgr.prompt(id, "hi")).toThrow();
+    });
+
+    it("a hanging stop() does not prevent stopAll() from resolving", async () => {
+      class HangingExecutor implements Executor {
+        readonly name = "hanging";
+        start(_opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
+          ev.onEvent({ type: "session_status", status: "idle" });
+          return {
+            providerSessionId: Promise.resolve("hanging-session"),
+            send: () => {},
+            interrupt: async () => {},
+            stop: () => new Promise<void>(() => {}), // never settles
+          };
+        }
+      }
+      const db = openDb(":memory:");
+      const store = new EventStore(db);
+      const mgr = new SessionManager(db, store, new HangingExecutor());
+      const id = mgr.createSession("/tmp");
+
+      const start = Date.now();
+      await mgr.stopAll(50);
+      expect(Date.now() - start).toBeLessThan(2000);
+      expect(() => mgr.prompt(id, "hi")).toThrow();
+    });
+
+    it("is safe to call twice", async () => {
+      const { mgr } = make();
+      mgr.createSession("/tmp");
+      await mgr.stopAll();
+      await expect(mgr.stopAll()).resolves.toBeUndefined();
+    });
   });
 });

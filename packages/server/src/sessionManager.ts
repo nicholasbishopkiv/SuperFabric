@@ -59,6 +59,28 @@ export class SessionManager {
 
   async interrupt(id: string): Promise<void> { await this.handles.get(id)?.interrupt(); }
 
+  /**
+   * Stop every live executor. Sessions stay 'active' in the db so resumeAll() picks them up
+   * next boot. Each stop() races an unref'd timeout so a wedged CLI subprocess can never wedge
+   * shutdown; all stops settle (failures/timeouts are tolerated individually).
+   */
+  async stopAll(timeoutMs = 5000): Promise<void> {
+    const handles = [...this.handles.values()];
+    this.handles.clear();
+    await Promise.allSettled(handles.map((h) => this.stopWithTimeout(h, timeoutMs)));
+  }
+
+  private stopWithTimeout(handle: ExecutorHandle, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("stop() timed out")), timeoutMs);
+      timer.unref();
+      handle.stop().then(
+        () => { clearTimeout(timer); resolve(); },
+        (err) => { clearTimeout(timer); reject(err); },
+      );
+    });
+  }
+
   listSessions(): SessionInfo[] {
     return (this.db.prepare("SELECT id, state, claude_session_id FROM sessions ORDER BY created_at").all() as
       { id: string; state: "active" | "paused" | "done"; claude_session_id: string | null }[])
