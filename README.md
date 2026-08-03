@@ -36,9 +36,46 @@ meters, approval cards, and direct chat with any agent.
 
 ## Status
 
-🏗️ **Design phase.** The full design package is written and under review; no code yet.
-Implementation starts with milestone **M0** (core session runner). Star/watch the repo
-to follow along.
+🏗️ **Early development.** Milestone **M0 (core session runner) is complete**: a Claude Code
+session is driven from the browser over a WebSocket, every event is persisted to an
+append-only SQLite log, tool calls surface as approval cards, and a session survives a
+server restart — verified by killing the server mid-session and having the agent still
+recall the conversation afterwards.
+
+Next up is **M1**: the 3D factory floor, rooms-as-folders, and the roles library. The
+current web UI is a deliberately plain console that M1 replaces.
+
+```bash
+pnpm install
+pnpm -F @superfabric/server dev   # 127.0.0.1:4620
+pnpm -F @superfabric/web dev      # open the printed Vite URL
+```
+
+Requires Node 22+, pnpm 9+, and a working `claude` login (M0 uses your current
+`~/.claude` account; multi-account arrives in M2). See [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## Security
+
+SuperFabric drives agents that run commands on your machine with your Claude account. Treat
+the server as a local privileged tool:
+
+- **It binds to `127.0.0.1` only** — never to `0.0.0.0`. Nothing is reachable from the network.
+- **Only allow-listed browser origins may open the WebSocket.** Browsers do not apply CORS to
+  WebSockets, so without a check any website you visit could connect to the local server and
+  drive your agent. The handshake accepts the server's own origin, the Vite dev origins
+  (`localhost:5173` / `127.0.0.1:5173`) and anything in `SUPERFABRIC_ALLOWED_ORIGINS`
+  (comma-separated); every other `Origin` is rejected with 403 and logged. Requests with **no**
+  `Origin` header are allowed, because non-browser clients (CLI tools, scripts) send none while
+  browsers always do.
+- **There is no authentication.** Anyone who can run code on the machine — or on any host you
+  add to `SUPERFABRIC_ALLOWED_ORIGINS` — can drive your agents and approve their tool calls.
+  Don't run SuperFabric on a shared host, and don't expose the port through a tunnel.
+- **Agents default to `auto` autonomy**: Claude Code's own classifier decides on each gated tool
+  call, so an approval card is the exception rather than the rule. Switch an agent to `attended`
+  and every gated action asks you first. `bypass` disables gating entirely — the agent runs any
+  command without asking — and is a deliberate per-agent opt-in, appropriate only for a room you
+  are willing to treat as disposable until container sandboxing lands (M4). Autonomy is stored
+  per session and survives a server restart.
 
 ## Documentation
 
@@ -54,10 +91,16 @@ Russian originals: [VISION.ru.md](docs/VISION.ru.md) · [ROADMAP.ru.md](docs/ROA
 
 ## Planned stack
 
-TypeScript · Node 22+ · pnpm workspaces · Fastify + WebSocket · better-sqlite3 ·
+TypeScript · Node 22+ · pnpm workspaces · Fastify + WebSocket · better-sqlite3 · zod ·
 [`@anthropic-ai/claude-agent-sdk`](https://code.claude.com/docs/en/agent-sdk/overview) ·
 React 19 + Vite · react-three-fiber + drei (Three.js) · zustand · dockerode.
-Dependency license policy: MIT/Apache only.
+
+SuperFabric itself is MIT. Third-party libraries are MIT/Apache/BSD/ISC — with one
+deliberate exception: `@anthropic-ai/claude-agent-sdk` and the `claude` CLI it drives are
+Anthropic's proprietary software (© Anthropic PBC, governed by
+[Anthropic's legal agreements](https://code.claude.com/docs/en/legal-and-compliance)).
+They are the engine this tool orchestrates, so installing SuperFabric means installing
+them too.
 
 ## ⚠️ Important disclaimers
 

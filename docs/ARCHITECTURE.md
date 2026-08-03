@@ -6,9 +6,9 @@ Status: **draft for review** (2026-08-03). Canonical decisions live in the desig
 ## 1. System overview
 
 ```
-┌────────────────────────────  Browser (React + React Flow)  ───────────────────────────┐
-│  Factory canvas: project block, room nodes, agent chips, animated message edges,      │
-│  task board, per-account limit meters, approval cards, direct chat with any agent     │
+┌──────────────────  Browser (React + react-three-fiber, 3D + DOM overlay)  ────────────┐
+│  3D factory floor: project building, room workshops, conveyors carrying packages      │
+│  2D overlay: task panel, per-account limit meters, approval cards, agent chat          │
 └───────────────▲───────────────────────────────────────────────────────────────────────┘
                 │ one WebSocket, {sessionId, seq} multiplexed; replay-then-tail
 ┌───────────────┴───────────────  Fabrica Server (Node/TS)  ────────────────────────────┐
@@ -36,7 +36,9 @@ Node 22+, TypeScript, Fastify. Owns everything stateful.
 - **SessionManager** — one `query()` from `@anthropic-ai/claude-agent-sdk` per agent, in
   **streaming-input mode** (AsyncIterable prompt): the session stays alive and the server
   feeds it turns (user messages, bus messages, orchestrator directives). Exposes
-  `interrupt()`, `setPermissionMode()`. Captures `session_id` from the init message and
+  `interrupt()`. (An autonomy change restarts the query with the new mode rather than
+  calling the SDK's `setPermissionMode()`, because `bypass` needs a spawn-time flag that
+  cannot be added to a running query.) Captures `session_id` from the init message and
   persists it → restart recovery via `options.resume`. `canUseTool` callback is forwarded
   to the browser as an approval card (with per-room auto-approve policies).
 - **Event log** — append-only SQLite table `events(session_id, seq, ts, type, payload)`.
@@ -97,6 +99,13 @@ Node 22+, TypeScript, Fastify. Owns everything stateful.
   one-click attachment of the bundle; presets are plain files (`roles/*.yaml` in the
   Fabrica repo + user overrides in `.fabrica/roles/`), customizable and shareable.
   Skills/plugins install into the room's `.claude/` so the repo stays self-contained.
+- **Per-agent autonomy** — alongside the role bundle, every session carries an `autonomy` field
+  (`attended` | `auto` | `bypass`, persisted in `sessions.autonomy` and re-applied on resume) that
+  maps to the Agent SDK's `permissionMode` inside the executor. `auto` is the default: the CLI's
+  classifier decides, and only escalated calls raise an approval card. `bypass` gates nothing and
+  is a deliberate per-agent opt-in — the M4 container sandbox (below) is the precondition for using
+  it routinely, since it is exactly the `--dangerously-skip-permissions` posture that only becomes
+  safe inside a sandboxed room.
 
 ### 2.2 Web (`packages/web`)
 React 19 + Vite + **react-three-fiber (Three.js) + drei** (all MIT) + zustand.

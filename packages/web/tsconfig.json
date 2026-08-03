@@ -1,0 +1,20 @@
+{
+  // The web package is bundled by Vite, not emitted by tsc: it overrides the base config's
+  // NodeNext/emit settings with bundler resolution, DOM libs and JSX, and type-checks only.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["vite/client"],
+    "declaration": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": ["src", "test", "vite.config.ts"]
+}

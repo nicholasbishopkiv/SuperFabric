@@ -7,19 +7,23 @@ milestone is a self-contained sub-project with its own "spec → plan → implem
 cycle and a **working result at the end**. The order is chosen to burn down the biggest
 risks first.
 
-## M0 — Core: one server-managed session (first sub-project)
+## M0 — Core: one server-managed session ✅ **complete** (2026-08-03)
 
 Removes the main technical risk: a steerable long-lived session.
 
-- pnpm monorepo: `server`, `web`, `shared`.
-- SessionManager on the Agent SDK (streaming input): start, event streaming, interrupt,
-  resume after a server restart.
-- SQLite event log + WebSocket replay-then-tail.
-- Minimal web UI: a chat with one agent, approval cards (`canUseTool`).
-- Single account (the current `~/.claude`).
+- [x] pnpm monorepo: `server`, `web`, `shared`.
+- [x] SessionManager on the Agent SDK (streaming input): start, event streaming,
+      interrupt, graceful stop, resume after a server restart.
+- [x] SQLite event log + WebSocket replay-then-tail with per-session `afterSeq`.
+- [x] Minimal web UI: chat with an agent, approval cards (`canUseTool`), connection
+      state, interrupt.
+- [x] Single account (the current `~/.claude`).
 
-**Done when**: a session can be driven from the browser, the server killed, and the
-session continued from the same spot.
+**Acceptance run**: an agent was told a secret word, the server was SIGTERM'd
+mid-session, restarted (`resumed sessions: …`), the browser client replayed the
+transcript from the event log, and the agent answered the secret word correctly
+afterwards — conversation context genuinely survived the restart. Event `seq` values were
+contiguous. 44 tests green (+1 live-quota test, run manually).
 
 ## M1 — The floor: 3D factory, project block, rooms
 

@@ -16,8 +16,10 @@ before starting anything sizable, and open an issue to discuss first.
 - **Respect the invariants** listed in [CLAUDE.md](CLAUDE.md) — especially: no account
   pooling/rotation features (hard ToS line, PRs adding it will be rejected), one
   `CLAUDE_CONFIG_DIR` per account, event log as source of truth.
-- **Licenses**: dependencies must be MIT/Apache-2.0/BSD/ISC. No AGPL. Don't copy code
-  from AGPL projects (e.g. claude-squad).
+- **Licenses**: third-party libraries must be MIT/Apache-2.0/BSD/ISC — no copyleft
+  (GPL/AGPL/SSPL), and don't copy code from copyleft projects (e.g. claude-squad, AGPL).
+  The one deliberate exception is Anthropic's own `@anthropic-ai/claude-agent-sdk` and
+  the `claude` CLI, which are proprietary and intrinsic to what SuperFabric does.
 - **Language**: code, comments, commits, and docs in English. (Russian doc originals
   live as `*.ru.md`.)
 - **AI-assisted contributions welcome** — this project is literally about orchestrating
