@@ -1,4 +1,10 @@
-import type { RoomInfo, ServerMessage, SessionEvent, SessionInfo } from "@superfabric/shared";
+import type {
+  RoomInfo,
+  ScenePosition,
+  ServerMessage,
+  SessionEvent,
+  SessionInfo,
+} from "@superfabric/shared";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 
@@ -39,6 +45,19 @@ export interface PackageInFlight {
   durationMs: number;
 }
 
+/**
+ * A building being dragged across the floor right now, and where the operator's pointer has put it.
+ *
+ * This is **local and uncommitted on purpose**. Rooms are rebroadcast to every attached socket on a
+ * 250 ms debounce, so a drag that waited for the server would stutter, and a broadcast arriving
+ * mid-drag would yank the building out from under the pointer. So the drag position wins for as long
+ * as the drag lasts and exactly one `move_room` is sent when the pointer comes up.
+ */
+export interface RoomDrag {
+  roomId: string;
+  position: ScenePosition;
+}
+
 /** How long a package takes to cross a belt, unless the caller says otherwise. */
 export const DEFAULT_PACKAGE_MS = 2_400;
 
@@ -59,8 +78,10 @@ export interface FabricState {
    * mechanism.
    */
   roomIds: string[];
-  /** The building the operator clicked, shared by the scene and (from Task 9) the room panel. */
+  /** The building the operator clicked, shared by the scene and the room panel. */
   selectedRoomId: string | null;
+  /** The building under the pointer right now, or null. See `RoomDrag`. */
+  drag: RoomDrag | null;
   /**
    * roomId -> what that room's beacon shows. Derived from `sessions` (which already carry the
    * server-derived `status` and `blocked`), never from replayed events: the log is the source of
@@ -104,6 +125,15 @@ export interface FabricState {
    */
   clearError(): void;
   /**
+   * Start dragging a building. `position` is where it stands right now, so the first frame of the
+   * drag is identical to the last frame before it and the building never jumps on pointer-down.
+   */
+  beginRoomDrag(roomId: string, position: ScenePosition): void;
+  /** Move the dragged building. Ignored when no drag is in progress — a stray pointer event. */
+  dragRoomTo(position: ScenePosition): void;
+  /** Let go. The caller sends the one `move_room`; the store only forgets the local position. */
+  endRoomDrag(): void;
+  /**
    * Put a package on the belt between two rooms. **This is the seam the M3 factory bus plugs into**:
    * when a real inter-room message exists, the bus calls this and nothing else on the client changes.
    * Until then the console drawer's manual control is the only caller.
@@ -119,6 +149,7 @@ export const initialFabricState = {
   rooms: [] as RoomInfo[],
   roomIds: [] as string[],
   selectedRoomId: null as string | null,
+  drag: null as RoomDrag | null,
   roomStatus: {} as Record<string, FactoryStatus>,
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
@@ -265,6 +296,11 @@ function applyRooms(s: FabricState, incoming: RoomInfo[]): Partial<FabricState> 
     roomIds: idsUnchanged ? s.roomIds : ids,
     // A room that is gone cannot stay selected, or the panel would describe nothing.
     selectedRoomId: s.selectedRoomId !== null && !ids.includes(s.selectedRoomId) ? null : s.selectedRoomId,
+    // An in-progress drag deliberately survives this: the server rebroadcasts the whole floor on a
+    // 250 ms debounce, and the position it is broadcasting is the one the operator is in the middle
+    // of changing. The local position wins until the pointer comes up. The one exception is a
+    // building that is no longer on the floor — there is nothing left to drag.
+    drag: s.drag !== null && !ids.includes(s.drag.roomId) ? null : s.drag,
     roomStatus: nextRoomStatus(s.roomStatus, rooms, s.sessions),
     conveyors: nextConveyors(s.conveyors, rooms, s.packagedPairs),
   };
@@ -327,6 +363,20 @@ export const useFabric = create<FabricState>((set, get) => ({
 
   clearError: () => set((s) => (s.lastError === null ? s : { lastError: null })),
 
+  beginRoomDrag: (roomId, position) => set({ drag: { roomId, position } }),
+
+  dragRoomTo: (position) =>
+    set((s) => {
+      if (s.drag === null) return s;
+      const { x, z } = s.drag.position;
+      // The pointer produces far more events than distinct floor cells; an unchanged position must
+      // not re-render the building or rebuild the belts hanging off it.
+      if (position.x === x && position.z === z) return s;
+      return { drag: { roomId: s.drag.roomId, position } };
+    }),
+
+  endRoomDrag: () => set((s) => (s.drag === null ? s : { drag: null })),
+
   sendPackage: (from, to, durationMs = DEFAULT_PACKAGE_MS) => {
     if (from === to) return;
     set((s) => {
@@ -367,7 +417,27 @@ export const useRoomIds = (): string[] => useFabric((s) => s.roomIds);
 export const useRoom = (roomId: string): RoomInfo | undefined =>
   useFabric((s) => s.rooms.find((r) => r.id === roomId));
 
+/**
+ * Where a building should be drawn: the position the operator's pointer is holding it at while they
+ * drag it, and the server's committed position at every other moment. **This is the single place the
+ * "local position wins during a drag" rule is expressed** — the building and the belts hanging off it
+ * both read it, so they can never disagree about where the building is.
+ */
+export function roomPosition(
+  state: Pick<FabricState, "rooms" | "drag">,
+  roomId: string,
+): ScenePosition | undefined {
+  if (state.drag !== null && state.drag.roomId === roomId) return state.drag.position;
+  return state.rooms.find((r) => r.id === roomId)?.position;
+}
+
+export const useRoomPosition = (roomId: string): ScenePosition | undefined =>
+  useFabric(useShallow((s) => roomPosition(s, roomId)));
+
 export const useSelectedRoomId = (): string | null => useFabric((s) => s.selectedRoomId);
+
+/** Whether *any* building is being dragged. Subscribing to the boolean, not to the moving position. */
+export const useIsDragging = (): boolean => useFabric((s) => s.drag !== null);
 
 export const useIsSelected = (roomId: string): boolean =>
   useFabric((s) => s.selectedRoomId === roomId);
@@ -436,9 +506,14 @@ export const useRoomlessSessions = (): SessionInfo[] =>
  * A Claude Code session reports `starting` when its executor spawns and only leaves that status when
  * its first turn completes — so a freshly created agent nobody has prompted yet stays `starting`
  * indefinitely, and counting it would pin the frameloop to `"always"` for the rest of the session.
+ *
+ * A drag counts because a drag *is* motion: without it the demand loop renders the frame the pointer
+ * went down and then nothing, and the building sits frozen while the operator hauls on it.
  */
-export function hasMotion(state: Pick<FabricState, "sessions" | "packages">): boolean {
-  return state.packages.length > 0 || state.sessions.some((s) => s.status === "working");
+export function hasMotion(state: Pick<FabricState, "sessions" | "packages" | "drag">): boolean {
+  return state.drag !== null
+    || state.packages.length > 0
+    || state.sessions.some((s) => s.status === "working");
 }
 
 export const useHasMotion = (): boolean => useFabric(hasMotion);

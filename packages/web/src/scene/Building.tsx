@@ -1,7 +1,14 @@
 import { Html } from "@react-three/drei";
 import type { ThreeEvent } from "@react-three/fiber";
-import { memo, useCallback } from "react";
-import { useFabric, useIsSelected, useRoom, useRoomAgentCount, useRoomStatus } from "../store";
+import { memo } from "react";
+import {
+  useFabric,
+  useIsSelected,
+  useRoom,
+  useRoomAgentCount,
+  useRoomPosition,
+  useRoomStatus,
+} from "../store";
 import { Agents } from "./Agents";
 import {
   beaconHeight,
@@ -31,22 +38,29 @@ const SELECTED_EMISSIVE = 0.55;
  */
 export const Building = memo(function Building({ roomId }: { roomId: string }) {
   const room = useRoom(roomId);
+  // Not `room.position`: while this building is being dragged, the operator's pointer owns where it
+  // stands and the server's last broadcast does not. `RoomDrag` explains why.
+  const position = useRoomPosition(roomId);
   const agents = useRoomAgentCount(roomId);
   const status = useRoomStatus(roomId);
   const selected = useIsSelected(roomId);
   const selectRoom = useFabric((s) => s.selectRoom);
-
-  const onClick = useCallback(
-    (e: ThreeEvent<MouseEvent>) => {
-      // Only the building actually under the pointer, not everything the ray passed through.
-      e.stopPropagation();
-      selectRoom(selected ? null : roomId);
-    },
-    [roomId, selected, selectRoom],
-  );
+  const beginRoomDrag = useFabric((s) => s.beginRoomDrag);
 
   // The room list can drop a row (a rebuild from the server) while this component is still mounted.
-  if (room === undefined) return null;
+  if (room === undefined || position === undefined) return null;
+
+  /**
+   * Pointer-down does two things and starts a third: it selects the building (which the room panel
+   * reads too), and it opens a drag that `RoomDrag` finishes. `stopPropagation` keeps the press off
+   * every other building the ray passed through — and off the canvas's `onPointerMissed`, which
+   * would otherwise deselect the room the press just selected.
+   */
+  const onPointerDown = (e: ThreeEvent<PointerEvent>): void => {
+    e.stopPropagation();
+    selectRoom(roomId);
+    beginRoomDrag(roomId, position);
+  };
 
   const isProject = room.kind === "project";
   const { width, height } = buildingSize(room.kind);
@@ -56,7 +70,7 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
   const roofRadius = (width * Math.SQRT2) / 2 + 0.1;
 
   return (
-    <group position={[room.position.x, 0, room.position.z]} onClick={onClick}>
+    <group position={[position.x, 0, position.z]} onPointerDown={onPointerDown}>
       <mesh castShadow receiveShadow position-y={height / 2}>
         <boxGeometry args={[width, height, width]} />
         <meshStandardMaterial

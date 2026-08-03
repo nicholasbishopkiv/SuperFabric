@@ -4,6 +4,8 @@ import {
   agentSlots,
   beaconHeight,
   buildingSize,
+  draggedPosition,
+  grabOffset,
   ISO_CAMERA_POSITION,
   ISO_ZOOM,
   ISO_ZOOM_MAX,
@@ -32,6 +34,38 @@ describe("ringPosition", () => {
     expect(ringPosition(1)).toEqual({ x: 5.657, z: 5.657 });
     expect(ringPosition(2)).toEqual({ x: 0, z: 8 });
     expect(ringPosition(8)).toEqual({ x: 13, z: 0 });
+  });
+});
+
+describe("dragging a building onto a floor point", () => {
+  it("holds the building where it was grabbed instead of snapping its centre to the pointer", () => {
+    const roomAt = { x: 14, z: 0 };
+    // the operator grabbed the roof's near corner, a metre off the building's centre
+    const grabbed = { x: 15, z: 1.5 };
+    const offset = grabOffset(roomAt, grabbed);
+
+    // the first move of the drag has not moved the pointer yet, so the building must not have moved
+    expect(draggedPosition(grabbed, offset)).toEqual(roomAt);
+    // and a pointer that moved by (-4, +2) moves the building by exactly that
+    expect(draggedPosition({ x: 11, z: 3.5 }, offset)).toEqual({ x: 10, z: 2 });
+  });
+
+  it("is the identity when the building is grabbed dead centre", () => {
+    const offset = grabOffset({ x: 3, z: -7 }, { x: 3, z: -7 });
+    expect(offset).toEqual({ x: 0, z: 0 });
+    expect(draggedPosition({ x: -2, z: 9 }, offset)).toEqual({ x: -2, z: 9 });
+  });
+
+  it("rounds to three decimals, so a raycast hit is not stored to fifteen", () => {
+    const offset = grabOffset({ x: 0, z: 0 }, { x: 0, z: 0 });
+    expect(draggedPosition({ x: 1.23456789, z: -4.987654321 }, offset)).toEqual({ x: 1.235, z: -4.988 });
+  });
+
+  it("ignores the height of the point it was handed — the floor plane is y = 0", () => {
+    // the raycaster reports a Vector3; only x and z are ever read, and a drag can never lift a
+    // building off the floor
+    const offset = grabOffset({ x: 2, z: 2 }, { x: 1, z: 1 });
+    expect(Object.keys(draggedPosition({ x: 5, z: 5 }, offset)).sort()).toEqual(["x", "z"]);
   });
 });
 

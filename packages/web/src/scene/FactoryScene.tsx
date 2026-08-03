@@ -6,6 +6,7 @@ import { Buildings } from "./Buildings";
 import { Conveyors } from "./Conveyor";
 import { Floor } from "./Floor";
 import { Packages } from "./Packages";
+import { RoomDrag } from "./RoomDrag";
 import { ISO_CAMERA_POSITION, ISO_ZOOM, ISO_ZOOM_MAX, ISO_ZOOM_MIN } from "./layout";
 
 /**
@@ -18,11 +19,15 @@ import { ISO_CAMERA_POSITION, ISO_ZOOM, ISO_ZOOM_MAX, ISO_ZOOM_MIN } from "./lay
  */
 export function FactoryScene() {
   const hasMotion = useHasMotion();
+  const selectRoom = useFabric((s) => s.selectRoom);
 
   return (
     <Canvas
       shadows
       frameloop={hasMotion ? "always" : "demand"}
+      // A press that hit no building is a press on the floor, and that deselects. Buildings
+      // `stopPropagation` on pointer-down, so this never fires for one of them.
+      onPointerMissed={() => selectRoom(null)}
       orthographic
       // near is negative on purpose: an orthographic camera looking down a diagonal would otherwise
       // clip the geometry standing between it and the origin.
@@ -55,6 +60,8 @@ export function FactoryScene() {
         minZoom={ISO_ZOOM_MIN}
         maxZoom={ISO_ZOOM_MAX}
       />
+      {/* After MapControls, so `makeDefault` has already registered the controls it has to silence. */}
+      <RoomDrag />
       <RedrawOnStoreChange />
     </Canvas>
   );

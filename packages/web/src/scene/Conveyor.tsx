@@ -1,6 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { BoxGeometry, InstancedMesh, Matrix4, Quaternion, TubeGeometry, Vector3 } from "three";
-import { useFabric, useRoom } from "../store";
+import { useFabric, useRoomPosition } from "../store";
 import { BELT_HEIGHT, conveyorCurve } from "./conveyorPath";
 import { BELT_COLOR, SLAT_COLOR } from "./palette";
 
@@ -91,12 +91,16 @@ const Belt = memo(function Belt({
   );
 });
 
-/** A belt between two rooms, looked up by id so it follows either building when it moves. */
+/**
+ * A belt between two rooms, looked up by id so it follows either building when it moves — including
+ * while one of them is being dragged, which is what `useRoomPosition` adds over the room's own row.
+ * A belt left hanging in the air where a building used to be would make a drag look like a bug.
+ */
 export const Conveyor = memo(function Conveyor({ from, to }: { from: string; to: string }) {
-  const a = useRoom(from);
-  const b = useRoom(to);
+  const a = useRoomPosition(from);
+  const b = useRoomPosition(to);
   if (a === undefined || b === undefined) return null;
-  return <Belt ax={a.position.x} az={a.position.z} bx={b.position.x} bz={b.position.z} />;
+  return <Belt ax={a.x} az={a.z} bx={b.x} bz={b.z} />;
 });
 
 /**

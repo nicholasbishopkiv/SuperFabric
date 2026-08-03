@@ -1,4 +1,4 @@
-import { ringPosition, type RoomInfo } from "@superfabric/shared";
+import { ringPosition, type RoomInfo, type ScenePosition } from "@superfabric/shared";
 
 /**
  * Pure scene geometry. Nothing here imports three or React, so it is unit-testable in jsdom — which
@@ -36,6 +36,28 @@ export function isoCameraTarget(rooms: readonly Pick<RoomInfo, "position">[]): [
   }
   const round = (v: number) => Math.round((v / rooms.length) * 1000) / 1000;
   return [round(x), 0, round(z)];
+}
+
+/** Positions on the floor are kept to this many decimals, in the store and on the wire alike. */
+const round3 = (v: number) => Math.round(v * 1000) / 1000;
+
+/**
+ * Dragging a building, in the only two lines of arithmetic it actually needs. The screen-to-world
+ * part is not here on purpose: the `<Canvas>`'s own raycaster already reports the point where the
+ * pointer's ray meets the floor plane, and hand-rolling that projection would be a second,
+ * disagreeing camera model.
+ *
+ * What is left is the grab offset. Without it a building's centre snaps to the pointer the instant
+ * the drag starts, so grabbing a roof corner teleports the building by half its width before it has
+ * moved at all.
+ */
+export function grabOffset(roomPosition: ScenePosition, floorPoint: ScenePosition): ScenePosition {
+  return { x: roomPosition.x - floorPoint.x, z: roomPosition.z - floorPoint.z };
+}
+
+/** Where a dragged building stands when the pointer's ray meets the floor at `floorPoint`. */
+export function draggedPosition(floorPoint: ScenePosition, offset: ScenePosition): ScenePosition {
+  return { x: round3(floorPoint.x + offset.x), z: round3(floorPoint.z + offset.z) };
 }
 
 /** Footprint and height of a building, by room kind. The project block is the bigger one. */

@@ -7,6 +7,7 @@ import {
   liveAgentCount,
   roomAgents,
   roomlessSessions,
+  roomPosition,
   useFabric,
 } from "../src/store";
 
@@ -17,7 +18,7 @@ beforeEach(() => {
   useFabric.setState({
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
-    selectedRoomId: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
+    selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
   });
 });
 
@@ -438,6 +439,89 @@ describe("roomAgents", () => {
   });
 });
 
+describe("dragging a building", () => {
+  const project = room({ id: "p", name: "fabrica", path: "/p", kind: "project", position: { x: 0, z: 0 } });
+  const floor = () => apply({ kind: "rooms", rooms: [project, room({ position: { x: 14, z: 0 } })] });
+  const drag = () => useFabric.getState().drag;
+
+  it("starts where the building already stands, so it never jumps on pointer-down", () => {
+    floor();
+    useFabric.getState().beginRoomDrag("r1", { x: 14, z: 0 });
+    expect(drag()).toEqual({ roomId: "r1", position: { x: 14, z: 0 } });
+    expect(roomPosition(useFabric.getState(), "r1")).toEqual({ x: 14, z: 0 });
+  });
+
+  it("moves the building locally, without touching the server's row", () => {
+    floor();
+    useFabric.getState().beginRoomDrag("r1", { x: 14, z: 0 });
+    useFabric.getState().dragRoomTo({ x: 9, z: -3 });
+
+    expect(roomPosition(useFabric.getState(), "r1")).toEqual({ x: 9, z: -3 });
+    // the committed row is still exactly what the server last said
+    expect(useFabric.getState().rooms[1].position).toEqual({ x: 14, z: 0 });
+  });
+
+  it("only overrides the building being dragged", () => {
+    floor();
+    useFabric.getState().beginRoomDrag("r1", { x: 14, z: 0 });
+    useFabric.getState().dragRoomTo({ x: 9, z: -3 });
+    expect(roomPosition(useFabric.getState(), "p")).toEqual({ x: 0, z: 0 });
+  });
+
+  it("clears on pointer-up, and the server's position takes over again", () => {
+    floor();
+    useFabric.getState().beginRoomDrag("r1", { x: 14, z: 0 });
+    useFabric.getState().dragRoomTo({ x: 9, z: -3 });
+    useFabric.getState().endRoomDrag();
+
+    expect(drag()).toBeNull();
+    expect(roomPosition(useFabric.getState(), "r1")).toEqual({ x: 14, z: 0 });
+  });
+
+  it("ignores a move with no drag in progress", () => {
+    floor();
+    const before = useFabric.getState();
+    useFabric.getState().dragRoomTo({ x: 1, z: 1 });
+    expect(useFabric.getState()).toBe(before);
+    expect(drag()).toBeNull();
+  });
+
+  it("is a no-op when the pointer reports the same position twice", () => {
+    floor();
+    useFabric.getState().beginRoomDrag("r1", { x: 14, z: 0 });
+    const held = drag();
+    useFabric.getState().dragRoomTo({ x: 14, z: 0 });
+    // a pointer sends far more events than distinct floor cells; an unchanged position must not
+    // re-render the building or rebuild the belts hanging off it
+    expect(drag()).toBe(held);
+  });
+
+  it("lets the local position win over a rooms broadcast that arrives mid-drag", () => {
+    floor();
+    useFabric.getState().beginRoomDrag("r1", { x: 14, z: 0 });
+    useFabric.getState().dragRoomTo({ x: 9, z: -3 });
+
+    // the server rebroadcasts the whole floor every 250 ms; this one still carries the old position
+    // (and would carry a stale *new* one for as long as the debounce lasts)
+    apply({ kind: "rooms", rooms: [project, room({ position: { x: 14, z: 0 }, agentCount: 1 })] });
+
+    expect(drag()).toEqual({ roomId: "r1", position: { x: 9, z: -3 } });
+    expect(roomPosition(useFabric.getState(), "r1")).toEqual({ x: 9, z: -3 });
+  });
+
+  it("drops the drag when the dragged building leaves the floor", () => {
+    floor();
+    useFabric.getState().beginRoomDrag("r1", { x: 14, z: 0 });
+    apply({ kind: "rooms", rooms: [project] });
+    expect(drag()).toBeNull();
+  });
+
+  it("reports no position at all for a room this client does not have", () => {
+    floor();
+    expect(roomPosition(useFabric.getState(), "nobody")).toBeUndefined();
+  });
+});
+
 describe("roomlessSessions", () => {
   it("is exactly what the floor cannot draw", () => {
     const sessions = [
@@ -591,7 +675,7 @@ describe("packages", () => {
 });
 
 describe("hasMotion", () => {
-  const still = { sessions: [], packages: [] };
+  const still = { sessions: [], packages: [], drag: null };
 
   it("is false for an empty factory", () => {
     expect(hasMotion(still)).toBe(false);
@@ -614,6 +698,17 @@ describe("hasMotion", () => {
     // A Claude Code session that has been spawned but never prompted reports `starting` forever;
     // counting it would leave the canvas on frameloop="always" for the rest of the session.
     expect(hasMotion({ ...still, sessions: [session({ status: "starting" })] })).toBe(false);
+  });
+
+  it("is true while a building is being dragged, and false again when it is let go", () => {
+    // Without this the demand frameloop renders the frame the pointer went down and then nothing:
+    // the building freezes mid-drag while the operator hauls on it.
+    apply({ kind: "rooms", rooms: [room({ id: "r1" })] });
+    useFabric.getState().beginRoomDrag("r1", { x: 14, z: 0 });
+    expect(hasMotion(useFabric.getState())).toBe(true);
+
+    useFabric.getState().endRoomDrag();
+    expect(hasMotion(useFabric.getState())).toBe(false);
   });
 
   it("is true while a package is in flight, and false again once it is reaped", () => {
