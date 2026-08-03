@@ -45,8 +45,13 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   console.log(`received ${signal}, shutting down`);
 
+  // wss.close()'s callback only fires once every tracked client has disconnected, so a client
+  // that never closes on its own would hang shutdown forever. Force them closed up front.
   console.log("shutdown: closing ws server (no new connections)");
-  await new Promise<void>((resolve) => wss.close(() => resolve()));
+  await new Promise<void>((resolve) => {
+    wss.close(() => resolve());
+    for (const client of wss.clients) client.terminate();
+  });
 
   console.log("shutdown: stopping executors");
   await mgr.stopAll();
