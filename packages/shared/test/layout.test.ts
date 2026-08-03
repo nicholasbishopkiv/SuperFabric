@@ -48,10 +48,12 @@ describe("ringPosition", () => {
   });
 
   it("leaves a run of open floor between the project block and every workshop", () => {
-    // The belt lives in this gap. A 6-wide project block and a 4-wide workshop consume 5 units of
+    // The belt lives in this gap. A 7-wide project block and a 4-wide workshop consume 5.5 units of
     // the distance between their centres before any belt is drawn, so the radius has to be
     // comfortably more than that or the conveyor is a detail inside two buildings.
-    const projectHalf = 3;
+    // (The footprints themselves live in the web package's `buildingSize`; these are the numbers
+    // this radius was chosen against.)
+    const projectHalf = 3.5;
     const workshopHalf = 2;
     expect(RING_RADIUS - projectHalf - workshopHalf).toBeGreaterThan(6);
   });

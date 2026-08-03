@@ -15,6 +15,8 @@ import {
   isoFraming,
   isoProject,
   labelHeight,
+  loadingBays,
+  PROJECT_ROOF_HEIGHT,
   ringPosition,
   roofTop,
 } from "../src/scene/layout";
@@ -31,6 +33,7 @@ import {
   STATUS_EMISSIVE,
   STATUS_HUE_BANDS,
 } from "../src/scene/palette";
+import { wallDistance } from "../src/scene/conveyorPath";
 
 /**
  * jsdom has no WebGL, so a `<Canvas>` can never be mounted here. What is testable is every piece of
@@ -254,10 +257,15 @@ describe("camera contract", () => {
 });
 
 describe("buildingSize", () => {
-  it("gives the project block a bigger footprint than a workshop", () => {
-    expect(buildingSize("project")).toEqual({ width: 6, height: 5 });
+  it("makes the project block read as headquarters, not as one more shed", () => {
+    expect(buildingSize("project")).toEqual({ width: 7, height: 6.5 });
     expect(buildingSize("room")).toEqual({ width: 4, height: 3 });
-    expect(buildingSize("project").width).toBeGreaterThan(buildingSize("room").width);
+    const project = buildingSize("project");
+    const workshop = buildingSize("room");
+    expect(project.width).toBeGreaterThan(workshop.width);
+    // over twice a workshop's volume: "bigger" was not enough to read as a different kind of thing
+    const volume = (s: { width: number; height: number }) => s.width * s.width * s.height;
+    expect(volume(project) / volume(workshop)).toBeGreaterThan(2);
   });
 
   it("keeps a workshop small enough that two adjacent ring slots cannot overlap", () => {
@@ -269,6 +277,13 @@ describe("buildingSize", () => {
 });
 
 describe("what stacks above a building", () => {
+  it("keeps the project block's pitch steep enough to read from a fixed isometric camera", () => {
+    // rise over the horizontal run from eaves to apex; a shallow cone reads as a flat dark cap.
+    // The old 2-on-a-6-wide-block was 34 degrees; this must be a proper pitch.
+    const pitch = Math.atan2(PROJECT_ROOF_HEIGHT, buildingSize("project").width / 2);
+    expect(pitch * (180 / Math.PI)).toBeGreaterThan(42);
+  });
+
   it("puts the beacon clear of the roof and the label clear of the beacon", () => {
     for (const kind of ["project", "room"] as const) {
       expect(roofTop(kind)).toBeGreaterThan(buildingSize(kind).height);
@@ -280,6 +295,61 @@ describe("what stacks above a building", () => {
   it("stacks the project block's furniture higher than a workshop's", () => {
     expect(beaconHeight("project")).toBeGreaterThan(beaconHeight("room"));
     expect(labelHeight("project")).toBeGreaterThan(labelHeight("room"));
+  });
+});
+
+describe("loadingBays", () => {
+  const half = buildingSize("room").width / 2;
+
+  it("gives a wall-less building no doors", () => {
+    expect(loadingBays("room", [])).toEqual([]);
+  });
+
+  it("puts the bay on the wall the belt actually crosses, at the point it crosses it", () => {
+    // straight out along +x
+    expect(loadingBays("room", [10, 0])).toEqual([{ x: half, z: 0, yaw: Math.PI / 2 }]);
+    // straight out along -z
+    expect(loadingBays("room", [0, -10])).toEqual([{ x: 0, z: -half, yaw: Math.PI }]);
+    // off-axis: the +x wall, but not in the middle of it
+    const [bay] = loadingBays("room", [10, 4]);
+    expect(bay.x).toBe(half);
+    expect(bay.z).toBeCloseTo((half * 4) / 10, 3);
+    expect(bay.yaw).toBeCloseTo(Math.PI / 2, 6);
+  });
+
+  it("faces the bay out of the wall, never into the building", () => {
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [3, 1], [-2, 5]] as const) {
+      const [bay] = loadingBays("room", [dx, dz]);
+      // the bay's outward normal is local +z rotated by yaw
+      const nx = Math.sin(bay.yaw);
+      const nz = Math.cos(bay.yaw);
+      expect(nx * dx + nz * dz).toBeGreaterThan(0);
+    }
+  });
+
+  it("is where the belt is: a bay and its belt's end agree on which wall they are on", () => {
+    // beltEnds anchors the belt at `wallDistance` along the same direction, which is the same
+    // point this picks — a bay somewhere else would be a door with no conveyor at it.
+    for (const [dx, dz] of [[14, 5.4], [5.4, 14], [-14, -5.4]] as const) {
+      const [bay] = loadingBays("room", [dx, dz]);
+      const d = wallDistance("room", dx, dz);
+      const span = Math.hypot(dx, dz);
+      expect(bay.x).toBeCloseTo((dx / span) * d, 2);
+      expect(bay.z).toBeCloseTo((dz / span) * d, 2);
+    }
+  });
+
+  it("collapses doors that would overlap, so the project block is not a wall of doors", () => {
+    // Eight belts all leaving the +x wall within one bay width of each other.
+    const dirs: number[] = [];
+    for (let i = 0; i < 8; i++) dirs.push(20, i * 0.2);
+    expect(loadingBays("project", dirs)).toHaveLength(1);
+  });
+
+  it("still gives one bay per wall when the belts genuinely go different ways", () => {
+    const bays = loadingBays("project", [20, 0, 0, 20, -20, 0, 0, -20]);
+    expect(bays).toHaveLength(4);
+    expect(new Set(bays.map((b) => b.yaw)).size).toBe(4);
   });
 });
 

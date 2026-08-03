@@ -223,13 +223,23 @@ export function paintedZones(rooms: readonly Pick<RoomInfo, "position" | "kind">
   return [...radii].sort((a, b) => a - b);
 }
 
-/** Footprint and height of a building, by room kind. The project block is the bigger one. */
+/**
+ * Footprint and height of a building, by room kind.
+ *
+ * The project block is not merely "bigger": it has to read as **headquarters** next to a row of
+ * workshops, and at the previous 6x5 against 4x3 it read as one more shed that happened to be in the
+ * middle. 7 wide and 6.5 tall is a bit over twice a workshop's volume, which is the point.
+ */
 export function buildingSize(kind: RoomInfo["kind"]): { width: number; height: number } {
-  return kind === "project" ? { width: 6, height: 5 } : { width: 4, height: 3 };
+  return kind === "project" ? { width: 7, height: 6.5 } : { width: 4, height: 3 };
 }
 
-/** The project block's pitched roof: a 4-sided cone this tall, sitting on top of the box. */
-export const PROJECT_ROOF_HEIGHT = 2;
+/**
+ * The project block's pitched roof: a 4-sided cone this tall, sitting on top of the box. Steep on
+ * purpose — at the old height of 2 on a 6-wide block the pitch was about 33°, which from a fixed
+ * isometric camera is nearly flat, so the roof read as a dark cap rather than as a roof.
+ */
+export const PROJECT_ROOF_HEIGHT = 3.4;
 /** A workshop's flat roof: a thin slab with a slight overhang. */
 export const ROOM_ROOF_THICKNESS = 0.3;
 
@@ -247,6 +257,53 @@ export function beaconHeight(kind: RoomInfo["kind"]): number {
 /** Where a building's name label sits: above the beacon, so the two never overlap. */
 export function labelHeight(kind: RoomInfo["kind"]): number {
   return beaconHeight(kind) + 1.4;
+}
+
+/** One recessed opening in a wall: where it is in the building's local frame, and which way it faces. */
+export interface LoadingBay {
+  x: number;
+  z: number;
+  /** Rotation about y that points the bay's outward face along the wall's normal. */
+  yaw: number;
+}
+
+/** How wide a bay is, and how far apart two bays on the same wall have to be to both be drawn. */
+export const BAY_WIDTH = 1.5;
+
+/**
+ * Where this building needs a loading bay: **the wall each belt actually arrives at**, and not one
+ * anywhere else. Without this a package slides along a conveyor and into a blank slab.
+ *
+ * `directions` is a flat `[dx0, dz0, dx1, dz1, …]` of vectors towards the buildings this one is
+ * joined to (flat because it comes through a zustand selector, and a shallow comparison over numbers
+ * is what keeps this from re-rendering every frame). For each one, the wall is whichever of the four
+ * the vector leaves through — the footprint is a square, so that is just the dominant axis — and the
+ * bay sits at the point where the vector crosses it, which is exactly where `beltEnds` anchors the
+ * belt.
+ *
+ * Bays closer together than one bay width collapse into the first of them: the project block is
+ * joined to every workshop on the floor and would otherwise grow a wall of overlapping doors.
+ */
+export function loadingBays(kind: RoomInfo["kind"], directions: readonly number[]): LoadingBay[] {
+  const half = buildingSize(kind).width / 2;
+  const bays: LoadingBay[] = [];
+  for (let i = 0; i + 1 < directions.length; i += 2) {
+    const dx = directions[i];
+    const dz = directions[i + 1];
+    const longest = Math.max(Math.abs(dx), Math.abs(dz));
+    if (longest === 0) continue;
+    // Scale the direction until it reaches the wall, which puts the bay where the belt does.
+    const t = half / longest;
+    const x = round3(dx * t);
+    const z = round3(dz * t);
+    // The outward normal is the axis the vector left through, so the bay faces along the belt.
+    const yaw = Math.abs(dx) >= Math.abs(dz)
+      ? (dx > 0 ? Math.PI / 2 : -Math.PI / 2)
+      : (dz > 0 ? 0 : Math.PI);
+    if (bays.some((b) => Math.hypot(b.x - x, b.z - z) < BAY_WIDTH)) continue;
+    bays.push({ x, z, yaw });
+  }
+  return bays;
 }
 
 /**

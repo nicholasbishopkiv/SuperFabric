@@ -105,9 +105,9 @@ export const PROJECT = {
   wall: "#39424e",
   /** A darker band at the base, so the mass sits on the ground instead of floating on it. */
   plinth: "#2b323b",
-  roof: "#6c7784",
-  /** The ridge along the top of the pitch, one step lighter again, to catch the key light. */
-  ridge: "#8a95a1",
+  roof: "#4b5563",
+  /** The eaves band and the finial, lighter again, to catch the key light. */
+  ridge: "#78838f",
 } as const;
 
 /** A workshop's shared shell. Its *accent* is what tells one workshop from another. */
@@ -126,9 +126,14 @@ export const DETAIL = {
   /** The frame around that opening. */
   bayFrame: "#9aa2ab",
   /** Glazing. Dark, because a window is a hole with glass in it. */
-  window: "#2f3945",
-  /** The lights are on inside. Faint and constant — decoration must never imply a status. */
+  window: "#27303a",
+  /**
+   * The lights are on inside. Kept *very* faint on purpose: warm glass is the scene's only warm
+   * accent on a building, and any brighter it starts reading as the amber that means `blocked`.
+   */
   windowGlow: "#ffd7a0",
+  /** How hard that glow burns. Tuned down from 0.28, where the strips read as amber bars. */
+  windowGlowIntensity: 0.09,
   vent: "#8d949c",
   /** Roof glazing, pale so it reads as sky rather than as a panel. */
   skylight: "#cfe0ea",

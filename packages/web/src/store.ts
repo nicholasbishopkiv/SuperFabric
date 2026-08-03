@@ -473,6 +473,37 @@ export const useRoomPosition = (roomId: string): ScenePosition | undefined =>
 export const useRoomKind = (roomId: string): RoomInfo["kind"] | undefined =>
   useFabric((s) => s.rooms.find((r) => r.id === roomId)?.kind);
 
+/**
+ * Which way the belts leave this room, as a flat `[dx0, dz0, dx1, dz1, …]` — one pair per belt this
+ * room is an end of. The building draws a loading bay on the wall each of them crosses, so a package
+ * arrives at a door instead of at a blank slab.
+ *
+ * Flat numbers rather than objects on purpose: this goes through `useShallow`, which compares
+ * element by element with `Object.is`. An array of freshly built `{x, z}` objects would never compare
+ * equal, and the building would re-render on every store notification for ever.
+ *
+ * Positions come from `roomPosition`, so a bay follows the belt while either building is dragged.
+ */
+export function beltDirections(
+  state: Pick<FabricState, "rooms" | "drag" | "conveyors">,
+  roomId: string,
+): number[] {
+  const self = roomPosition(state, roomId);
+  if (self === undefined) return [];
+  const out: number[] = [];
+  for (const belt of state.conveyors) {
+    const otherId = belt.from === roomId ? belt.to : belt.to === roomId ? belt.from : null;
+    if (otherId === null) continue;
+    const other = roomPosition(state, otherId);
+    if (other === undefined) continue;
+    out.push(other.x - self.x, other.z - self.z);
+  }
+  return out;
+}
+
+export const useBeltDirections = (roomId: string): number[] =>
+  useFabric(useShallow((s) => beltDirections(s, roomId)));
+
 export const useSelectedRoomId = (): string | null => useFabric((s) => s.selectedRoomId);
 
 export const useHudInsets = (): { left: number; right: number } =>

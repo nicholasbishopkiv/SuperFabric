@@ -27,13 +27,13 @@ describe("wallDistance", () => {
   it("is half the width when the belt leaves a wall face-on", () => {
     expect(wallDistance("room", 1, 0)).toBeCloseTo(2, 6);
     expect(wallDistance("room", 0, -1)).toBeCloseTo(2, 6);
-    expect(wallDistance("project", 1, 0)).toBeCloseTo(3, 6);
+    expect(wallDistance("project", 1, 0)).toBeCloseTo(3.5, 6);
   });
 
   it("is half the diagonal when the belt leaves towards a corner", () => {
     // the footprint is a square, so the boundary is further away on the diagonal
     expect(wallDistance("room", 1, 1)).toBeCloseTo(2 * Math.SQRT2, 6);
-    expect(wallDistance("project", -1, 1)).toBeCloseTo(3 * Math.SQRT2, 6);
+    expect(wallDistance("project", -1, 1)).toBeCloseTo(3.5 * Math.SQRT2, 6);
   });
 
   it("never reports less than half the width, whichever way the belt leaves", () => {
@@ -52,8 +52,8 @@ describe("beltEnds", () => {
     const { start, end } = beltEnds(project(0, 0), room(14, 0));
     expect(start).toEqual({ x: inset("project", 1, 0), z: 0 });
     expect(end).toEqual({ x: 14 - inset("room", 1, 0), z: 0 });
-    // 3 + 0.3 and 14 - (2 + 0.3): a package now has 8.4 units of open floor to travel
-    expect(start.x).toBeCloseTo(3.3, 6);
+    // 3.5 + 0.3 and 14 - (2 + 0.3): a package has 7.9 units of open floor to travel
+    expect(start.x).toBeCloseTo(3.8, 6);
     expect(end.x).toBeCloseTo(11.7, 6);
   });
 
@@ -127,8 +127,8 @@ describe("conveyorCurve", () => {
     const curve = conveyorCurve(project(0, 0), room(14, 0), 0.18);
     const mid = pointAt(curve, 0.5);
 
-    // the straight line between the two wall anchors runs from x = 3.3 to x = 11.7
-    expect(mid.x).toBeCloseTo(7.5, 3);
+    // the straight line between the two wall anchors runs from x = 3.8 to x = 11.7
+    expect(mid.x).toBeCloseTo(7.75, 3);
     expect(Math.abs(mid.z)).toBeGreaterThan(0.5);
   });
 
