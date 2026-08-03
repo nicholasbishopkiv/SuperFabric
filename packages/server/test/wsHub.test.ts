@@ -212,6 +212,75 @@ describe("WsHub", () => {
     });
   });
 
+  // ---- per-agent model over the wire ----
+
+  describe("set_model", () => {
+    it("creates a session on the requested model and reports it back", () => {
+      const { hub, sock, sent } = makeHub();
+      hub.handleMessage(sock, JSON.stringify({ kind: "create_session", cwd: "/tmp", model: "claude-haiku-4-5" }));
+      const sessions = sent.find(m => m.kind === "sessions").sessions;
+      expect(sessions[0].model).toBe("claude-haiku-4-5");
+    });
+
+    it("leaves a session unpinned when create_session names no model", () => {
+      const { hub, sock, sent } = makeHub();
+      hub.handleMessage(sock, JSON.stringify({ kind: "create_session", cwd: "/tmp" }));
+      expect(sent.find(m => m.kind === "sessions").sessions[0].model).toBeNull();
+    });
+
+    it("switches a live session and replies with an updated sessions message", async () => {
+      const { hub, mgr, sock, sent } = makeHub();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      hub.handleMessage(sock, JSON.stringify({ kind: "set_model", sessionId: id, model: "claude-opus-5" }));
+      await waitFor(() => {
+        const last = sent.filter(m => m.kind === "sessions").at(-1);
+        if (last === undefined) throw new Error("no sessions reply yet");
+        if (last.sessions.find((s: any) => s.id === id).model !== "claude-opus-5") throw new Error("not yet");
+      });
+      expect(sent.some(m => m.kind === "error")).toBe(false);
+      expect(mgr.listSessions()[0].model).toBe("claude-opus-5");
+    });
+
+    it("hands a session back to the CLI default with null", async () => {
+      const { hub, mgr, sock } = makeHub();
+      const id = mgr.createSession({ cwd: "/tmp", model: "claude-haiku-4-5" });
+      hub.handleMessage(sock, JSON.stringify({ kind: "set_model", sessionId: id, model: null }));
+      await waitFor(() => {
+        if (mgr.listSessions()[0].model !== null) throw new Error("not yet");
+      });
+    });
+
+    it("accepts an id this build has never heard of", async () => {
+      // The picker is a convenience list, not the protocol: a model released this morning has to be
+      // usable without shipping a new SuperFabric.
+      const { hub, mgr, sock, sent } = makeHub();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      hub.handleMessage(sock, JSON.stringify({ kind: "set_model", sessionId: id, model: "claude-something-7" }));
+      await waitFor(() => {
+        if (mgr.listSessions()[0].model !== "claude-something-7") throw new Error("not yet");
+      });
+      expect(sent.some(m => m.kind === "error")).toBe(false);
+    });
+
+    it("replies error for an unknown session without throwing", async () => {
+      const { hub, sock, sent } = makeHub();
+      expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "set_model", sessionId: "nope", model: "claude-opus-5" })))
+        .not.toThrow();
+      await waitFor(() => {
+        if (!sent.some(m => m.kind === "error" && /unknown session/.test(m.message))) throw new Error("not yet");
+      });
+      expect(sent.some(m => m.kind === "sessions")).toBe(false);
+    });
+
+    it("rejects an empty model id rather than storing one", () => {
+      const { hub, mgr, sock, sent } = makeHub();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      hub.handleMessage(sock, JSON.stringify({ kind: "set_model", sessionId: id, model: "" }));
+      expect(sent.some(m => m.kind === "error" && m.message === "bad message")).toBe(true);
+      expect(mgr.listSessions()[0].model).toBeNull();
+    });
+  });
+
   // ---- M1a: rooms over the wire ----
 
   describe("rooms", () => {

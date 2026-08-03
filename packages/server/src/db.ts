@@ -103,6 +103,13 @@ const MIGRATIONS: readonly Migration[] = [
   // 5 — M1b projects. One SuperFabric serves several factories, so everything the operator looks at
   // is scoped by `project_id`: rooms, sessions, tasks and bus messages. See `migrateProjects`.
   migrateProjects,
+  // 6 — per-agent model. NULL means "the CLI's own default", which is what every session written
+  // before this column ran on — so existing rows keep behaving exactly as they did, and a row only
+  // pins a model once someone chooses one. No CHECK and no enum: model ids are Anthropic's release
+  // schedule, not our schema (see `ModelId` in the protocol).
+  `
+    ALTER TABLE sessions ADD COLUMN model TEXT;
+  `,
 ];
 
 /**

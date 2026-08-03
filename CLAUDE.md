@@ -28,6 +28,12 @@ and a subscription limit monitor with auto-pause/resume.
   `bypass` agent comes back as `bypass`, an `attended` one as `attended`. A session's SDK
   permission mode is always set explicitly, so the operator's own Claude Code default can never
   decide what a factory agent may do.
+- The **model is per session** in exactly the same way (`sessions.model`, NULL = the CLI's own
+  default), re-applied on resume, and changed by restarting the session's executor with `resume` —
+  so the stored model and the model actually in force can never disagree. Model *ids* are Anthropic's
+  release schedule, not our protocol: the wire takes any non-empty string, `AGENT_MODELS` in
+  `packages/shared` is a shortlist for the UI, and a free-text field covers everything else. Never
+  hard-code an id you are not sure of — a wrong one is a 404 mid-turn.
 - **A room is never taken from tool input.** The room an agent speaks for comes from its session
   row, and `busTools` bakes it into the closures — an agent cannot send a bus message *as* another
   department, whatever it puts in the arguments. A roomless session gets no bus tools at all.
@@ -63,6 +69,20 @@ still reach the operator. `bypass` is only genuinely safe once sessions are sand
 `create_session` carries an optional `autonomy`; `set_autonomy` toggles a live agent (the SDK's
 mode is fixed per `query()`, so the session's executor is restarted, resuming from the stored
 `claude_session_id`).
+
+## Model (per agent)
+
+`create_session` carries an optional `model`; `set_model {sessionId, model}` switches a live agent,
+with `null` handing it back to the CLI's default. It is the worked twin of `set_autonomy` —
+`Options.model` is fixed per `query()`, so the executor is restarted and resumed from
+`claude_session_id` rather than mutated (`Query.setModel()` exists, but a restart is what makes the
+stored model, the running model and the model a reboot would use one thing). Stored in
+`sessions.model`; NULL means "no choice was made", which is *not* the same fact as any particular id.
+
+The picker's shortlist is `AGENT_MODELS` in `packages/shared/src/protocol.ts` and the wire type is a
+plain non-empty string, so an id we have never heard of still works. `Query.supportedModels()` (see
+`server/notes/agent-sdk-api.md`) is the authoritative list for the installed CLI and could populate
+this dynamically later.
 
 ## Stack
 

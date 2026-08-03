@@ -476,6 +476,54 @@ describe("ClaudeCodeExecutor", () => {
     });
   });
 
+  // ---- per-session model (ExecutorStartOptions.model) ----
+
+  describe("model", () => {
+    it("passes a session's model straight through to the SDK's Options.model", () => {
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: fq.fn })
+        .start({ cwd: "/repo", model: "claude-haiku-4-5" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      expect(fq.options()!.model).toBe("claude-haiku-4-5");
+    });
+
+    it("lets a session override the process-wide default", () => {
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ model: "claude-opus-5", query: fq.fn })
+        .start({ cwd: "/repo", model: "claude-haiku-4-5" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      expect(fq.options()!.model).toBe("claude-haiku-4-5");
+    });
+
+    it("falls back to the process-wide default for a session that pinned nothing", () => {
+      for (const model of [undefined, null]) {
+        const fq = makeFakeQuery();
+        new ClaudeCodeExecutor({ model: "claude-opus-5", query: fq.fn })
+          .start({ cwd: "/repo", model }, { onEvent: () => {}, requestApproval: async () => "deny" });
+        expect(fq.options()!.model).toBe("claude-opus-5");
+      }
+    });
+
+    it("leaves Options.model unset when nobody chose one, rather than guessing an id", () => {
+      // An id the installed CLI does not know is a 404 mid-turn, so "no choice" has to stay "no
+      // choice" all the way down to the SDK.
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: fq.fn })
+        .start({ cwd: "/repo", model: null }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      expect(fq.options()!.model).toBeUndefined();
+    });
+
+    it("does not disturb the rest of the session's configuration", () => {
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: fq.fn }).start(
+        { cwd: "/repo", model: "claude-sonnet-5", autonomy: "bypass", resumeSessionId: "prev" },
+        { onEvent: () => {}, requestApproval: async () => "deny" },
+      );
+      const o = fq.options()!;
+      expect(o.model).toBe("claude-sonnet-5");
+      expect(o.permissionMode).toBe("bypassPermissions");
+      expect(o.resume).toBe("prev");
+    });
+  });
+
   it("omits optional Options when no defaults are given", () => {
     const fq = makeFakeQuery();
     const exec = new ClaudeCodeExecutor({ query: fq.fn });

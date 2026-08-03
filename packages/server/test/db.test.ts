@@ -406,6 +406,90 @@ describe("db", () => {
     }
   });
 
+  // ---- migration 6: per-agent model ----
+
+  it("adds a nullable sessions.model, because NULL is the CLI's own default", () => {
+    const db = openDb(":memory:");
+    const cols = db.prepare("SELECT name, \"notnull\", dflt_value FROM pragma_table_info('sessions')")
+      .all() as { name: string; notnull: number; dflt_value: string | null }[];
+    const model = cols.find(c => c.name === "model");
+    expect(model).toBeDefined();
+    // Not NOT NULL and no default: "no model was chosen" is a real state, and it is not the same
+    // fact as "this agent runs on <whatever we would have written here>".
+    expect(model!.notnull).toBe(0);
+    expect(model!.dflt_value).toBeNull();
+    db.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("s1", "/tmp");
+    expect(db.prepare("SELECT model FROM sessions WHERE id = 's1'").get()).toEqual({ model: null });
+  });
+
+  it("keeps a chosen model across a reopen, which is what resume re-applies", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-model-"));
+    try {
+      const path = join(dir, "test.db");
+      const first = openDb(path);
+      first.prepare("INSERT INTO sessions (id, cwd, model) VALUES (?, ?, ?)")
+        .run("s1", "/tmp", "claude-haiku-4-5");
+      first.close();
+      const second = openDb(path);
+      expect(second.prepare("SELECT model FROM sessions WHERE id = 's1'").get())
+        .toEqual({ model: "claude-haiku-4-5" });
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("upgrades a user_version = 5 database, leaving its agents on the default model", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-v5-"));
+    try {
+      const path = join(dir, "v5.db");
+      // A database exactly as migration 5 left it.
+      const v5 = new Database(path);
+      v5.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, claude_session_id TEXT,
+          state TEXT NOT NULL DEFAULT 'active', cwd TEXT NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          autonomy TEXT NOT NULL DEFAULT 'auto', room_id TEXT, project_id TEXT
+        );
+        CREATE TABLE events (
+          session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          ts INTEGER NOT NULL DEFAULT (unixepoch()),
+          type TEXT NOT NULL, payload TEXT NOT NULL,
+          PRIMARY KEY (session_id, seq)
+        );
+        CREATE TABLE projects (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()), last_opened_at INTEGER
+        );
+        CREATE TABLE rooms (
+          id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'room',
+          pos_x REAL NOT NULL DEFAULT 0, pos_z REAL NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()), UNIQUE (project_id, name)
+        );
+      `);
+      v5.exec("PRAGMA user_version = 5");
+      v5.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
+      v5.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
+        .run("r1", "p1", "payments", "/code/shop/payments");
+      v5.prepare("INSERT INTO sessions (id, cwd, autonomy, room_id, project_id) VALUES (?, ?, ?, ?, ?)")
+        .run("s1", "/code/shop/payments", "bypass", "r1", "p1");
+      v5.close();
+
+      const db = openDb(path);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(6);
+      // The existing agent is untouched and pinned to nothing: it ran on the CLI's default before
+      // this column existed, and it must go on doing exactly that.
+      expect(db.prepare("SELECT autonomy, room_id, project_id, model FROM sessions WHERE id = 's1'").get())
+        .toEqual({ autonomy: "bypass", room_id: "r1", project_id: "p1", model: null });
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("indexes the project scope of every list the operator looks at", () => {
     const db = openDb(":memory:");
     const indexes = (table: string) =>

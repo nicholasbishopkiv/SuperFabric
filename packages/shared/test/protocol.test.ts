@@ -1,13 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
-  AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, MessageInfo, MessageKind, ProjectInfo, RoomInfo,
-  ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
+  AGENT_MODELS, AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, MessageInfo, MessageKind, ModelId,
+  ProjectInfo, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
 } from "../src/protocol.js";
 
 /** Every field `SessionInfo` requires, so a case can vary exactly the one it is about. */
 const SESSION_INFO = {
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
-  autonomy: "auto", roomId: null, status: "idle", blocked: false,
+  autonomy: "auto", model: null, roomId: null, status: "idle", blocked: false,
 } as const;
 
 describe("protocol", () => {
@@ -53,6 +53,55 @@ describe("protocol", () => {
       expect(() => ServerMessage.parse({ kind: "sessions", sessions: [info] })).toThrow();
       expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...info, autonomy: "bypass" }] }))
         .toMatchObject({ sessions: [{ autonomy: "bypass" }] });
+    });
+  });
+
+  describe("model", () => {
+    it("accepts any non-empty id, because model ids are not our schema", () => {
+      expect(ModelId.parse("claude-opus-5")).toBe("claude-opus-5");
+      // a model released after this build shipped is still a legal choice
+      expect(ModelId.parse("claude-something-7")).toBe("claude-something-7");
+      expect(() => ModelId.parse("")).toThrow();
+      expect(() => ModelId.parse("x".repeat(201))).toThrow();
+    });
+
+    it("offers a short curated list for the picker, in the current id scheme", () => {
+      expect(AGENT_MODELS.length).toBeGreaterThan(0);
+      // Short on purpose: a wrong id is a 404 at runtime, so the list is the ones we are sure of
+      // and the free-text field covers the rest.
+      expect(AGENT_MODELS.length).toBeLessThanOrEqual(6);
+      for (const m of AGENT_MODELS) {
+        expect(() => ModelId.parse(m.id)).not.toThrow();
+        expect(m.id).toMatch(/^claude-[a-z]+-[0-9-]+$/);
+        expect(m.label).not.toBe("");
+        expect(m.note).not.toBe("");
+      }
+      // no duplicates: the picker is a list of distinct choices
+      expect(new Set(AGENT_MODELS.map(m => m.id)).size).toBe(AGENT_MODELS.length);
+    });
+
+    it("accepts create_session with and without a model, and set_model either way", () => {
+      expect(ClientMessage.parse({ kind: "create_session" })).toEqual({ kind: "create_session" });
+      expect(ClientMessage.parse({ kind: "create_session", model: "claude-sonnet-5" }))
+        .toMatchObject({ model: "claude-sonnet-5" });
+      expect(ClientMessage.parse({ kind: "set_model", sessionId: "s1", model: "claude-opus-5" }))
+        .toEqual({ kind: "set_model", sessionId: "s1", model: "claude-opus-5" });
+      // null is how an agent is handed back to the CLI's default
+      expect(ClientMessage.parse({ kind: "set_model", sessionId: "s1", model: null }))
+        .toEqual({ kind: "set_model", sessionId: "s1", model: null });
+      // …but "no model field at all" is not the same message, and is refused
+      expect(() => ClientMessage.parse({ kind: "set_model", sessionId: "s1" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "set_model", sessionId: "s1", model: "" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "create_session", model: "" })).toThrow();
+    });
+
+    it("requires model on SessionInfo, nullable for the CLI's own default", () => {
+      const { model: _omitted, ...info } = SESSION_INFO;
+      expect(() => ServerMessage.parse({ kind: "sessions", sessions: [info] })).toThrow();
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...info, model: "claude-haiku-4-5" }] }))
+        .toMatchObject({ sessions: [{ model: "claude-haiku-4-5" }] });
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [SESSION_INFO] }))
+        .toMatchObject({ sessions: [{ model: null }] });
     });
   });
 

@@ -52,7 +52,11 @@ export function inProcessToolPrefixes(servers: Record<string, McpServerConfig> |
 }
 
 export interface ClaudeCodeExecutorOptions {
-  /** Model id, e.g. "claude-fable-5". Omitted => the CLI's own default. */
+  /**
+   * Process-wide fallback model id, e.g. "claude-opus-5". Omitted => the CLI's own default. A
+   * session's own `ExecutorStartOptions.model` wins over this; this is only the default for
+   * sessions that pinned nothing.
+   */
   model?: string;
   /** Per-account CLAUDE_CONFIG_DIR (auth/settings/transcript isolation). */
   configDir?: string;
@@ -201,7 +205,10 @@ export class ClaudeCodeExecutor implements Executor {
     // `{ type: "sdk", instance }` entry is one variant of its config union — the tools run in this
     // process, with no transport and no subprocess.
     if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0) options.mcpServers = opts.mcpServers;
-    if (this.defaults.model) options.model = this.defaults.model;
+    // Per-session model wins; then the process-wide default; then the CLI's own. Left unset rather
+    // than guessed at, because an id the CLI does not know is a 404 mid-turn.
+    const model = opts.model ?? this.defaults.model;
+    if (model) options.model = model;
     if (this.defaults.appendSystemPrompt) {
       // There is no `appendSystemPrompt` option; appending lives inside the preset object form.
       options.systemPrompt = { type: "preset", preset: "claude_code", append: this.defaults.appendSystemPrompt };

@@ -160,11 +160,12 @@ export class WsHub {
           });
           break;
         case "create_session": {
-          // `autonomy` omitted => SessionManager applies the product default ("auto"); a `roomId`
-          // makes the room's folder the cwd, and an unknown one throws into the catch below. The
-          // active project is passed so a room from another factory is refused rather than adopted.
+          // `autonomy` omitted => SessionManager applies the product default ("auto"); `model`
+          // omitted => the CLI's own default, which is not ours to guess. A `roomId` makes the
+          // room's folder the cwd, and an unknown one throws into the catch below. The active
+          // project is passed so a room from another factory is refused rather than adopted.
           const id = this.mgr.createSession({
-            cwd: msg.cwd, roomId: msg.roomId, autonomy: msg.autonomy,
+            cwd: msg.cwd, roomId: msg.roomId, autonomy: msg.autonomy, model: msg.model,
             projectId: this.activeProject(sock),
           });
           this.broadcastSessions();
@@ -178,6 +179,14 @@ export class WsHub {
           // Restarting the executor is async, so the outcome is reported from the promise — an
           // unhandled rejection would exit the process on Node 22.
           void this.mgr.setAutonomy(msg.sessionId, msg.autonomy).then(
+            () => { this.broadcastSessions(); },
+            (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
+          );
+          break;
+        // Same shape as set_autonomy, and for the same reason: the model is fixed for the lifetime
+        // of a query(), so the session's executor is restarted and resumed.
+        case "set_model":
+          void this.mgr.setModel(msg.sessionId, msg.model).then(
             () => { this.broadcastSessions(); },
             (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
           );

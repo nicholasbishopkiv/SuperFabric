@@ -18,6 +18,50 @@ export type AutonomyMode = z.infer<typeof AutonomyMode>;
 export const DEFAULT_AUTONOMY: AutonomyMode = "auto";
 
 /**
+ * Which model an agent runs on.
+ *
+ * A free string, not an enum, and that is the whole design. Model ids are Anthropic's release
+ * schedule, not our protocol: a closed union would mean a SuperFabric release is required before an
+ * operator can use a model that shipped this morning, and a *wrong* id in that union is a 404 at
+ * runtime — the worst kind of bug to ship, because it only appears when someone selects it. So the
+ * wire accepts any non-empty id, `AGENT_MODELS` below is a convenience list for the UI, and the two
+ * are deliberately not the same thing.
+ *
+ * `null`/omitted means "whatever the CLI would use" — not a model we chose.
+ */
+export const ModelId = z.string().min(1).max(200);
+export type ModelId = z.infer<typeof ModelId>;
+
+/** One entry in the picker: the id sent on the wire, and what a person is shown. */
+export interface AgentModel {
+  id: string;
+  label: string;
+  /** One line of "why would I pick this one". */
+  note: string;
+}
+
+/**
+ * The curated model list, and the single source of truth for the UI's picker.
+ *
+ * Deliberately short. Every id here is one we are confident exists (they are the ids
+ * `packages/server/notes/agent-sdk-api.md` documents for `Options.model`, in Anthropic's current
+ * `claude-<family>-<version>` scheme); anything else the operator can still type by hand, because
+ * `ModelId` accepts any string. Fewer ids we are sure about plus a free-text field beats a long list
+ * with a 404 hiding in it.
+ *
+ * **This list could be populated dynamically instead.** The Agent SDK's `Query.supportedModels()`
+ * (see `notes/agent-sdk-api.md`) returns the CLI's own `ModelInfo[]` — the authoritative answer for
+ * the account and CLI version actually installed. It needs a live `query()` to ask, so it is not a
+ * static import; a later change can have the server call it once at boot and broadcast the result,
+ * at which point this list becomes the fallback for a server that has not asked yet.
+ */
+export const AGENT_MODELS: readonly AgentModel[] = [
+  { id: "claude-opus-5", label: "Opus 5", note: "most capable; the default choice for hard work" },
+  { id: "claude-sonnet-5", label: "Sonnet 5", note: "fast and cheaper, near-Opus on most tasks" },
+  { id: "claude-haiku-4-5", label: "Haiku 4.5", note: "cheapest and quickest; simple, scoped work" },
+];
+
+/**
  * What an agent is doing right now. The same vocabulary is used twice on purpose: as the payload of
  * a `session_status` event (the log's record of a transition) and as the derived `status` on
  * `SessionInfo` (the current value, so a client does not have to replay a transcript to learn it).
@@ -148,8 +192,16 @@ export const ClientMessage = z.discriminatedUnion("kind", [
     /** Put the agent in a room; the room's folder becomes its cwd. Omitted => a roomless session. */
     roomId: z.string().optional(),
     autonomy: AutonomyMode.optional(),
+    /** Omitted => the CLI's own default model. */
+    model: ModelId.optional(),
   }),
   z.object({ kind: z.literal("set_autonomy"), sessionId: z.string(), autonomy: AutonomyMode }),
+  /**
+   * Switch a live agent's model. `null` hands it back to the CLI's default rather than pinning one.
+   * Like `set_autonomy`, this restarts the session's executor (resuming the same provider session),
+   * because the model is fixed for the lifetime of a `query()` — see `SessionManager.setModel`.
+   */
+  z.object({ kind: z.literal("set_model"), sessionId: z.string(), model: ModelId.nullable() }),
   z.object({ kind: z.literal("list_sessions") }),
   /**
    * `path` is the room's working folder. Omitted, the room is `<project root>/<name>` and must stay
@@ -212,6 +264,12 @@ export const SessionInfo = z.object({
   lastSeq: z.number().int(),
   /** Per-session, persisted, and re-applied on resume. */
   autonomy: AutonomyMode,
+  /**
+   * The model this agent runs on, or `null` for the CLI's own default. Per-session, persisted, and
+   * re-applied on resume, exactly like `autonomy`: a restarted agent must come back on the model the
+   * operator chose, not on whatever the CLI would have picked.
+   */
+  model: z.string().nullable(),
   /** The room this agent works in, or null for a roomless session (every M0 session). */
   roomId: z.string().nullable(),
   /**

@@ -27,6 +27,8 @@ export interface CreateSessionOptions {
   /** The room to work in. Its folder becomes the cwd. Unknown ids are rejected. */
   roomId?: string;
   autonomy?: AutonomyMode;
+  /** Model id to pin this agent to. Omitted => the executor's default, i.e. the CLI's own. */
+  model?: string;
   /**
    * The factory this agent belongs to. With a `roomId` it is implied by the room and only has to be
    * passed to be *checked* — the hub passes the asking socket's active project, so a client that knew
@@ -75,13 +77,14 @@ export class SessionManager {
   ) {
     this.stmts = {
       insertSession: db.prepare(
-        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model) VALUES (?, ?, ?, ?, ?, ?)",
       ),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
-      activeSessions: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id FROM sessions WHERE state = 'active'"),
+      activeSessions: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id, model FROM sessions WHERE state = 'active'"),
       markError: db.prepare("UPDATE sessions SET state = 'error' WHERE id = ? AND state = 'active'"),
-      session: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id FROM sessions WHERE id = ?"),
+      session: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id, model FROM sessions WHERE id = ?"),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
+      setModel: db.prepare("UPDATE sessions SET model = ? WHERE id = ?"),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
       // `status` and `blocked` are derived from the log by correlated subqueries rather than a
       // second round of queries per row, for the same reason — the 3D floor asks for this list on
@@ -127,8 +130,9 @@ export class SessionManager {
     if (!isDir) throw new Error(`cwd is not a directory: ${cwd}`);
 
     const id = randomUUID();
-    this.stmts.insertSession.run(id, projectId, cwd, autonomy, roomId);
-    this.startExecutor(id, cwd, null, autonomy, roomId);
+    const model = opts.model ?? null;
+    this.stmts.insertSession.run(id, projectId, cwd, autonomy, roomId, model);
+    this.startExecutor(id, cwd, null, autonomy, roomId, model);
     return id;
   }
 
@@ -173,7 +177,46 @@ export class SessionManager {
     // now would leak a CLI subprocess past the server's exit; the stored mode still applies on the
     // next boot.
     if (this.stopping) return;
-    this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id);
+    this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id, row.model);
+  }
+
+  /**
+   * Switch an agent's model. Same shape and the same reason as `setAutonomy`: the SDK's `model` is
+   * an `Options` field baked in when `query()` is called, so a live session is restarted — resuming
+   * from the stored `claude_session_id`, which keeps the conversation — rather than mutated. The
+   * stored value and the value actually in force can then never disagree, which is the property
+   * that matters: an operator who set "Haiku" and is silently still being billed for Opus has been
+   * lied to. (`Query.setModel()` does exist and would avoid the restart; a restart is chosen anyway
+   * so that the running model, the stored model and the model a reboot would use are one thing.)
+   *
+   * `null` un-pins the session, handing it back to the CLI's default. The new value is persisted
+   * first: even if the restart fails, the next boot starts the agent on the model asked for.
+   */
+  async setModel(id: string, model: string | null): Promise<void> {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    this.stmts.setModel.run(model, id);
+
+    const handle = this.handles.get(id);
+    if (handle === undefined) {
+      this.store.append(id, {
+        type: "session_status", status: "idle",
+        detail: `model: ${model ?? "default"} (applies when the session next starts)`,
+      });
+      return;
+    }
+
+    this.store.append(id, {
+      type: "session_status", status: "starting", detail: `model: ${model ?? "default"}`,
+    });
+    // Order matters exactly as in setAutonomy: the old executor is gone before a new one resumes the
+    // same provider session, and the turn that died with it takes its approvals with it.
+    this.handles.delete(id);
+    this.turnInFlight.delete(id);
+    this.denyPendingApprovals(id);
+    await this.stopWithTimeout(handle, 5000).catch(() => {});
+    if (this.stopping) return;
+    this.startExecutor(id, row.cwd, row.claude_session_id, asAutonomy(row.autonomy), row.room_id, model);
   }
 
   /**
@@ -185,9 +228,10 @@ export class SessionManager {
     const started: string[] = [];
     for (const r of rows) {
       if (this.handles.has(r.id)) continue;
-      // The stored mode is what a session comes back as: a bypass agent stays bypass across a
-      // restart, an attended one stays attended.
-      this.startExecutor(r.id, r.cwd, r.claude_session_id, asAutonomy(r.autonomy), r.room_id);
+      // The stored mode and the stored model are what a session comes back as: a bypass agent stays
+      // bypass across a restart, an attended one stays attended, and an agent pinned to a model
+      // comes back on that model rather than on the CLI's default.
+      this.startExecutor(r.id, r.cwd, r.claude_session_id, asAutonomy(r.autonomy), r.room_id, r.model);
       started.push(r.id);
     }
     return started;
@@ -214,9 +258,16 @@ export class SessionManager {
     };
   }
 
-  private startExecutor(id: string, cwd: string, resume: string | null, autonomy: AutonomyMode, roomId: string | null) {
+  private startExecutor(
+    id: string,
+    cwd: string,
+    resume: string | null,
+    autonomy: AutonomyMode,
+    roomId: string | null,
+    model: string | null,
+  ) {
     const handle = this.executor.start(
-      { cwd, resumeSessionId: resume, autonomy, mcpServers: this.busToolServers(id, roomId) },
+      { cwd, resumeSessionId: resume, autonomy, model, mcpServers: this.busToolServers(id, roomId) },
       {
         onEvent: (event) => {
           this.store.append(id, event);
@@ -351,7 +402,7 @@ export class SessionManager {
   private toSessionInfo(rows: unknown[]): SessionInfo[] {
     return (rows as {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
-      autonomy: string; room_id: string | null; last_seq: number;
+      autonomy: string; model: string | null; room_id: string | null; last_seq: number;
       status: string | null; blocked: number;
     }[]).map(r => ({
       id: r.id,
@@ -359,6 +410,7 @@ export class SessionManager {
       claudeSessionId: r.claude_session_id,
       lastSeq: r.last_seq,
       autonomy: asAutonomy(r.autonomy),
+      model: r.model,
       roomId: r.room_id,
       status: asStatus(r.status),
       blocked: r.blocked === 1,
@@ -373,7 +425,8 @@ export class SessionManager {
 function sessionListSql(where: string): string {
   return `
     SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
-           s.autonomy AS autonomy, s.room_id AS room_id, COALESCE(MAX(e.seq), 0) AS last_seq,
+           s.autonomy AS autonomy, s.model AS model, s.room_id AS room_id,
+           COALESCE(MAX(e.seq), 0) AS last_seq,
            -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
            (SELECT json_extract(st.payload, '$.status')
               FROM events st
@@ -400,6 +453,8 @@ interface SessionRow {
   cwd: string;
   claude_session_id: string | null;
   autonomy: string;
+  /** NULL is "the CLI's own default", not a missing value. */
+  model: string | null;
   room_id: string | null;
 }
 

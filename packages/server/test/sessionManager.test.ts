@@ -388,6 +388,149 @@ describe("SessionManager", () => {
     });
   });
 
+  // ---- per-agent model: persisted, passed to the executor, survives resume ----
+
+  describe("model", () => {
+    /** Records every start() so a test can assert the model the executor was handed. */
+    class RecordingExecutor implements Executor {
+      readonly name = "recording";
+      readonly starts: ExecutorStartOptions[] = [];
+      readonly stops: number[] = [];
+      constructor(private readonly providerId = "claude-session-model") {}
+      start(opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
+        this.starts.push(opts);
+        ev.onEvent({ type: "session_status", status: "idle" });
+        return {
+          providerSessionId: Promise.resolve(this.providerId),
+          send: () => {},
+          interrupt: async () => {},
+          stop: async () => { this.stops.push(Date.now()); },
+        };
+      }
+    }
+
+    const setup = (db = openDb(":memory:")) => {
+      const store = new EventStore(db);
+      const exec = new RecordingExecutor();
+      return { db, store, exec, mgr: new SessionManager(db, store, exec, ...manager(db)) };
+    };
+
+    const stored = (db: ReturnType<typeof openDb>, id: string) =>
+      (db.prepare("SELECT model FROM sessions WHERE id = ?").get(id) as { model: string | null }).model;
+
+    it("pins nothing by default, so the CLI's own default applies", () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      expect(stored(db, id)).toBeNull();
+      expect(exec.starts[0].model).toBeNull();
+      expect(mgr.listSessions()[0].model).toBeNull();
+    });
+
+    it("createSession with a model persists it and hands it to the executor", () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp", model: "claude-haiku-4-5" });
+      expect(stored(db, id)).toBe("claude-haiku-4-5");
+      expect(exec.starts).toHaveLength(1);
+      expect(exec.starts[0].model).toBe("claude-haiku-4-5");
+      expect(mgr.listSessions()[0].model).toBe("claude-haiku-4-5");
+    });
+
+    it("setModel persists, restarts the live executor on the new model, and logs it", async () => {
+      const { db, store, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp", model: "claude-sonnet-5" });
+      // the provider session id lands asynchronously; the restart must resume from it
+      await waitFor(() => {
+        const row = db.prepare("SELECT claude_session_id c FROM sessions WHERE id = ?").get(id) as { c: string | null };
+        if (row.c === null) throw new Error("not persisted yet");
+      });
+
+      await mgr.setModel(id, "claude-opus-5");
+
+      expect(stored(db, id)).toBe("claude-opus-5");
+      expect(mgr.listSessions().find(s => s.id === id)!.model).toBe("claude-opus-5");
+      // the stored model and the running one cannot disagree: the old executor is stopped and a new
+      // one resumes the same provider session on the new model
+      expect(exec.stops).toHaveLength(1);
+      expect(exec.starts).toHaveLength(2);
+      expect(exec.starts[1].model).toBe("claude-opus-5");
+      expect(exec.starts[1].resumeSessionId).toBe("claude-session-model");
+      // the autonomy the session was created with survives the model change
+      expect(exec.starts[1].autonomy).toBe("auto");
+      const detail = store.listAfter(id, 0)
+        .map(e => e.event)
+        .filter(e => e.type === "session_status")
+        .map(e => (e as { detail?: string }).detail)
+        .find(d => d !== undefined && d.includes("model"));
+      expect(detail).toContain("model: claude-opus-5");
+      expect(() => mgr.prompt(id, "still here")).not.toThrow();
+    });
+
+    it("un-pins a session back to the CLI default with null", async () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp", model: "claude-haiku-4-5" });
+      await mgr.setModel(id, null);
+      expect(stored(db, id)).toBeNull();
+      expect(exec.starts[1].model).toBeNull();
+      expect(mgr.listSessions()[0].model).toBeNull();
+    });
+
+    it("persists without restarting when the session is not live", async () => {
+      const { db, store, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      await mgr.stopAll();
+      const startsBefore = exec.starts.length;
+
+      await mgr.setModel(id, "claude-haiku-4-5");
+
+      expect(stored(db, id)).toBe("claude-haiku-4-5");
+      expect(exec.starts).toHaveLength(startsBefore);
+      const statuses = store.listAfter(id, 0).map(e => e.event).filter(e => e.type === "session_status");
+      expect((statuses.at(-1) as { detail?: string }).detail).toContain("claude-haiku-4-5");
+    });
+
+    it("does not spawn a replacement executor when shutdown starts mid-switch", async () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      const switching = mgr.setModel(id, "claude-haiku-4-5");
+      await mgr.stopAll();
+      await switching;
+      expect(exec.starts).toHaveLength(1);
+      expect(stored(db, id)).toBe("claude-haiku-4-5");
+    });
+
+    it("rejects an unknown session instead of persisting anything", async () => {
+      const { db, mgr } = setup();
+      await expect(mgr.setModel("nope", "claude-opus-5")).rejects.toThrow(/unknown session/);
+      expect((db.prepare("SELECT COUNT(*) c FROM sessions").get() as { c: number }).c).toBe(0);
+    });
+
+    it("resumeAll restarts a session on its stored model, so a restart changes nothing", async () => {
+      const db = openDb(":memory:");
+      const { store, mgr } = setup(db);
+      const pinned = mgr.createSession({ cwd: "/tmp", model: "claude-haiku-4-5" });
+      const unpinned = mgr.createSession({ cwd: "/tmp" });
+      await mgr.stopAll();
+
+      // a second manager over the same db simulates a server restart
+      const exec2 = new RecordingExecutor();
+      const mgr2 = new SessionManager(db, store, exec2, ...manager(db));
+      expect(mgr2.resumeAll().sort()).toEqual([pinned, unpinned].sort());
+      const byModel = new Map(exec2.starts.map(o => [o.model ?? "default", o]));
+      expect([...byModel.keys()].sort()).toEqual(["claude-haiku-4-5", "default"]);
+      expect(mgr2.listSessions().find(s => s.id === pinned)!.model).toBe("claude-haiku-4-5");
+      expect(mgr2.listSessions().find(s => s.id === unpinned)!.model).toBeNull();
+    });
+
+    it("reports whatever id is stored, including one this build has never heard of", () => {
+      // Model ids are Anthropic's release schedule, not our schema: an id we do not know about is
+      // a valid choice by an operator with a newer CLI, not a row to sanitise.
+      const { db, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      db.prepare("UPDATE sessions SET model = ? WHERE id = ?").run("claude-something-7", id);
+      expect(mgr.listSessions()[0].model).toBe("claude-something-7");
+    });
+  });
+
   // ---- M1a: a session belongs to a room and runs in that room's folder ----
 
   describe("rooms", () => {
