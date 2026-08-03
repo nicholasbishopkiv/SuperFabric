@@ -1,9 +1,15 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import { SCHEMA_VERSION, openDb } from "../src/db.js";
+
+// `bun:sqlite` has no `db.pragma()` helper — a pragma is read as an ordinary one-row query.
+const userVersion = (db: Database): number =>
+  (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+const journalMode = (db: Database): string =>
+  (db.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
 
 describe("db", () => {
   it("creates the sessions and events tables", () => {
@@ -16,7 +22,7 @@ describe("db", () => {
     const dir = mkdtempSync(join(tmpdir(), "superfabric-db-"));
     try {
       const db = openDb(join(dir, "test.db"));
-      expect(db.pragma("journal_mode", { simple: true })).toBe("wal");
+      expect(journalMode(db)).toBe("wal");
       db.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -25,12 +31,12 @@ describe("db", () => {
 
   it("leaves in-memory databases on their default journal mode", () => {
     const db = openDb(":memory:");
-    expect(db.pragma("journal_mode", { simple: true })).toBe("memory");
+    expect(journalMode(db)).toBe("memory");
   });
 
   it("stamps a fresh database with the current schema version", () => {
     const db = openDb(":memory:");
-    expect(db.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
+    expect(userVersion(db)).toBe(SCHEMA_VERSION);
     expect(SCHEMA_VERSION).toBeGreaterThan(0);
   });
 
@@ -42,7 +48,7 @@ describe("db", () => {
       first.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("s1", "/tmp");
       first.close();
       const second = openDb(path);
-      expect(second.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
+      expect(userVersion(second)).toBe(SCHEMA_VERSION);
       expect((second.prepare("SELECT COUNT(*) c FROM sessions").get() as { c: number }).c).toBe(1);
       second.close();
     } finally {
@@ -69,14 +75,14 @@ describe("db", () => {
           PRIMARY KEY (session_id, seq)
         );
       `);
-      old.pragma("user_version = 0");
+      old.exec("PRAGMA user_version = 0");
       old.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("legacy", "/legacy/cwd");
       old.prepare("INSERT INTO events (session_id, seq, type, payload) VALUES (?, ?, ?, ?)")
         .run("legacy", 1, "agent_text", JSON.stringify({ type: "agent_text", text: "from before" }));
       old.close();
 
       const db = openDb(path);
-      expect(db.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
       expect(db.prepare("SELECT cwd FROM sessions WHERE id = 'legacy'").get()).toEqual({ cwd: "/legacy/cwd" });
       expect((db.prepare("SELECT payload FROM events WHERE session_id='legacy' AND seq=1").get() as { payload: string }).payload)
         .toContain("from before");
@@ -153,14 +159,14 @@ describe("db", () => {
           PRIMARY KEY (session_id, seq)
         );
       `);
-      v2.pragma("user_version = 2");
+      v2.exec("PRAGMA user_version = 2");
       v2.prepare("INSERT INTO sessions (id, cwd, autonomy) VALUES (?, ?, ?)").run("m0", "/m0/cwd", "bypass");
       v2.prepare("INSERT INTO events (session_id, seq, type, payload) VALUES (?, ?, ?, ?)")
         .run("m0", 1, "agent_text", JSON.stringify({ type: "agent_text", text: "from M0" }));
       v2.close();
 
       const db = openDb(path);
-      expect(db.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
       expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(3);
 
       // the M0 session survived intact, and is roomless

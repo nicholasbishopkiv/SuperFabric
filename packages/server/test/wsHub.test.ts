@@ -1,4 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "bun:test";
+import { waitFor } from "./_waitFor.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -131,7 +132,7 @@ describe("WsHub", () => {
       const mgr = (hub as unknown as { mgr: SessionManager }).mgr;
       mgr.interrupt = async () => { throw new Error("interrupt exploded"); };
       expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "interrupt", sessionId: "nope" }))).not.toThrow();
-      await vi.waitFor(() => {
+      await waitFor(() => {
         if (!sent.some(m => m.kind === "error" && /interrupt exploded/.test(m.message))) throw new Error("not yet");
       });
     });
@@ -151,7 +152,7 @@ describe("WsHub", () => {
       const { hub, mgr, sock, sent } = makeHub();
       const id = mgr.createSession({ cwd: "/tmp", autonomy: "auto" });
       hub.handleMessage(sock, JSON.stringify({ kind: "set_autonomy", sessionId: id, autonomy: "attended" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         const last = sent.filter(m => m.kind === "sessions").at(-1);
         if (last === undefined) throw new Error("no sessions reply yet");
         if (last.sessions.find((s: any) => s.id === id).autonomy !== "attended") throw new Error("not yet");
@@ -164,7 +165,7 @@ describe("WsHub", () => {
       const { hub, sock, sent } = makeHub();
       expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "set_autonomy", sessionId: "nope", autonomy: "bypass" })))
         .not.toThrow();
-      await vi.waitFor(() => {
+      await waitFor(() => {
         if (!sent.some(m => m.kind === "error" && /unknown session/.test(m.message))) throw new Error("not yet");
       });
       expect(sent.some(m => m.kind === "sessions")).toBe(false);

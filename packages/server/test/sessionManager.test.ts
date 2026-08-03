@@ -1,4 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "bun:test";
+import { waitFor } from "./_waitFor.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,7 +38,7 @@ describe("SessionManager", () => {
     const id = mgr.createSession({ cwd: "/tmp" });
     mgr.prompt(id, "run it");
     // wait until the approval_request event lands in the store
-    await vi.waitFor(() => {
+    await waitFor(() => {
       if (!store.listAfter(id, 0).some(e => e.event.type === "approval_request")) throw new Error("not yet");
     });
     const req = store.listAfter(id, 0).find(e => e.event.type === "approval_request")!;
@@ -95,7 +96,7 @@ describe("SessionManager", () => {
       const mgr = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
       const id = mgr.createSession({ cwd: "/tmp" });
       mgr.prompt(id, "run it");
-      await vi.waitFor(() => {
+      await waitFor(() => {
         if (!store.listAfter(id, 0).some(e => e.event.type === "approval_request")) throw new Error("not yet");
       });
       const req = store.listAfter(id, 0).find(e => e.event.type === "approval_request")!;
@@ -215,7 +216,7 @@ describe("SessionManager", () => {
     expect(exec1.starts[0].resumeSessionId ?? null).toBeNull();
 
     // the id lands in the db asynchronously, off providerSessionId
-    await vi.waitFor(() => {
+    await waitFor(() => {
       const row = db.prepare("SELECT claude_session_id c FROM sessions WHERE id = ?").get(id) as { c: string | null };
       if (row.c !== providerId) throw new Error(`not persisted yet: ${row.c}`);
     });
@@ -280,7 +281,7 @@ describe("SessionManager", () => {
       const { db, store, exec, mgr } = setup();
       const id = mgr.createSession({ cwd: "/tmp", autonomy: "auto" });
       // the provider session id lands asynchronously; the restart must resume from it
-      await vi.waitFor(() => {
+      await waitFor(() => {
         const row = db.prepare("SELECT claude_session_id c FROM sessions WHERE id = ?").get(id) as { c: string | null };
         if (row.c === null) throw new Error("not persisted yet");
       });

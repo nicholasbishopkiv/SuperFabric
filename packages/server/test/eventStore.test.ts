@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "bun:test";
 import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
 
