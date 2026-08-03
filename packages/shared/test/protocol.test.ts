@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, RoomInfo, ServerMessage, SessionEvent } from "../src/protocol.js";
+import { AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, RoomInfo, ServerMessage, SessionEvent, SessionStatus } from "../src/protocol.js";
+
+/** Every field `SessionInfo` requires, so a case can vary exactly the one it is about. */
+const SESSION_INFO = {
+  id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
+  autonomy: "auto", roomId: null, status: "idle", blocked: false,
+} as const;
 
 describe("protocol", () => {
   it("parses a subscribe message", () => {
@@ -40,10 +46,39 @@ describe("protocol", () => {
     });
 
     it("requires autonomy on SessionInfo", () => {
-      const info = { id: "s1", state: "active", claudeSessionId: null, lastSeq: 0, roomId: null };
+      const { autonomy: _omitted, ...info } = SESSION_INFO;
       expect(() => ServerMessage.parse({ kind: "sessions", sessions: [info] })).toThrow();
       expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...info, autonomy: "bypass" }] }))
         .toMatchObject({ sessions: [{ autonomy: "bypass" }] });
+    });
+  });
+
+  // ---- M1a: the derived status the 3D floor reads instead of replaying transcripts ----
+
+  describe("session status", () => {
+    it("shares one vocabulary between the session_status event and SessionInfo", () => {
+      expect(SessionStatus.options).toEqual(["starting", "working", "idle", "paused", "error", "done"]);
+      for (const status of SessionStatus.options) {
+        expect(SessionEvent.parse({ type: "session_status", status }).type).toBe("session_status");
+        expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...SESSION_INFO, status }] }))
+          .toMatchObject({ sessions: [{ status }] });
+      }
+    });
+
+    it("requires status and blocked on SessionInfo, and rejects a status outside the enum", () => {
+      const { status: _s, ...noStatus } = SESSION_INFO;
+      const { blocked: _b, ...noBlocked } = SESSION_INFO;
+      expect(() => ServerMessage.parse({ kind: "sessions", sessions: [noStatus] })).toThrow();
+      expect(() => ServerMessage.parse({ kind: "sessions", sessions: [noBlocked] })).toThrow();
+      expect(() => ServerMessage.parse({ kind: "sessions", sessions: [{ ...SESSION_INFO, status: "busy" }] }))
+        .toThrow();
+    });
+
+    it("carries blocked as its own flag, not folded into status", () => {
+      // "waiting on you" and "working" are different things to draw, so an agent can be both
+      // working and blocked on the wire.
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...SESSION_INFO, status: "working", blocked: true }] }))
+        .toMatchObject({ sessions: [{ status: "working", blocked: true }] });
     });
   });
 
@@ -89,7 +124,7 @@ describe("protocol", () => {
     it("lets a session belong to a room, and reports it on SessionInfo", () => {
       expect(ClientMessage.parse({ kind: "create_session", roomId: "r1" }))
         .toMatchObject({ roomId: "r1" });
-      const info = { id: "s1", state: "active", claudeSessionId: null, lastSeq: 0, autonomy: "auto" };
+      const { roomId: _omitted, ...info } = SESSION_INFO;
       // roomId is explicit on the wire: null means "not in a room", not "field forgotten"
       expect(() => ServerMessage.parse({ kind: "sessions", sessions: [info] })).toThrow();
       expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...info, roomId: null }] }))

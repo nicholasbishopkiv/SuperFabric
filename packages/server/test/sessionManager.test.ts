@@ -468,6 +468,137 @@ describe("SessionManager", () => {
     });
   });
 
+  // ---- M1a: the derived status and blocked flag the 3D floor reads off listSessions() ----
+
+  describe("derived status", () => {
+    /** An executor that emits nothing on start, so a test controls the log exactly. */
+    class SilentExecutor implements Executor {
+      readonly name = "silent";
+      start(): ExecutorHandle {
+        return {
+          providerSessionId: Promise.resolve("silent-session"),
+          send: () => {},
+          interrupt: async () => {},
+          stop: async () => {},
+        };
+      }
+    }
+
+    function silent() {
+      const db = openDb(":memory:");
+      const store = new EventStore(db);
+      const mgr = new SessionManager(db, store, new SilentExecutor(), new RoomManager(db, tmpdir()));
+      return { db, store, mgr };
+    }
+
+    const info = (mgr: SessionManager, id: string) => mgr.listSessions().find((s) => s.id === id)!;
+
+    it("reports idle for a session whose log holds no status at all", () => {
+      const { mgr } = silent();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      expect(info(mgr, id).status).toBe("idle");
+      expect(info(mgr, id).blocked).toBe(false);
+    });
+
+    it("reports idle when the log holds events but no session_status", () => {
+      const { store, mgr } = silent();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      store.append(id, { type: "user_prompt", text: "hi" });
+      store.append(id, { type: "agent_text", text: "hello" });
+      expect(info(mgr, id).status).toBe("idle");
+    });
+
+    it("reports the latest session_status, not the first", () => {
+      const { store, mgr } = silent();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      for (const status of ["starting", "working", "idle", "working"] as const) {
+        store.append(id, { type: "session_status", status });
+      }
+      expect(info(mgr, id).status).toBe("working");
+      store.append(id, { type: "session_status", status: "idle" });
+      expect(info(mgr, id).status).toBe("idle");
+    });
+
+    it("reports every status in the enum, error included", () => {
+      for (const status of ["starting", "working", "idle", "paused", "error", "done"] as const) {
+        const { store, mgr } = silent();
+        const id = mgr.createSession({ cwd: "/tmp" });
+        store.append(id, { type: "session_status", status });
+        expect(info(mgr, id).status).toBe(status);
+      }
+    });
+
+    it("does not let a later non-status event mask the status", () => {
+      const { store, mgr } = silent();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      store.append(id, { type: "session_status", status: "working" });
+      store.append(id, { type: "agent_text", text: "still going" });
+      store.append(id, { type: "turn_complete" });
+      expect(info(mgr, id).status).toBe("working");
+    });
+
+    it("keeps each session's status to itself", () => {
+      const { store, mgr } = silent();
+      const a = mgr.createSession({ cwd: "/tmp" });
+      const b = mgr.createSession({ cwd: "/tmp" });
+      store.append(a, { type: "session_status", status: "working" });
+      store.append(b, { type: "session_status", status: "error" });
+      expect(info(mgr, a).status).toBe("working");
+      expect(info(mgr, b).status).toBe("error");
+    });
+
+    it("blocks only while an approval is unresolved", () => {
+      const { store, mgr } = silent();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      expect(info(mgr, id).blocked).toBe(false);
+
+      store.append(id, { type: "approval_request", approvalId: "a1", toolName: "Bash", input: {} });
+      expect(info(mgr, id).blocked).toBe(true);
+      store.append(id, { type: "approval_resolved", approvalId: "a1", behavior: "allow" });
+      expect(info(mgr, id).blocked).toBe(false);
+    });
+
+    it("stays blocked while any one of several approvals is open", () => {
+      const { store, mgr } = silent();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      store.append(id, { type: "approval_request", approvalId: "a1", toolName: "Bash", input: {} });
+      store.append(id, { type: "approval_request", approvalId: "a2", toolName: "Write", input: {} });
+      store.append(id, { type: "approval_resolved", approvalId: "a1", behavior: "deny" });
+      expect(info(mgr, id).blocked).toBe(true);
+      store.append(id, { type: "approval_resolved", approvalId: "a2", behavior: "allow" });
+      expect(info(mgr, id).blocked).toBe(false);
+    });
+
+    it("does not let one session's resolution clear another's approval", () => {
+      const { store, mgr } = silent();
+      const a = mgr.createSession({ cwd: "/tmp" });
+      const b = mgr.createSession({ cwd: "/tmp" });
+      store.append(a, { type: "approval_request", approvalId: "shared-id", toolName: "Bash", input: {} });
+      store.append(b, { type: "approval_resolved", approvalId: "shared-id", behavior: "allow" });
+      expect(info(mgr, a).blocked).toBe(true);
+      expect(info(mgr, b).blocked).toBe(false);
+    });
+
+    it("reports blocked alongside working — waiting on the operator is not idling", () => {
+      const { store, mgr } = silent();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      store.append(id, { type: "session_status", status: "working" });
+      store.append(id, { type: "approval_request", approvalId: "a1", toolName: "Bash", input: {} });
+      expect(info(mgr, id)).toMatchObject({ status: "working", blocked: true });
+    });
+
+    it("derives status and blocked in one statement, however many sessions there are", () => {
+      const { store, mgr } = silent();
+      const ids = Array.from({ length: 5 }, () => mgr.createSession({ cwd: "/tmp" }));
+      for (const id of ids) store.append(id, { type: "session_status", status: "working" });
+      // The guard is the query count, which is not observable here; what is observable is that one
+      // call answers for every session, which is what listSessions() has to keep doing.
+      const all = mgr.listSessions();
+      expect(all).toHaveLength(5);
+      expect(all.every((s) => s.status === "working" && !s.blocked)).toBe(true);
+    });
+  });
+
   describe("stopAll", () => {
     it("stops every live executor; prompt() on a stopped session then throws", async () => {
       const { mgr } = make();

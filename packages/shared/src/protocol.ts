@@ -17,9 +17,17 @@ export type AutonomyMode = z.infer<typeof AutonomyMode>;
 /** Product default: agents run in `auto` unless someone says otherwise. */
 export const DEFAULT_AUTONOMY: AutonomyMode = "auto";
 
+/**
+ * What an agent is doing right now. The same vocabulary is used twice on purpose: as the payload of
+ * a `session_status` event (the log's record of a transition) and as the derived `status` on
+ * `SessionInfo` (the current value, so a client does not have to replay a transcript to learn it).
+ */
+export const SessionStatus = z.enum(["starting", "working", "idle", "paused", "error", "done"]);
+export type SessionStatus = z.infer<typeof SessionStatus>;
+
 // ---- events persisted in the event log and streamed to clients ----
 export const SessionEvent = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("session_status"), status: z.enum(["starting", "working", "idle", "paused", "error", "done"]), detail: z.string().optional() }),
+  z.object({ type: z.literal("session_status"), status: SessionStatus, detail: z.string().optional() }),
   z.object({ type: z.literal("agent_text"), text: z.string() }),
   z.object({ type: z.literal("agent_thinking") }),
   z.object({ type: z.literal("tool_use"), toolName: z.string(), input: z.unknown() }),
@@ -96,6 +104,17 @@ export const SessionInfo = z.object({
   autonomy: AutonomyMode,
   /** The room this agent works in, or null for a roomless session (every M0 session). */
   roomId: z.string().nullable(),
+  /**
+   * Derived from the session's own event log: the latest `session_status`, or `idle` when it has
+   * none. The 3D floor needs the *current* status of every agent, and subscribing to every session
+   * just to replay every transcript would be absurd — so the server computes it and sends it.
+   */
+  status: SessionStatus,
+  /**
+   * An `approval_request` is outstanding. "Waiting on you" is a different thing to show than
+   * "working", and like `status` it must not require a transcript replay to know.
+   */
+  blocked: z.boolean(),
 });
 export type SessionInfo = z.infer<typeof SessionInfo>;
 

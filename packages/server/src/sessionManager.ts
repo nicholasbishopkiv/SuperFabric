@@ -4,7 +4,7 @@ import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
 import type { RoomManager } from "./roomManager.js";
-import { AutonomyMode, DEFAULT_AUTONOMY, type SessionInfo } from "@superfabric/shared";
+import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
 
 /** A tool call waiting on an operator decision, bound to the session that asked. */
 interface PendingApproval {
@@ -46,9 +46,26 @@ export class SessionManager {
       session: db.prepare("SELECT id, cwd, claude_session_id, autonomy FROM sessions WHERE id = ?"),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
+      // `status` and `blocked` are derived from the log by correlated subqueries rather than a
+      // second round of queries per row, for the same reason — the 3D floor asks for this list on
+      // every status tick, so it has to stay one statement.
       listSessions: db.prepare(`
         SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
-               s.autonomy AS autonomy, s.room_id AS room_id, COALESCE(MAX(e.seq), 0) AS last_seq
+               s.autonomy AS autonomy, s.room_id AS room_id, COALESCE(MAX(e.seq), 0) AS last_seq,
+               -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
+               (SELECT json_extract(st.payload, '$.status')
+                  FROM events st
+                  WHERE st.session_id = s.id AND st.type = 'session_status'
+                  ORDER BY st.seq DESC LIMIT 1) AS status,
+               -- an approval_request with no approval_resolved carrying the same approvalId
+               EXISTS (SELECT 1
+                  FROM events req
+                  WHERE req.session_id = s.id AND req.type = 'approval_request'
+                    AND NOT EXISTS (SELECT 1
+                      FROM events res
+                      WHERE res.session_id = s.id AND res.type = 'approval_resolved'
+                        AND json_extract(res.payload, '$.approvalId')
+                            = json_extract(req.payload, '$.approvalId'))) AS blocked
         FROM sessions s LEFT JOIN events e ON e.session_id = s.id
         GROUP BY s.id ORDER BY s.created_at
       `),
@@ -250,6 +267,7 @@ export class SessionManager {
     return (this.stmts.listSessions.all() as {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
       autonomy: string; room_id: string | null; last_seq: number;
+      status: string | null; blocked: number;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
@@ -257,6 +275,8 @@ export class SessionManager {
       lastSeq: r.last_seq,
       autonomy: asAutonomy(r.autonomy),
       roomId: r.room_id,
+      status: asStatus(r.status),
+      blocked: r.blocked === 1,
     }));
   }
 }
@@ -277,4 +297,15 @@ interface SessionRow {
 function asAutonomy(value: string): AutonomyMode {
   const parsed = AutonomyMode.safeParse(value);
   return parsed.success ? parsed.data : DEFAULT_AUTONOMY;
+}
+
+/**
+ * A session with no `session_status` in its log has never reported anything, so it is `idle` — not
+ * an error and not a missing value the client has to special-case. An unrecognised stored status
+ * (hand-edited row, or a status this build predates) folds to `idle` for the same reason.
+ */
+function asStatus(value: string | null): SessionStatus {
+  if (value === null) return "idle";
+  const parsed = SessionStatus.safeParse(value);
+  return parsed.success ? parsed.data : "idle";
 }

@@ -21,13 +21,16 @@ function fakeSocket() {
  * project root the rooms live under; tests that actually create rooms pass a throwaway directory and
  * remove it afterwards.
  */
-function makeHub(opts: { script?: { tool: string; input: unknown }[]; attach?: boolean; root?: string } = {}) {
+function makeHub(opts: {
+  script?: { tool: string; input: unknown }[]; attach?: boolean; root?: string;
+  sessionsDebounceMs?: number;
+} = {}) {
   const db = openDb(":memory:");
   const store = new EventStore(db);
   const exec = new FakeExecutor(opts.script ? { script: opts.script } : {});
   const rooms = new RoomManager(db, opts.root ?? tmpdir());
   const mgr = new SessionManager(db, store, exec, rooms);
-  const hub = new WsHub(store, mgr, rooms);
+  const hub = new WsHub(store, mgr, rooms, { sessionsDebounceMs: opts.sessionsDebounceMs });
   const { sock, sent } = fakeSocket();
   if (opts.attach !== false) hub.attach(sock);
   return { db, store, exec, rooms, mgr, hub, sock, sent };
@@ -292,6 +295,213 @@ describe("WsHub", () => {
         expect(sent.every(m => m.kind === "error" && m.message === "bad message")).toBe(true);
         expect(existsSync(join(root, "..", "escape"))).toBe(false);
       });
+    });
+  });
+
+  // ---- M1a: room and session state is global, so it is broadcast, not replied ----
+
+  describe("broadcast", () => {
+    it("reaches a second attached socket when a room is created", () => {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-broadcast-"));
+      try {
+        const { hub, sock, sent, rooms } = makeHub({ root });
+        rooms.ensureProjectRoom();
+        const second = fakeSocket();
+        hub.attach(second.sock);
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_room", name: "backend" }));
+
+        for (const seen of [sent, second.sent]) {
+          const roomsMsg = seen.filter(m => m.kind === "rooms").at(-1);
+          expect(roomsMsg.rooms.map((r: any) => r.name)).toEqual([rooms.listRooms()[0].name, "backend"]);
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("reaches a second attached socket when a room moves", () => {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-broadcast-"));
+      try {
+        const { hub, sock, rooms } = makeHub({ root });
+        rooms.ensureProjectRoom();
+        const room = rooms.createRoom("backend");
+        const second = fakeSocket();
+        hub.attach(second.sock);
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "move_room", roomId: room.id, position: { x: 2, z: -4 } }));
+
+        expect(second.sent.filter(m => m.kind === "rooms").at(-1).rooms.find((r: any) => r.id === room.id).position)
+          .toEqual({ x: 2, z: -4 });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("reaches a second attached socket when a session is created", () => {
+      const { hub, sock } = makeHub();
+      const second = fakeSocket();
+      hub.attach(second.sock);
+
+      hub.handleMessage(sock, JSON.stringify({ kind: "create_session", cwd: "/tmp" }));
+
+      const sessions = second.sent.filter(m => m.kind === "sessions").at(-1).sessions;
+      expect(sessions).toHaveLength(1);
+      // the creator's auto-subscription is still its own: the other tab gets the list, not the tail
+      expect(second.sent.some(m => m.kind === "event")).toBe(false);
+    });
+
+    it("reaches a second attached socket when autonomy is switched", async () => {
+      const { hub, mgr, sock } = makeHub();
+      const id = mgr.createSession({ cwd: "/tmp", autonomy: "auto" });
+      const second = fakeSocket();
+      hub.attach(second.sock);
+
+      hub.handleMessage(sock, JSON.stringify({ kind: "set_autonomy", sessionId: id, autonomy: "bypass" }));
+      await waitFor(() => {
+        const last = second.sent.filter(m => m.kind === "sessions").at(-1);
+        if (last?.sessions.find((s: any) => s.id === id)?.autonomy !== "bypass") throw new Error("not yet");
+      });
+    });
+
+    it("sends nothing to a detached socket", () => {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-broadcast-"));
+      try {
+        const { hub, sock, rooms } = makeHub({ root });
+        rooms.ensureProjectRoom();
+        const gone = fakeSocket();
+        hub.attach(gone.sock);
+        hub.detach(gone.sock);
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_room", name: "backend" }));
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_session", cwd: "/tmp" }));
+
+        expect(gone.sent).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("drops a socket whose send throws during a broadcast, and still reaches the others", () => {
+      const { hub, sock, sent } = makeHub();
+      const dead: SocketLike = { send: () => { throw new Error("socket is dead"); } };
+      hub.attach(dead);
+      const live = fakeSocket();
+      hub.attach(live.sock);
+
+      expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "create_session", cwd: "/tmp" }))).not.toThrow();
+
+      expect(subsFor(hub).has(dead)).toBe(false);
+      expect(sent.some(m => m.kind === "sessions")).toBe(true);
+      expect(live.sent.some(m => m.kind === "sessions")).toBe(true);
+    });
+
+    it("answers a list query only to the socket that asked", () => {
+      const { hub, sock } = makeHub();
+      const second = fakeSocket();
+      hub.attach(second.sock);
+      hub.handleMessage(sock, JSON.stringify({ kind: "list_sessions" }));
+      hub.handleMessage(sock, JSON.stringify({ kind: "list_rooms" }));
+      expect(second.sent).toHaveLength(0);
+    });
+
+    it("keeps an error on the socket that caused it", () => {
+      const { hub, sock, sent } = makeHub();
+      const second = fakeSocket();
+      hub.attach(second.sock);
+      hub.handleMessage(sock, JSON.stringify({ kind: "prompt", sessionId: "nope", text: "hi" }));
+      expect(sent.filter(m => m.kind === "error")).toHaveLength(1);
+      expect(second.sent).toHaveLength(0);
+    });
+  });
+
+  // ---- the status broadcast: pushed from the log, coalesced, newest state ----
+
+  describe("session status broadcast", () => {
+    const DEBOUNCE_MS = 20;
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+    /**
+     * A hub with one session and a *freshly attached* watcher socket. Creating a session already
+     * appends a `session_status`, which schedules a broadcast; waiting the window out first means
+     * every message the watcher sees was caused by the case itself.
+     */
+    async function withWatcher() {
+      const ctx = makeHub({ sessionsDebounceMs: DEBOUNCE_MS });
+      const id = ctx.mgr.createSession({ cwd: "/tmp" });
+      await sleep(DEBOUNCE_MS * 3);
+      const watcher = fakeSocket();
+      ctx.hub.attach(watcher.sock);
+      const broadcasts = () => watcher.sent.filter(m => m.kind === "sessions");
+      const session = () => broadcasts().at(-1)?.sessions.find((s: any) => s.id === id);
+      return { ...ctx, id, watcher, broadcasts, session };
+    }
+
+    it("pushes a sessions message when a status event lands, without a subscription", async () => {
+      const { store, id, watcher, session } = await withWatcher();
+      store.append(id, { type: "session_status", status: "working" });
+      await waitFor(() => {
+        if (session()?.status !== "working") throw new Error("not yet");
+      });
+      // the watcher never subscribed, so it must not be getting the transcript
+      expect(watcher.sent.some(m => m.kind === "event")).toBe(false);
+    });
+
+    it("coalesces rapid status changes into one broadcast carrying the newest state", async () => {
+      const { store, id, broadcasts, session } = await withWatcher();
+      store.append(id, { type: "session_status", status: "starting" });
+      store.append(id, { type: "session_status", status: "working" });
+      store.append(id, { type: "session_status", status: "idle" });
+
+      await waitFor(() => {
+        if (broadcasts().length === 0) throw new Error("not yet");
+      });
+      // let further windows pass, to prove no trailing duplicates queued up behind the first
+      await sleep(DEBOUNCE_MS * 4);
+
+      expect(broadcasts()).toHaveLength(1);
+      expect(session().status).toBe("idle");
+    });
+
+    it("pushes blocked when an approval opens and again when it resolves", async () => {
+      const { store, id, session } = await withWatcher();
+      store.append(id, { type: "approval_request", approvalId: "a1", toolName: "Bash", input: {} });
+      await waitFor(() => {
+        if (session()?.blocked !== true) throw new Error("not yet");
+      });
+
+      store.append(id, { type: "approval_resolved", approvalId: "a1", behavior: "allow" });
+      await waitFor(() => {
+        if (session()?.blocked !== false) throw new Error("not yet");
+      });
+    });
+
+    it("does not broadcast the session list for agent output", async () => {
+      const { store, id, broadcasts } = await withWatcher();
+      for (let i = 0; i < 50; i++) store.append(id, { type: "agent_text", text: `token ${i}` });
+      store.append(id, { type: "turn_complete" });
+      store.append(id, { type: "tool_use", toolName: "Read", input: {} });
+      await sleep(DEBOUNCE_MS * 4);
+
+      expect(broadcasts()).toHaveLength(0);
+    });
+
+    it("broadcasts a session_error so a floor with no subscription still shows the failure", async () => {
+      const { store, id, broadcasts, session } = await withWatcher();
+      store.append(id, { type: "session_error", message: "boom" });
+      await waitFor(() => {
+        if (broadcasts().length === 0) throw new Error("not yet");
+      });
+      expect(session().id).toBe(id);
+    });
+
+    it("does not keep the process alive: the pending timer is unref'd", async () => {
+      const { store, id, hub } = await withWatcher();
+      store.append(id, { type: "session_status", status: "working" });
+      const timer = (hub as unknown as { sessionsTimer: { hasRef?: () => boolean } | null }).sessionsTimer;
+      expect(timer).not.toBeNull();
+      // Bun's Timer exposes hasRef() like Node's; an unref'd timer reports false.
+      expect(timer!.hasRef?.()).toBe(false);
     });
   });
 
