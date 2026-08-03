@@ -3,6 +3,7 @@ import type {
   MessageKind,
   ProjectInfo,
   RoomInfo,
+  SavedAttachment,
   ScenePosition,
   ServerMessage,
   SessionEvent,
@@ -90,6 +91,25 @@ export interface WaitingMessage {
 export interface RoomDrag {
   roomId: string;
   position: ScenePosition;
+}
+
+/**
+ * A file that is on disk and waiting to be named in the next turn.
+ *
+ * Staged rather than sent, because the operator who just dropped a screenshot almost always wants
+ * to say something about it. The chip is removable for the same reason — dropping the wrong file
+ * must not force them to send it. Unstaging does **not** delete the file: it is the operator's file,
+ * in the operator's repository, and deleting their data because they changed their mind about
+ * mentioning it would be the wrong kind of tidy.
+ *
+ * `path` is the identity: the server never overwrites, so no two staged files share one.
+ */
+export interface StagedAttachment {
+  /** Absolute path on disk — this is what goes into the turn text. */
+  path: string;
+  /** The name the file actually got, which may not be the one the browser sent. */
+  name: string;
+  bytes: number;
 }
 
 /** The edges an overlay panel can cover. The top is deliberately free: nothing lives there. */
@@ -197,8 +217,21 @@ export interface FabricState {
   contiguousSeq: Record<string, number>;
   /** sessionId -> a gap was seen; the ws client owes this session a resubscribe. */
   needsResync: Record<string, boolean>;
+  /**
+   * Files written to disk and waiting to be named in the next turn. See `StagedAttachment`; the
+   * composer turns them into lines of turn text when the message is finally sent.
+   */
+  staged: StagedAttachment[];
+  /** An upload is in flight. The composer says so rather than looking like nothing happened. */
+  uploading: boolean;
   connected: boolean;
   lastError: string | null;
+  /**
+   * The server's last `notice`: "this worked, and here is what happened" — where a file landed,
+   * what a re-pointed room now means. Separate from `lastError` because they are different facts
+   * and must not be painted the same colour.
+   */
+  lastNotice: string | null;
   apply(msg: ServerMessage): void;
   setConnected(connected: boolean): void;
   selectRoom(roomId: string | null): void;
@@ -212,6 +245,20 @@ export interface FabricState {
    * otherwise the second attempt looks like it failed the same way.
    */
   clearError(): void;
+  /** Report a client-side failure (a failed upload) on the same channel as a server error. */
+  setError(message: string): void;
+  /** Forget the last notice, so a stale "saved to …" does not sit under the next thing. */
+  clearNotice(): void;
+  setUploading(uploading: boolean): void;
+  /**
+   * Add what an upload just wrote to the composer. Idempotent by path: a double-fired drop event
+   * (they happen) must not chip the same file twice, and the server never reuses a path.
+   */
+  stageAttachments(saved: readonly SavedAttachment[]): void;
+  /** Take one chip back out. The file stays on disk — it is the operator's. */
+  unstageAttachment(path: string): void;
+  /** Empty the composer's attachment row, which is what sending a turn does. */
+  clearStagedAttachments(): void;
   /**
    * Start dragging a building. `position` is where it stands right now, so the first frame of the
    * drag is identical to the last frame before it and the building never jumps on pointer-down.
@@ -280,6 +327,11 @@ const EMPTY_PROJECT_STATE = {
   needsResync: {} as Record<string, boolean>,
   // An error about the factory we just left would sit under whatever the operator does next.
   lastError: null as string | null,
+  lastNotice: null as string | null,
+  // A staged path points into the folder of the factory we have just left, and the composer it was
+  // staged for belongs to a session on that floor. Carrying it across would name a file at an agent
+  // that cannot see it.
+  staged: [] as StagedAttachment[],
 } as const;
 
 /** Everything except the actions — exported so tests can reset between cases. */
@@ -305,8 +357,11 @@ export const initialFabricState = {
   lastSeq: {} as Record<string, number>,
   contiguousSeq: {} as Record<string, number>,
   needsResync: {} as Record<string, boolean>,
+  staged: [] as StagedAttachment[],
+  uploading: false,
   connected: false,
   lastError: null as string | null,
+  lastNotice: null as string | null,
 };
 
 /** Highest seq reachable from `start` with no hole. `rows` must be sorted ascending. */
@@ -535,6 +590,9 @@ export const useFabric = create<FabricState>((set, get) => ({
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
       if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
       if (msg.kind === "error") return { lastError: msg.message };
+      // Not an error, and deliberately not stored with them: "saved to /p/attachments/a.png" is the
+      // server confirming something worked, and painting it red would be a lie.
+      if (msg.kind === "notice") return { lastNotice: msg.message };
       if (msg.kind !== "event") return s;
 
       const { sessionId, seq } = msg;
@@ -587,6 +645,29 @@ export const useFabric = create<FabricState>((set, get) => ({
   requestCameraFit: () => set((s) => ({ fitRequests: s.fitRequests + 1 })),
 
   clearError: () => set((s) => (s.lastError === null ? s : { lastError: null })),
+
+  setError: (message) => set((s) => (s.lastError === message ? s : { lastError: message })),
+
+  clearNotice: () => set((s) => (s.lastNotice === null ? s : { lastNotice: null })),
+
+  setUploading: (uploading) => set((s) => (s.uploading === uploading ? s : { uploading })),
+
+  stageAttachments: (saved) =>
+    set((s) => {
+      const known = new Set(s.staged.map((a) => a.path));
+      const added = saved
+        .filter((a) => !known.has(a.path))
+        .map((a) => ({ path: a.path, name: a.name, bytes: a.bytes }));
+      return added.length === 0 ? s : { staged: [...s.staged, ...added] };
+    }),
+
+  unstageAttachment: (path) =>
+    set((s) => {
+      const staged = s.staged.filter((a) => a.path !== path);
+      return staged.length === s.staged.length ? s : { staged };
+    }),
+
+  clearStagedAttachments: () => set((s) => (s.staged.length === 0 ? s : { staged: [] })),
 
   beginRoomDrag: (roomId, position) => set({ drag: { roomId, position } }),
 
@@ -807,6 +888,9 @@ export const useBeltDirections = (roomId: string): number[] =>
   useFabric(useShallow((s) => beltDirections(s, roomId)));
 
 export const useSelectedRoomId = (): string | null => useFabric((s) => s.selectedRoomId);
+
+/** The composer's attachment row. See `StagedAttachment`. */
+export const useStagedAttachments = (): StagedAttachment[] => useFabric((s) => s.staged);
 
 export const useHudInsets = (): HudInsets => useFabric(useShallow((s) => s.hudInsets));
 

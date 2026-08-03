@@ -70,6 +70,12 @@ the server as a local privileged tool:
   (comma-separated); every other `Origin` is rejected with 403 and logged. Requests with **no**
   `Origin` header are allowed, because non-browser clients (CLI tools, scripts) send none while
   browsers always do.
+- **The attachment upload endpoint is gated by the same allow-list.** `POST /attachments`
+  writes files into your repository, so it is exactly as strict as the WebSocket handshake:
+  the same origins, 403 for anything else, checked before the body is read. Filenames from
+  the browser are folded to a single safe path segment, the resolved path is verified to be
+  inside the destination folder, nothing is ever overwritten (a taken name becomes
+  `shot-2.png`), and a file over 25 MB is refused.
 - **There is no authentication.** Anyone who can run code on the machine — or on any host you
   add to `SUPERFABRIC_ALLOWED_ORIGINS` — can drive your agents and approve their tool calls.
   Don't run SuperFabric on a shared host, and don't expose the port through a tunnel.

@@ -115,9 +115,10 @@ out in the README so users know what they're installing.
 
 Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folders and the 3D
 floor)**, **M3a (the factory bus, tasks, and packages that ride real messages)** and the structural
-half of **M1b (several projects in one server, settable room folders)** are complete — see
-`docs/ROADMAP.md` for the acceptance evidence of each. Still open in M1b: attachments (files in,
-paths out) and the shadcn/ui rebuild of the HUD (`docs/decisions/0003-ui-library.md`). Then
+half of **M1b (several projects in one server, settable room folders, attachments — files in, paths
+out)** are complete — see
+`docs/ROADMAP.md` for the acceptance evidence of each. Still open in M1b: the shadcn/ui rebuild of
+the HUD (`docs/decisions/0003-ui-library.md`). Then
 **M3b — the orchestrator and task auto-routing**, the rest of M1 (roles library, onboarding agent)
 and M2 (multi-account and the limit monitor).
 
@@ -167,12 +168,19 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
   each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
   `busTools.ts` (the bus as an in-process MCP server, one per session's room) ·
-  `taskStore.ts` (the task board; announces its own changes) · `wsHub.ts` (replay-then-tail plus
-  debounced `sessions`/`rooms`/`tasks`/`messages` broadcasts) · `index.ts` (wiring only) ·
+  `taskStore.ts` (the task board; announces its own changes) ·
+  `attachmentStore.ts` (files in, paths out: filename sanitising, MIME→extension, containment
+  against whichever root the file is going into, and never overwriting) ·
+  `attachmentRoutes.ts` (`POST /attachments`, multipart, behind the **same** origin allow-list as
+  the WebSocket handshake) · `wsHub.ts` (replay-then-tail plus
+  debounced `sessions`/`rooms`/`tasks`/`messages` broadcasts, and `notice` for "it worked") ·
+  `index.ts` (wiring only) ·
   `notes/agent-sdk-api.md` (verified SDK API reference — trust it over memory).
   Its tests run under `bun test` (`test/_waitFor.ts` replaces `vi.waitFor`); `packages/shared`
   and `packages/web` stay on vitest.
 - `packages/web` — `store.ts` (zustand: dedupes replays, and turns the bus's message snapshot into
   packages and waiting crates) · `wsClient.ts` (reconnect + resubscribe from `lastSeq`) ·
+  `attachments.ts` (upload over HTTP, stage the returned paths, and `composeTurn` — the pure
+  function that decides what an agent is actually told about a file) ·
   `App.tsx` (the 3D floor plus three HUD edges) · `scene/*` (the floor) · `hud/*` (room panel,
-  console drawer, task board).
+  console drawer, task board, window-wide paste/drop target).

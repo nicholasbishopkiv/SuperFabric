@@ -210,11 +210,32 @@ Protocol types: WS envelopes, event payloads, bus message schema, task schema. Z
   containment check that protects the default case does not apply to an explicitly chosen
   folder; adopting one never overwrites an existing `CLAUDE.md`.
 - **AttachmentStore** — files arrive from the browser by paste, drop or upload and are
-  written into the project (or the selected room's) folder under a predictable
-  subdirectory. **The agent is given the path, never the bytes**: an attachment becomes a
-  line in the injected turn pointing at a file on disk, which is what an agent with file
-  tools actually wants and what keeps the event log small. Clipboard images get a
-  generated name and a real extension sniffed from the payload.
+  written into `<project or room folder>/attachments/`. **The agent is given the path, never
+  the bytes**: an attachment becomes a line in the injected turn (`Attached file: <absolute
+  path>`) pointing at a file on disk, which is what an agent with file tools actually wants
+  and what keeps the event log small. Clipboard images get a generated name
+  (`pasted-<timestamp>.<ext>`) with a real extension taken from the declared MIME type.
+  Details that are decisions, not implementation:
+  - **Transport is `POST /attachments`, not the WebSocket.** The socket's protocol is JSON
+    and its `maxPayload` is deliberately 1 MiB, so binary there would mean base64 in one
+    giant frame. Fastify is already listening on the same port.
+  - **The endpoint is gated exactly as hard as the WebSocket handshake**: the same
+    `origin.ts` allow-list (403 on a disallowed browser `Origin`, checked in `onRequest`
+    before the body is read), a 25 MB per-file cap enforced three times (`content-length`,
+    the streaming multipart limit, the real byte count), an untrusted filename folded to one
+    safe path segment, the resolved path re-checked against the destination root, and no
+    overwriting ever — a taken name is uniquified (`shot-2.png`).
+  - **Containment is against the room's own root.** A room folder may live outside the
+    project root, so there is no single directory to validate against; each write is checked
+    against the root it is going into.
+  - **Multipart is parsed by `@fastify/multipart`**, not by Bun's own `Request.formData()`:
+    Bun's discards each part's `Content-Type` and re-derives it from the filename extension,
+    which is exactly backwards for a clipboard image (no filename, type is all there is).
+- **`notice` on the wire.** The protocol had one channel for talking to the operator —
+  `error` — so every "this worked, here is what happened" either travelled on it (a
+  successful `set_room_path` once did, painted red) or was guessed at by the UI. A
+  `notice {message}` server message now carries both that and "attachment saved to `<path>`".
+  Not persisted: it is a fact about the request that just completed, not an event in a log.
 
 ## 3. Filesystem contract
 
@@ -222,9 +243,11 @@ Protocol types: WS envelopes, event payloads, bus message schema, task schema. Z
 <project-root>/
   CLAUDE.md                  # project-wide context (Onboarder creates if missing)
   .fabrica/                  # factory state: fabrica.db (SQLite), layout.json, accounts.json (no secrets)
+  attachments/               # files the operator pasted, dropped or uploaded at the project
   backend/                   # a room
     CLAUDE.md                # room charter: responsibility, interfaces, conventions
     .claude/agents/*.md      # room subagents, skills
+    attachments/             # …or at this room, when it was the selected one
     ...code...
   frontend/ ...
 ```

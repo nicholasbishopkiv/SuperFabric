@@ -1,7 +1,8 @@
 import type { AutonomyMode, SessionEvent } from "@superfabric/shared";
 import { useEffect, useRef, useState } from "react";
+import { composeTurn, uploadIntoComposer } from "../attachments";
 import type { EventRow } from "../store";
-import { useFabric } from "../store";
+import { useFabric, useStagedAttachments } from "../store";
 import { send, subscribe } from "../wsClient";
 import { AutonomySelect, BypassWarning } from "./AutonomySelect";
 import { ModelNote, ModelSelect } from "./ModelSelect";
@@ -60,6 +61,67 @@ function PackageSender() {
   );
 }
 
+/** Human-sized byte count for a chip's tooltip. */
+function humanBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} kB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * The composer's attachment row: one removable chip per file already written to disk.
+ *
+ * They are files, not pending uploads — the bytes landed before the chip appeared — so removing one
+ * takes it out of the *message*, not off the disk. The chip's title is the absolute path, because
+ * that is literally what the agent will be told.
+ */
+function StagedRow() {
+  const staged = useStagedAttachments();
+  const unstage = useFabric((s) => s.unstageAttachment);
+  const uploading = useFabric((s) => s.uploading);
+
+  if (staged.length === 0 && !uploading) return null;
+
+  return (
+    <div
+      data-testid="staged-attachments"
+      style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginTop: 8 }}
+    >
+      {staged.map((a) => (
+        <span
+          key={a.path}
+          title={`${a.path} · ${humanBytes(a.bytes)}`}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            maxWidth: "100%",
+            padding: "2px 4px 2px 8px",
+            borderRadius: 12,
+            border: `1px solid ${C.accent}`,
+            background: "#e6fbff",
+            fontSize: 12,
+          }}
+        >
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            📎 {a.name}
+          </span>
+          <button
+            type="button"
+            aria-label={`Remove ${a.name}`}
+            title="Take it out of the message — the file stays on disk"
+            onClick={() => unstage(a.path)}
+            style={{ font: "inherit", lineHeight: 1, padding: "0 4px", cursor: "pointer" }}
+          >
+            ×
+          </button>
+        </span>
+      ))}
+      {uploading && <span style={{ color: C.dim, fontSize: 12 }}>saving…</span>}
+    </div>
+  );
+}
+
 /**
  * The M0 console, moved verbatim out of `App.tsx` and demoted to an overlay: the 3D floor is the
  * primary surface now, and this is the drawer you open to talk to one agent. Its behavior is
@@ -74,8 +136,13 @@ export function ConsoleDrawer() {
   const connected = useFabric((s) => s.connected);
   const lastError = useFabric((s) => s.lastError);
 
+  const lastNotice = useFabric((s) => s.lastNotice);
+  const staged = useStagedAttachments();
+  const clearStaged = useFabric((s) => s.clearStagedAttachments);
+
   const [active, setActive] = useState<string | null>(null);
   const [input, setInput] = useState("");
+  const fileInput = useRef<HTMLInputElement>(null);
   const [newAutonomy, setNewAutonomy] = useState<AutonomyMode>("auto");
   /** The model the *next* session is created on; null leaves it on the CLI's own default. */
   const [newModel, setNewModel] = useState<string | null>(null);
@@ -130,10 +197,15 @@ export function ConsoleDrawer() {
 
   function submitPrompt(e: React.FormEvent): void {
     e.preventDefault();
-    const text = input.trim();
-    if (active === null || text === "") return;
+    if (active === null) return;
+    // The staged paths become lines of the turn: the agent is handed a file on disk, not bytes.
+    // `null` means there was neither text nor an attachment — a send with only attachments is a
+    // real thing to want and is allowed.
+    const text = composeTurn(input, staged);
+    if (text === null) return;
     send({ kind: "prompt", sessionId: active, text });
     setInput("");
+    clearStaged();
   }
 
   const canSend = connected && active !== null;
@@ -266,17 +338,50 @@ export function ConsoleDrawer() {
         ))}
       </div>
 
-      <form onSubmit={submitPrompt} style={{ display: "flex", gap: 6, marginTop: 12 }}>
-        <input
-          name="prompt"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder={active === null ? "Create a session first…" : "Message the agent…"}
-          style={{ flex: 1, padding: "6px 8px", font: "inherit" }}
-        />
-        <button type="submit" disabled={!canSend}>
-          Send
-        </button>
+      <form onSubmit={submitPrompt} style={{ marginTop: 12 }}>
+        <div style={{ display: "flex", gap: 6 }}>
+          <input
+            name="prompt"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={active === null ? "Create a session first…" : "Message the agent…"}
+            style={{ flex: 1, minWidth: 0, padding: "6px 8px", font: "inherit" }}
+          />
+          {/* The third way in, next to paste and drop — and the only one that works when the
+              operator's hands are already on the keyboard and the file is in a folder. */}
+          <button
+            type="button"
+            onClick={() => fileInput.current?.click()}
+            disabled={!connected}
+            title="Save a file into the project (or the selected room) and attach its path"
+          >
+            📎 Attach
+          </button>
+          <input
+            ref={fileInput}
+            type="file"
+            multiple
+            aria-label="Attach files"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const files = [...(e.target.files ?? [])];
+              // Reset first: picking the same file twice in a row fires no change event otherwise.
+              e.target.value = "";
+              void uploadIntoComposer(files);
+            }}
+          />
+          <button type="submit" disabled={!canSend || (input.trim() === "" && staged.length === 0)}>
+            Send
+          </button>
+        </div>
+        <StagedRow />
+        {/* Where the file landed. Green, because it is the server saying something worked — the
+            protocol's `notice`, not its `error`. */}
+        {lastNotice !== null && (
+          <div style={{ color: C.ok, fontSize: 12, marginTop: 6, wordBreak: "break-all" }}>
+            {lastNotice}
+          </div>
+        )}
       </form>
       </div>
     </div>

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { AttachmentDrop } from "./hud/AttachmentDrop";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
 import { FitButton } from "./hud/FitButton";
 import { ProjectSwitcher } from "./hud/ProjectSwitcher";
@@ -30,6 +31,10 @@ export default function App() {
       <ProjectSwitcher />
       {/* Last, so it paints over the panel's own corner. */}
       <FitButton />
+      {/* Not a panel: a window-wide paste/drop surface that only draws anything while a file is
+          actually being dragged in. It lives here because a drop belongs to the app, not to a
+          rectangle of it. */}
+      <AttachmentDrop />
     </>
   );
 }

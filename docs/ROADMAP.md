@@ -67,10 +67,13 @@ things into it.
 - [x] **Per-room working folder.** A room defaults to `<project>/<name>/`, but the folder is
       settable: a department may live in a separate repository. Adopting an existing folder
       must never overwrite its `CLAUDE.md` (the invariant already holds — keep it).
-- [ ] **Files in, paths out.** Paste from the clipboard, drop onto the window, or upload.
-      The file is written into the project (or the selected room's) folder and the agent
+- [x] **Files in, paths out.** Paste from the clipboard, drop onto the window, or upload.
+      The file is written into `<project or room folder>/attachments/` and the agent
       receives **the path**, not the bytes — a colleague handed a file on disk. Images
-      pasted from the clipboard get a sensible generated name and extension.
+      pasted from the clipboard get a sensible generated name and extension. Transport is
+      `POST /attachments` (multipart), behind the *same* origin allow-list as the WebSocket;
+      the saved paths are staged as chips in the composer and folded into the turn text when
+      the operator sends. A new `notice` server message says where each file landed.
 - [ ] **A real UI.** Rebuild the HUD on a component library instead of hand-rolled inline
       styles, so the panels look designed rather than assembled. Choice and reasoning:
       `docs/decisions/0003-ui-library.md`.
@@ -84,6 +87,20 @@ folder outside the project root adopted an existing repository without touching 
 and the agent started there recorded that folder as its `cwd`. Re-pointing that room left the
 running agent's `cwd` alone across a server restart, which is what the panel warns about.
 539 tests green (shared 39, server 297 + 1 skipped live-quota test, web 203).
+
+**Acceptance run for attachments (2026-08-04, no agent prompted)**: dropping a file on the window
+raised the drop target, saved it to `<project>/attachments/`, staged a chip and produced the green
+notice carrying the absolute path; the explicit `📎 Attach` input did the same; a paste carrying an
+image blob with no filename landed as `pasted-2026-08-03T23-23-08-592Z.png`. With a room selected
+the next attachment went into that room's folder, and after re-pointing the room *outside* the
+project root it went there instead — the notice for that re-point is now a `notice`, not an
+`error`. Sending composed the turn as `have a look at this crash\n\nAttached file: …/bug-report.png`
+and the event log recorded exactly that (read from the log; the executor was the FakeExecutor, so
+no quota was spent and no real agent was prompted). A send with attachments and no text was
+accepted. `curl` against the running server: a disallowed `Origin` got 403 with nothing written, a
+non-browser request with no `Origin` was accepted, a 30 MB file got 413, and a repeated name
+uniquified to `uploaded-spec-2.md`. 637 tests green (shared 46, server 360 + 1 skipped live-quota
+test, web 231).
 
 ## M2 — Multi-account and the limit monitor
 
