@@ -30,7 +30,7 @@ const LABEL_COLOR = "#1c1c1c";
  * How far outside the building the selection rim is drawn. Small: a rim is a rim, and a thick one
  * turns the building back into a coloured blob.
  */
-const RIM_SCALE = 1.04;
+const RIM_SCALE = 1.028;
 
 /** The skirt at a building's base: this much wider than the walls, and this tall. */
 const PLINTH_OVERHANG = 0.5;
@@ -300,9 +300,11 @@ function SelectionRim({ width, height }: { width: number; height: number }) {
         <boxGeometry args={[width, height, width]} />
         <meshBasicMaterial color={SELECT_COLOR} side={BackSide} toneMapped={false} />
       </mesh>
+      {/* Hugging the footprint's corners (a square of half-width h has its corners at 1.41h), so the
+          ring reads as belonging to this building rather than as a circle drawn near it. */}
       <mesh rotation-x={-Math.PI / 2} position-y={0.03}>
-        <ringGeometry args={[width * 0.86, width * 0.96, 64]} />
-        <meshBasicMaterial color={SELECT_COLOR} toneMapped={false} transparent opacity={0.9} />
+        <ringGeometry args={[width * 0.78, width * 0.85, 64]} />
+        <meshBasicMaterial color={SELECT_COLOR} toneMapped={false} transparent opacity={0.75} />
       </mesh>
     </>
   );
