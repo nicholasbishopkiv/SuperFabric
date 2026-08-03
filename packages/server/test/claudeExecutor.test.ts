@@ -311,6 +311,25 @@ describe("ClaudeCodeExecutor", () => {
     expect(o.abortController).toBeInstanceOf(AbortController);
   });
 
+  it("owns its own configuration instead of inheriting the operator's global setup", () => {
+    const fq = makeFakeQuery();
+    const exec = new ClaudeCodeExecutor({ query: fq.fn });
+    exec.start({ cwd: "/repo" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+    const o = fq.options()!;
+    // Explicit mode: a user-level "bypassPermissions" default would otherwise silence approvals.
+    expect(o.permissionMode).toBe("default");
+    // "user" excluded so the operator's personal hooks/model/permission rules stay out of
+    // factory agents; project/local stay because a room's own config lives in its folder.
+    expect(o.settingSources).toEqual(["project", "local"]);
+  });
+
+  it("allows a room to opt into an autonomous permission mode", () => {
+    const fq = makeFakeQuery();
+    const exec = new ClaudeCodeExecutor({ permissionMode: "bypassPermissions", query: fq.fn });
+    exec.start({ cwd: "/repo" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+    expect(fq.options()!.permissionMode).toBe("bypassPermissions");
+  });
+
   it("omits optional Options when no defaults are given", () => {
     const fq = makeFakeQuery();
     const exec = new ClaudeCodeExecutor({ query: fq.fn });

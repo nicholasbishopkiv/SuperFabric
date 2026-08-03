@@ -21,6 +21,12 @@ export interface ClaudeCodeExecutorOptions {
   configDir?: string;
   /** Appended to the claude_code system-prompt preset. */
   appendSystemPrompt?: string;
+  /**
+   * Permission mode for this session. Defaults to "default" (every gated tool call goes
+   * through canUseTool → an operator approval card). Rooms running autonomously pass
+   * "bypassPermissions" — only meaningful once sessions are sandboxed.
+   */
+  permissionMode?: NonNullable<Options["permissionMode"]>;
   /** Test seam: defaults to the SDK's query(). */
   query?: QueryFn;
 }
@@ -93,6 +99,18 @@ export class ClaudeCodeExecutor implements Executor {
     const options: Options = {
       cwd: opts.cwd,
       abortController: abort,
+      // SuperFabric owns an agent's configuration; it does not inherit the operator's personal
+      // Claude Code setup. Being explicit matters for both fields:
+      //   permissionMode — a user-level `defaultMode: "bypassPermissions"` would otherwise
+      //     disable gating entirely and the approval cards would never fire. (Note "auto" still
+      //     gates genuinely dangerous calls, and the CLI auto-allows safe commands like `echo`
+      //     in every mode — canUseTool is consulted only for calls the CLI would ask about.)
+      //   settingSources — dropping "user" keeps the operator's global hooks, model default and
+      //     permission rules out of factory agents, so a room behaves the same on any machine.
+      //     "project"/"local" stay because a room's own CLAUDE.md, skills and agents live in its
+      //     folder and are meant to apply.
+      permissionMode: this.defaults.permissionMode ?? "default",
+      settingSources: ["project", "local"],
       canUseTool: async (toolName, input): Promise<PermissionResult> => {
         const behavior = await ev.requestApproval(toolName, input);
         // SessionManager owns approval_request/approval_resolved events; don't double-emit here.
