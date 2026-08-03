@@ -1208,8 +1208,64 @@ describe("WsHub", () => {
         hub.handleMessage(sock, JSON.stringify({ kind: "set_room_path", roomId: room.id, path: "relative/dir" }));
         hub.handleMessage(sock, JSON.stringify({ kind: "set_room_path", roomId: "nope", path: tmpdir() }));
         expect(sent.filter((m) => m.kind === "error")).toHaveLength(2);
+        expect(sent.some((m) => m.kind === "notice")).toBe(false);
         expect(rooms.getRoom(room.id)!.path).toBe(room.path);
       });
+    });
+
+    it("reports the successful re-point on the notice channel, not the error one", () => {
+      withRoot(({ hub, rooms, sock, sent }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-hub-elsewhere-"));
+        try {
+          const room = rooms.createRoom("backend");
+          sent.length = 0;
+          hub.handleMessage(sock, JSON.stringify({ kind: "set_room_path", roomId: room.id, path: elsewhere }));
+
+          const notice = sent.find((m) => m.kind === "notice");
+          expect(notice).toBeDefined();
+          expect(notice.message).toContain(elsewhere);
+          // the two things the operator has to know about a re-point, said by the server itself
+          expect(notice.message).toMatch(/nothing was moved/);
+          expect(notice.message).toMatch(/keep the folder they started in/);
+          expect(sent.some((m) => m.kind === "error")).toBe(false);
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+  });
+
+  describe("notices", () => {
+    it("noticeProject reaches only the tabs on that floor", () => {
+      const { hub, projects, sock, sent } = makeHub();
+      const home = projects.defaultProject().id;
+      const awayRoot = mkdtempSync(join(tmpdir(), "superfabric-hub-away-"));
+      try {
+        const away = projects.create({ root: awayRoot }).id;
+        const other = fakeSocket();
+        hub.attach(other.sock);
+        hub.handleMessage(other.sock, JSON.stringify({ kind: "open_project", projectId: away }));
+        sent.length = 0;
+        other.sent.length = 0;
+
+        hub.noticeProject(home, "attachment saved to /tmp/x/attachments/a.png");
+
+        expect(sent).toEqual([
+          { kind: "notice", message: "attachment saved to /tmp/x/attachments/a.png" },
+        ]);
+        // a tab watching another factory has no business hearing about this one's files
+        expect(other.sent).toEqual([]);
+      } finally {
+        rmSync(awayRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("drops a socket a notice cannot be written to", () => {
+      const { hub, projects } = makeHub({ attach: false });
+      const dead: SocketLike = { send: () => { throw new Error("closed"); } };
+      hub.attach(dead);
+      hub.noticeProject(projects.defaultProject().id, "anything");
+      expect(subsFor(hub).has(dead)).toBe(false);
     });
   });
 });

@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import Fastify from "fastify";
 import { WebSocketServer, type WebSocket } from "ws";
+import { registerAttachmentRoutes } from "./attachmentRoutes.js";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
 import { FactoryBus } from "./factoryBus.js";
@@ -61,12 +62,22 @@ else console.log("no sessions to resume");
 const carried = projects.list().flatMap((p) => rooms.listRooms(p.id)).flatMap((r) => bus.flushRoom(r.id));
 if (carried.length > 0) console.log(`delivered ${carried.length} message(s) queued before the restart`);
 
-const app = Fastify();
-app.get("/healthz", async () => ({ ok: true }));
-
 const port = Number(process.env.PORT ?? 4620);
 const host = "127.0.0.1";
 const wsPath = "/ws";
+
+const app = Fastify();
+app.get("/healthz", async () => ({ ok: true }));
+
+// Files in, paths out. The only endpoint that takes bytes, and it is gated by the same origin
+// allow-list as the WebSocket handshake — see attachmentRoutes.ts for why it is HTTP at all.
+registerAttachmentRoutes(app, {
+  projects,
+  rooms,
+  port,
+  allowedOrigins: process.env.SUPERFABRIC_ALLOWED_ORIGINS,
+  notify: (projectId, message) => hub.noticeProject(projectId, message),
+});
 
 await app.listen({ port, host });
 

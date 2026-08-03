@@ -214,15 +214,21 @@ export class WsHub {
           this.broadcastRooms();
           break;
         // Re-point a room. Agents already running there keep the cwd their SDK session was started
-        // with, which the operator has to know — but that is a fact about the room, not a failure of
-        // this request, so it is said by the panel next to the folder rather than pushed back down
-        // the one channel this protocol has for errors. Sending it as an `error` would label a
-        // successful change as a failed one, which is worse than saying nothing.
-        case "set_room_path":
+        // with, which the operator has to know — and that is a fact about a *successful* change, so
+        // it goes out as a `notice`. It used to travel on the `error` channel (labelling a success
+        // as a failure) and was then only said by the panel; now the protocol has the right channel
+        // for it, the server says it itself.
+        case "set_room_path": {
           this.requireRoomOnFloor(sock, msg.roomId);
-          this.rooms.setPath(msg.roomId, msg.path);
+          const room = this.rooms.setPath(msg.roomId, msg.path);
           this.broadcastRooms();
+          this.safeSend(sock, {
+            kind: "notice",
+            message: `room ${room.name} now works in ${room.path} — nothing was moved, and agents `
+              + "already running keep the folder they started in",
+          });
           break;
+        }
         case "list_rooms":
           this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms(this.activeProject(sock)) });
           break;
@@ -319,6 +325,21 @@ export class WsHub {
   private broadcastMessages(): void {
     if (this.bus === undefined) return;
     this.broadcastPerProject((p) => ({ kind: "messages", messages: this.bus!.list(p) }));
+  }
+
+  /**
+   * Tell every tab on one factory floor that something worked.
+   *
+   * Used by the attachment endpoint, which has no socket of its own: an upload arrives over HTTP and
+   * the operator has to learn *where the file landed*, in the tab they are looking at. Addressed by
+   * project for the same reason every other push is — a tab watching another factory has no business
+   * hearing about this one's files.
+   */
+  noticeProject(projectId: string, message: string): void {
+    for (const sock of [...this.subs.keys()]) {
+      if (this.activeProject(sock) !== projectId) continue;
+      if (!this.safeSend(sock, { kind: "notice", message })) this.detach(sock);
+    }
   }
 
   /**
