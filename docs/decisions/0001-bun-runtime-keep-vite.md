@@ -51,6 +51,27 @@ dependency this product cannot work around. It passing is what made the rest wor
 **Gained:** no native module; native TypeScript execution (both workarounds above are
 deleted); markedly faster server tests.
 
+## Found during the migration (the probes had missed these)
+
+Two differences only showed up against the real code, and both are recorded in `CLAUDE.md`
+because they are traps for future work, not one-off porting chores:
+
+- **`stmt.get()` returns `null` for a missing row**, where `better-sqlite3` returned
+  `undefined`. Three call sites in `roomManager.ts`/`sessionManager.ts` compared against
+  `undefined` and silently took the "row found" branch on an empty result. They now test
+  `== null`. `RoomManager.getRoom` still returns `undefined` for "no such room", so the
+  absent-row shape the rest of the package speaks did not change.
+- **Bun's `ws` compatibility shim drops the client `origin` option** and does not implement
+  the `unexpected-response` event. `test/wsOrigin.test.ts` was built on both: under Bun it
+  sent no `Origin` at all and would have passed while asserting nothing about the
+  security-relevant policy it exists to protect. It now writes the upgrade request by hand
+  over a socket — which additionally lets it assert the exact status (403 vs 101) rather
+  than an opaque client failure — and uses Bun's native `WebSocket` with
+  `{ headers: { Origin } }` for the case that must also exchange a message.
+
+Both are arguments for the boundary this decision already draws: the driver stays behind
+`db.ts`, and anything Bun-shaped stays testable at the protocol level.
+
 ## Rejected: Rsbuild
 
 Rspack is faster than Vite on large bundles. We do not have one — the web bundle is

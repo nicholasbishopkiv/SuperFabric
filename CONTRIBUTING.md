@@ -33,7 +33,10 @@ pnpm dev        # server + web in watch mode
 pnpm test
 ```
 
-Node 22+, pnpm 9+.
+Node 22+, pnpm 9+, and [Bun](https://bun.sh) 1.3+ — `packages/server` runs and tests on Bun
+(`bun test`), while `packages/shared` and `packages/web` stay on Node with Vite/vitest.
+Installs are always `pnpm install`, never `bun install`. See
+[docs/decisions/0001-bun-runtime-keep-vite.md](docs/decisions/0001-bun-runtime-keep-vite.md).
 
 ## Pull requests
 

@@ -11,8 +11,8 @@ Status: **draft for review** (2026-08-03). Canonical decisions live in the desig
 │  2D overlay: task panel, per-account limit meters, approval cards, agent chat          │
 └───────────────▲───────────────────────────────────────────────────────────────────────┘
                 │ one WebSocket, {sessionId, seq} multiplexed; replay-then-tail
-┌───────────────┴───────────────  Fabrica Server (Node/TS)  ────────────────────────────┐
-│  Fastify + ws        SQLite (better-sqlite3, WAL)        dockerode (phase M4)         │
+┌───────────────┴───────────────  Fabrica Server (Bun/TS)  ─────────────────────────────┐
+│  Fastify + ws        SQLite (bun:sqlite, WAL)            dockerode (phase M4)         │
 │                                                                                       │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  ┌──────────────┐  ┌───────────┐ │
 │  │ SessionMgr  │  │ Factory Bus  │  │ TaskStore   │  │ LimitMonitor │  │ AccountMgr│ │
@@ -31,7 +31,10 @@ Status: **draft for review** (2026-08-03). Canonical decisions live in the desig
 ## 2. Components
 
 ### 2.1 Server (`packages/server`)
-Node 22+, TypeScript, Fastify. Owns everything stateful.
+Bun 1.3+, TypeScript, Fastify. Owns everything stateful. Bun runs the TypeScript entrypoint
+directly (no build step), runs the tests (`bun test`), and provides the SQLite driver
+(`bun:sqlite`); `src/db.ts` is the only file that names it. Rationale and the measured
+evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
 
 - **SessionManager** — one `query()` from `@anthropic-ai/claude-agent-sdk` per agent, in
   **streaming-input mode** (AsyncIterable prompt): the session stays alive and the server
@@ -187,7 +190,8 @@ active (`options.resume` + JSONL transcripts persisted in each account's config 
 | Canvas | react-three-fiber + drei (Three.js) | MIT; true 3D factory (buildings, conveyors, packages, later agent characters) + DOM overlay for 2D panels; React Flow superseded by the 3D directive, tldraw rejected (license) |
 | Agent driving | TS Agent SDK, streaming-input | multi-turn steering, interrupt, resume, canUseTool, in-process MCP |
 | Transport | WebSocket (ws), multiplexed | bidirectional (approvals/interrupts), unanimous in prior art |
-| State | better-sqlite3, WAL | single-node self-hosted; event-log replay pattern |
+| Server runtime | Bun 1.3+ (web stays on Node 22+ / Vite) | runs TS directly and ships SQLite, so no `tsx` and no native module; vitest is Vite-native so the web keeps Vite — see decision 0001 |
+| State | SQLite via `bun:sqlite`, WAL | single-node self-hosted; event-log replay pattern; built into the runtime, so nothing to compile |
 | Containers | dockerode + Anthropic devcontainer firewall | official blessed pattern for `--dangerously-skip-permissions` |
 | Limits | OAuth usage endpoint + 429 + JSONL fallback | authoritative cross-device data; est.-only tools proven inaccurate |
 | Monorepo | pnpm workspaces | server/web/shared/agent-runner |
