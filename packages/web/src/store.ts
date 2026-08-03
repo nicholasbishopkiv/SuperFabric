@@ -84,3 +84,15 @@ export const useFabric = create<FabricState>((set) => ({
 
   setConnected: (connected) => set({ connected }),
 }));
+
+/**
+ * Whether anything in the scene needs animating. The canvas runs `frameloop="demand"` and only
+ * switches to `"always"` while this is true, so an idle factory does not spin the GPU. Tasks 6 and 7
+ * must keep this accurate: a beacon or a package that looks frozen is this returning false when it
+ * should not.
+ */
+export function hasMotion(state: Pick<FabricState, "sessions">): boolean {
+  return state.sessions.some((s) => s.status === "working" || s.status === "starting");
+}
+
+export const useHasMotion = (): boolean => useFabric(hasMotion);

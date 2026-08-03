@@ -1,5 +1,6 @@
+import type { SessionInfo } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
-import { initialFabricState, useFabric } from "../src/store";
+import { hasMotion, initialFabricState, useFabric } from "../src/store";
 
 const apply = (msg: Parameters<ReturnType<typeof useFabric.getState>["apply"]>[0]) =>
   useFabric.getState().apply(msg);
@@ -9,6 +10,12 @@ beforeEach(() => {
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [],
   });
+});
+
+/** A `SessionInfo` with every field the protocol requires; cases override just what they are about. */
+const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
+  id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
+  autonomy: "auto", roomId: null, status: "idle", blocked: false, ...over,
 });
 
 describe("event store", () => {
@@ -36,15 +43,13 @@ describe("event store", () => {
   });
 
   it("replaces the session list on a sessions message", () => {
-    useFabric.setState({
-      sessions: [{ id: "old", state: "done", claudeSessionId: null, lastSeq: 3, autonomy: "auto", roomId: null }],
-    });
+    useFabric.setState({ sessions: [session({ id: "old", state: "done", lastSeq: 3 })] });
 
     apply({
       kind: "sessions",
       sessions: [
-        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 7, autonomy: "auto", roomId: null },
-        { id: "s2", state: "paused", claudeSessionId: null, lastSeq: 0, autonomy: "attended", roomId: null },
+        session({ id: "s1", claudeSessionId: "c1", lastSeq: 7 }),
+        session({ id: "s2", state: "paused", autonomy: "attended" }),
       ],
     });
 
@@ -55,8 +60,8 @@ describe("event store", () => {
     apply({
       kind: "sessions",
       sessions: [
-        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 7, autonomy: "bypass", roomId: null },
-        { id: "s2", state: "active", claudeSessionId: "c2", lastSeq: 1, autonomy: "attended", roomId: null },
+        session({ id: "s1", claudeSessionId: "c1", lastSeq: 7, autonomy: "bypass" }),
+        session({ id: "s2", claudeSessionId: "c2", lastSeq: 1, autonomy: "attended" }),
       ],
     });
     expect(useFabric.getState().sessions.map((s) => [s.id, s.autonomy])).toEqual([
@@ -68,11 +73,27 @@ describe("event store", () => {
     apply({
       kind: "sessions",
       sessions: [
-        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 9, autonomy: "attended", roomId: null },
-        { id: "s2", state: "active", claudeSessionId: "c2", lastSeq: 1, autonomy: "attended", roomId: null },
+        session({ id: "s1", claudeSessionId: "c1", lastSeq: 9, autonomy: "attended" }),
+        session({ id: "s2", claudeSessionId: "c2", lastSeq: 1, autonomy: "attended" }),
       ],
     });
     expect(useFabric.getState().sessions.find((s) => s.id === "s1")?.autonomy).toBe("attended");
+  });
+
+  it("carries the server's derived status and blocked flag through untouched", () => {
+    apply({
+      kind: "sessions",
+      sessions: [
+        session({ id: "s1", status: "working" }),
+        session({ id: "s2", status: "error" }),
+        session({ id: "s3", status: "working", blocked: true }),
+      ],
+    });
+    expect(useFabric.getState().sessions.map((s) => [s.status, s.blocked])).toEqual([
+      ["working", false],
+      ["error", false],
+      ["working", true],
+    ]);
   });
 
   it("surfaces server errors in lastError", () => {
@@ -141,5 +162,25 @@ describe("event store", () => {
 
     // Same object identity: a deduped replay must not churn React subscribers.
     expect(useFabric.getState().events).toBe(before);
+  });
+});
+
+// ---- the frameloop contract: "always" only while something animates ----
+
+describe("hasMotion", () => {
+  it("is false for an empty factory", () => {
+    expect(hasMotion({ sessions: [] })).toBe(false);
+  });
+
+  it("is false while every agent is idle, paused, done or errored", () => {
+    for (const status of ["idle", "paused", "done", "error"] as const) {
+      expect(hasMotion({ sessions: [session({ status })] })).toBe(false);
+    }
+  });
+
+  it("is true while any agent is starting or working", () => {
+    for (const status of ["starting", "working"] as const) {
+      expect(hasMotion({ sessions: [session({ status: "idle" }), session({ id: "s2", status })] })).toBe(true);
+    }
   });
 });
