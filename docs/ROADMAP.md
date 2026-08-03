@@ -57,12 +57,14 @@ Four capabilities the operator asked for once the floor existed. They are groupe
 they all reshape the same surface: what the browser is looking at, and how a human puts
 things into it.
 
-- [ ] **Multiple projects, one SuperFabric.** Pick the project folder in the UI and switch
+- [x] **Multiple projects, one SuperFabric.** Pick the project folder in the UI and switch
       between projects; each is its own factory floor with its own rooms, agents, tasks,
-      messages and history. Everything scoped by `project_id` in one database, so a switch
+      messages and history. Everything scoped by `project_id` in one database (migration 5,
+      which backfills an existing `.fabrica/fabrica.db` into a one-project world), so a switch
       is instant and does not restart the server. `SUPERFABRIC_PROJECT` becomes the default
-      for the first project, not the only one there can be.
-- [ ] **Per-room working folder.** A room defaults to `<project>/<name>/`, but the folder is
+      for the first project, not the only one there can be. The active project is **per
+      socket**, so a second tab on another factory sees none of this one's traffic.
+- [x] **Per-room working folder.** A room defaults to `<project>/<name>/`, but the folder is
       settable: a department may live in a separate repository. Adopting an existing folder
       must never overwrite its `CLAUDE.md` (the invariant already holds — keep it).
 - [ ] **Files in, paths out.** Paste from the clipboard, drop onto the window, or upload.
@@ -72,6 +74,16 @@ things into it.
 - [ ] **A real UI.** Rebuild the HUD on a component library instead of hand-rolled inline
       styles, so the panels look designed rather than assembled. Choice and reasoning:
       `docs/decisions/0003-ui-library.md`.
+
+**Acceptance run for the first two (2026-08-04, no agent prompted)**: two projects in one server
+— `factory-a` (three rooms) and `Factory B` (two) — each with a room of the same name in the
+database, its own board and its own queued bus message. Switching in the HUD re-framed the camera
+and redrew the floor with only that project's buildings, board and belts; a room created in one
+tab's factory never appeared in a second tab watching the other. A room created with an explicit
+folder outside the project root adopted an existing repository without touching its `CLAUDE.md`,
+and the agent started there recorded that folder as its `cwd`. Re-pointing that room left the
+running agent's `cwd` alone across a server restart, which is what the panel warns about.
+539 tests green (shared 39, server 297 + 1 skipped live-quota test, web 203).
 
 ## M2 — Multi-account and the limit monitor
 

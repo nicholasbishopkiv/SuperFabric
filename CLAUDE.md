@@ -39,6 +39,12 @@ and a subscription limit monitor with auto-pause/resume.
 - **The bus persists before it delivers, and delivers only at a turn boundary.** A message is a
   row before anyone is told about it, and an agent mid-turn is never interrupted: its queue drains
   one message per `turn_complete`.
+- **Everything the operator looks at is scoped to one project, and the active project belongs to
+  the socket.** Rooms, sessions, tasks and messages all carry a `project_id`; every listing takes
+  one, and every broadcast is addressed by the asking socket's own scope. A second tab watching
+  another factory must never see this one's rooms, board or belts — cross-project leakage is the
+  bug to be most afraid of in this area, and the store-level tests exist to catch it. Room *names*
+  are unique per project, not per server, so anything resolving a name (`busTools`) must scope it.
 
 ## Autonomy (per-agent permission mode)
 
@@ -88,10 +94,12 @@ out in the README so users know what they're installing.
 ## Status
 
 Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folders and the 3D
-floor)** and **M3a (the factory bus, tasks, and packages that ride real messages)** are complete —
-see `docs/ROADMAP.md` for the acceptance evidence of each. Next: **M3b — the orchestrator and task
-auto-routing**, then the rest of M1 (roles library, onboarding agent) and M2 (multi-account and the
-limit monitor).
+floor)**, **M3a (the factory bus, tasks, and packages that ride real messages)** and the structural
+half of **M1b (several projects in one server, settable room folders)** are complete — see
+`docs/ROADMAP.md` for the acceptance evidence of each. Still open in M1b: attachments (files in,
+paths out) and the shadcn/ui rebuild of the HUD (`docs/decisions/0003-ui-library.md`). Then
+**M3b — the orchestrator and task auto-routing**, the rest of M1 (roles library, onboarding agent)
+and M2 (multi-account and the limit monitor).
 
 ## Running it
 
@@ -134,7 +142,8 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   one-file change) · `origin.ts` (WebSocket
   origin allow-list) · `eventStore.ts` (append-only log + subscriptions)
   · `executor.ts` (provider seam) · `executors/claudeCode.ts` (Agent SDK, streaming input)
-  · `executors/fake.ts` (scripted, for tests) · `roomManager.ts` (rooms as folders, charters)
+  · `executors/fake.ts` (scripted, for tests) · `projectManager.ts` (projects: the scope every
+  listing is filtered by) · `roomManager.ts` (rooms as folders, charters, settable folders)
   · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
   each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
   `busTools.ts` (the bus as an in-process MCP server, one per session's room) ·
