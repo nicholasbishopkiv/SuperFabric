@@ -6,9 +6,9 @@ Status: **draft for review** (2026-08-03). Canonical decisions live in the desig
 ## 1. System overview
 
 ```
-┌────────────────────────────  Browser (React + React Flow)  ───────────────────────────┐
-│  Factory canvas: project block, room nodes, agent chips, animated message edges,      │
-│  task board, per-account limit meters, approval cards, direct chat with any agent     │
+┌──────────────────  Browser (React + react-three-fiber, 3D + DOM overlay)  ────────────┐
+│  3D factory floor: project building, room workshops, conveyors carrying packages      │
+│  2D overlay: task panel, per-account limit meters, approval cards, agent chat          │
 └───────────────▲───────────────────────────────────────────────────────────────────────┘
                 │ one WebSocket, {sessionId, seq} multiplexed; replay-then-tail
 ┌───────────────┴───────────────  Fabrica Server (Node/TS)  ────────────────────────────┐
@@ -36,7 +36,9 @@ Node 22+, TypeScript, Fastify. Owns everything stateful.
 - **SessionManager** — one `query()` from `@anthropic-ai/claude-agent-sdk` per agent, in
   **streaming-input mode** (AsyncIterable prompt): the session stays alive and the server
   feeds it turns (user messages, bus messages, orchestrator directives). Exposes
-  `interrupt()`, `setPermissionMode()`. Captures `session_id` from the init message and
+  `interrupt()`. (An autonomy change restarts the query with the new mode rather than
+  calling the SDK's `setPermissionMode()`, because `bypass` needs a spawn-time flag that
+  cannot be added to a running query.) Captures `session_id` from the init message and
   persists it → restart recovery via `options.resume`. `canUseTool` callback is forwarded
   to the browser as an approval card (with per-room auto-approve policies).
 - **Event log** — append-only SQLite table `events(session_id, seq, ts, type, payload)`.
