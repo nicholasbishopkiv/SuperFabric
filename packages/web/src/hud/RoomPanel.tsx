@@ -1,7 +1,7 @@
 import type { AutonomyMode, SessionInfo } from "@superfabric/shared";
 import { RoomName } from "@superfabric/shared";
 import { memo, useEffect, useRef, useState } from "react";
-import { BYPASS_COLOR, STATUS_COLOR } from "../scene/palette";
+import { BYPASS_COLOR, SELECT_COLOR, STATUS_COLOR } from "../scene/palette";
 import type { FactoryStatus } from "../store";
 import {
   agentStatus,
@@ -92,8 +92,10 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
           padding: "5px 7px",
           marginBottom: 3,
           cursor: "pointer",
-          background: selected ? "#fff4e0" : "#fff",
-          border: `1px solid ${selected ? HUD.card : HUD.line}`,
+          // Selection is cyan everywhere, on the floor and in this list: the two are the
+          // same `selectedRoomId`, so they must not be two different colours.
+          background: selected ? "#e6fbff" : "#fff",
+          border: `1px solid ${selected ? SELECT_COLOR : HUD.line}`,
           borderRadius: 4,
         }}
       >

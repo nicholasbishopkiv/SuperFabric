@@ -1,6 +1,7 @@
 import { Html } from "@react-three/drei";
 import type { ThreeEvent } from "@react-three/fiber";
 import { memo } from "react";
+import { BackSide } from "three";
 import {
   useFabric,
   useIsSelected,
@@ -17,6 +18,7 @@ import {
   PROJECT_ROOF_HEIGHT,
   ROOM_ROOF_THICKNESS,
 } from "./layout";
+import { SELECT_COLOR } from "./palette";
 import { StatusBeacon } from "./StatusBeacon";
 
 const COLORS = {
@@ -24,12 +26,14 @@ const COLORS = {
   projectRoof: "#3f4c59",
   room: "#8a9aa8",
   roomRoof: "#6b7885",
-  selected: "#e08a00",
   label: "#1c1c1c",
 };
 
-/** How brightly a selected building glows. Emissive, so it reads as selected from any angle. */
-const SELECTED_EMISSIVE = 0.55;
+/**
+ * How far outside the building the selection rim is drawn. Small: a rim is a rim, and a thick one
+ * turns the building back into a coloured blob.
+ */
+const RIM_SCALE = 1.04;
 
 /**
  * One building on the floor, procedural and low-poly: no assets, no loading. Memoized and
@@ -64,8 +68,6 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
 
   const isProject = room.kind === "project";
   const { width, height } = buildingSize(room.kind);
-  const emissive = selected ? COLORS.selected : "#000000";
-  const emissiveIntensity = selected ? SELECTED_EMISSIVE : 0;
   // A 4-sided cone needs to reach the box's corners, not its edges, to cover the footprint.
   const roofRadius = (width * Math.SQRT2) / 2 + 0.1;
 
@@ -73,32 +75,20 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
     <group position={[position.x, 0, position.z]} onPointerDown={onPointerDown}>
       <mesh castShadow receiveShadow position-y={height / 2}>
         <boxGeometry args={[width, height, width]} />
-        <meshStandardMaterial
-          color={isProject ? COLORS.project : COLORS.room}
-          emissive={emissive}
-          emissiveIntensity={emissiveIntensity}
-        />
+        <meshStandardMaterial color={isProject ? COLORS.project : COLORS.room} />
       </mesh>
 
       {isProject ? (
         // A pitched four-sided roof, rotated 45° so its faces line up with the block's.
         <mesh castShadow position-y={height + PROJECT_ROOF_HEIGHT / 2} rotation-y={Math.PI / 4}>
           <coneGeometry args={[roofRadius, PROJECT_ROOF_HEIGHT, 4]} />
-          <meshStandardMaterial
-            color={COLORS.projectRoof}
-            emissive={emissive}
-            emissiveIntensity={emissiveIntensity}
-          />
+          <meshStandardMaterial color={COLORS.projectRoof} />
         </mesh>
       ) : (
         // A workshop gets a flatter roof: a thin slab with a slight overhang.
         <mesh castShadow position-y={height + ROOM_ROOF_THICKNESS / 2}>
           <boxGeometry args={[width + 0.4, ROOM_ROOF_THICKNESS, width + 0.4]} />
-          <meshStandardMaterial
-            color={COLORS.roomRoof}
-            emissive={emissive}
-            emissiveIntensity={emissiveIntensity}
-          />
+          <meshStandardMaterial color={COLORS.roomRoof} />
         </mesh>
       )}
 
@@ -108,14 +98,7 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
           project room is a real agent, and a floor that hid it would be lying about what is running. */}
       <Agents roomId={roomId} kind={room.kind} />
 
-      {selected && (
-        // An unmistakable ground ring under the selection: the emissive bump alone is subtle on a
-        // building seen edge-on.
-        <mesh rotation-x={-Math.PI / 2} position-y={0.03}>
-          <ringGeometry args={[width * 0.85, width * 0.98, 48]} />
-          <meshBasicMaterial color={COLORS.selected} />
-        </mesh>
-      )}
+      {selected && <SelectionRim width={width} height={height} />}
 
       {/*
         No `distanceFactor`: on an *orthographic* camera drei multiplies the label's scale by
@@ -129,7 +112,7 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
             font: "600 13px system-ui, sans-serif",
             color: COLORS.label,
             background: "rgba(255,255,255,0.86)",
-            border: `1px solid ${selected ? COLORS.selected : "#c3c9ce"}`,
+            border: `1px solid ${selected ? SELECT_COLOR : "#c3c9ce"}`,
             borderRadius: 4,
             padding: "2px 7px",
             whiteSpace: "nowrap",
@@ -149,3 +132,33 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
     </group>
   );
 });
+
+/**
+ * What "selected" looks like: a rim around the building and a ring on the floor under it.
+ *
+ * The first pass repainted the whole building orange with an emissive bump, which destroyed exactly
+ * the information the operator selected it to read — a selected workshop stopped being a workshop and
+ * became an orange box, indistinguishable from a selected project block. Selection has to **add**.
+ *
+ * The rim is the classic inverted hull: the same box, scaled a few percent, drawn back-faces-only.
+ * The front faces are culled, so all that survives is the sliver sticking out past the silhouette —
+ * an outline, for one extra draw call and no shader. The ground ring is there because a building
+ * seen almost edge-on has very little silhouette to rim.
+ *
+ * `toneMapped={false}` on both: this is UI drawn in the scene, and it should be the cyan it says it
+ * is rather than whatever the renderer's tone curve would prefer.
+ */
+function SelectionRim({ width, height }: { width: number; height: number }) {
+  return (
+    <>
+      <mesh position-y={height / 2} scale={RIM_SCALE}>
+        <boxGeometry args={[width, height, width]} />
+        <meshBasicMaterial color={SELECT_COLOR} side={BackSide} toneMapped={false} />
+      </mesh>
+      <mesh rotation-x={-Math.PI / 2} position-y={0.03}>
+        <ringGeometry args={[width * 0.86, width * 0.96, 64]} />
+        <meshBasicMaterial color={SELECT_COLOR} toneMapped={false} transparent opacity={0.9} />
+      </mesh>
+    </>
+  );
+}
