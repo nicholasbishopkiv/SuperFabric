@@ -1,4 +1,4 @@
-import type { SessionEvent } from "@superfabric/shared";
+import type { AutonomyMode, SessionEvent } from "@superfabric/shared";
 import { useEffect, useRef, useState } from "react";
 import type { EventRow } from "./store";
 import { useFabric } from "./store";
@@ -14,6 +14,49 @@ const C = {
   card: "#e08a00",
 };
 
+/** Human labels for the autonomy modes — the console never shows SDK permission-mode jargon. */
+const AUTONOMY_LABELS: Record<AutonomyMode, string> = {
+  attended: "Attended — every gated action asks",
+  auto: "Auto — classifier decides (default)",
+  bypass: "Bypass — nothing is gated",
+};
+const AUTONOMY_MODES = ["attended", "auto", "bypass"] as const;
+
+function AutonomySelect({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: AutonomyMode;
+  disabled: boolean;
+  onChange: (autonomy: AutonomyMode) => void;
+}) {
+  return (
+    <select
+      aria-label="Autonomy"
+      value={value}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value as AutonomyMode)}
+      style={{ font: "inherit" }}
+    >
+      {AUTONOMY_MODES.map((m) => (
+        <option key={m} value={m}>
+          {AUTONOMY_LABELS[m]}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/** One-line, no-modal warning shown only while Bypass is the selected mode. */
+function BypassWarning() {
+  return (
+    <span style={{ color: C.err }}>
+      ⚠ this agent can run any command without asking — only for a sandboxed room (M4)
+    </span>
+  );
+}
+
 export default function App() {
   const sessions = useFabric((s) => s.sessions);
   const events = useFabric((s) => s.events);
@@ -22,6 +65,7 @@ export default function App() {
 
   const [active, setActive] = useState<string | null>(null);
   const [input, setInput] = useState("");
+  const [newAutonomy, setNewAutonomy] = useState<AutonomyMode>("auto");
   const knownIds = useRef(new Set<string>());
   const wantNewest = useRef(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
@@ -81,6 +125,7 @@ export default function App() {
   }
 
   const canSend = connected && active !== null;
+  const activeSession = sessions.find((s) => s.id === active);
 
   return (
     <div
@@ -103,12 +148,13 @@ export default function App() {
         <button
           onClick={() => {
             wantNewest.current = true;
-            send({ kind: "create_session" });
+            send({ kind: "create_session", autonomy: newAutonomy });
           }}
           disabled={!connected}
         >
           New session
         </button>
+        <AutonomySelect value={newAutonomy} disabled={!connected} onChange={setNewAutonomy} />
         {sessions.map((s) => (
           <button
             key={s.id}
@@ -126,6 +172,23 @@ export default function App() {
         >
           Interrupt
         </button>
+        {newAutonomy === "bypass" && (
+          <div style={{ flexBasis: "100%" }}>
+            <BypassWarning /> <span style={{ color: C.dim }}>(applies to the next new session)</span>
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginBottom: 12 }}>
+        <span style={{ color: C.dim }}>Autonomy of this agent:</span>
+        <AutonomySelect
+          value={activeSession?.autonomy ?? "auto"}
+          disabled={!canSend || activeSession === undefined}
+          onChange={(autonomy) => {
+            if (active !== null) send({ kind: "set_autonomy", sessionId: active, autonomy });
+          }}
+        />
+        {activeSession?.autonomy === "bypass" && <BypassWarning />}
       </div>
 
       <div
