@@ -1,5 +1,22 @@
 import { z } from "zod";
 
+/**
+ * How much rope an agent gets. Deliberately our own vocabulary, not the SDK's `permissionMode`
+ * strings: the wire protocol stays stable if the SDK renames or adds modes, and the product only
+ * exposes these three of the SDK's six. The mapping to SDK strings lives in
+ * `server/src/executors/claudeCode.ts` (`sdkPermissionMode`).
+ *
+ * - `attended` — every gated tool call raises an approval card (SDK `"default"`).
+ * - `auto` — the CLI's classifier decides; cards become rare, not impossible (SDK `"auto"`).
+ * - `bypass` — nothing is gated (SDK `"bypassPermissions"`). Per-agent opt-in, only appropriate
+ *   for a sandboxed room (M4).
+ */
+export const AutonomyMode = z.enum(["attended", "auto", "bypass"]);
+export type AutonomyMode = z.infer<typeof AutonomyMode>;
+
+/** Product default: agents run in `auto` unless someone says otherwise. */
+export const DEFAULT_AUTONOMY: AutonomyMode = "auto";
+
 // ---- events persisted in the event log and streamed to clients ----
 export const SessionEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("session_status"), status: z.enum(["starting", "working", "idle", "paused", "error", "done"]), detail: z.string().optional() }),
@@ -21,7 +38,8 @@ export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("prompt"), sessionId: z.string(), text: z.string().min(1) }),
   z.object({ kind: z.literal("approval"), sessionId: z.string(), approvalId: z.string(), behavior: z.enum(["allow", "deny"]) }),
   z.object({ kind: z.literal("interrupt"), sessionId: z.string() }),
-  z.object({ kind: z.literal("create_session"), cwd: z.string().optional() }),
+  z.object({ kind: z.literal("create_session"), cwd: z.string().optional(), autonomy: AutonomyMode.optional() }),
+  z.object({ kind: z.literal("set_autonomy"), sessionId: z.string(), autonomy: AutonomyMode }),
   z.object({ kind: z.literal("list_sessions") }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
@@ -33,6 +51,8 @@ export const SessionInfo = z.object({
   state: z.enum(["active", "paused", "done", "error"]),
   claudeSessionId: z.string().nullable(),
   lastSeq: z.number().int(),
+  /** Per-session, persisted, and re-applied on resume. */
+  autonomy: AutonomyMode,
 });
 export type SessionInfo = z.infer<typeof SessionInfo>;
 
