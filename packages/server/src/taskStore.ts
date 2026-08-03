@@ -45,6 +45,7 @@ export interface TaskPatch {
  */
 export class TaskStore {
   private readonly stmts;
+  private listeners = new Set<() => void>();
 
   /**
    * `now` is a seam, not a feature: `unixepoch()` has one-second resolution, so a test cannot
@@ -83,6 +84,7 @@ export class TaskStore {
       roomId, agentId: null, blockedOnMessageId: null, createdAt: ts, updatedAt: ts,
     });
     this.stmts.insert.run(draft.id, draft.title, draft.detail, draft.roomId, draft.createdAt, draft.updatedAt);
+    this.emitChange();
     return draft;
   }
 
@@ -115,7 +117,23 @@ export class TaskStore {
       parsed.title, parsed.detail, parsed.status, parsed.roomId, parsed.agentId,
       parsed.blockedOnMessageId, parsed.updatedAt, taskId,
     );
+    this.emitChange();
     return parsed;
+  }
+
+  /**
+   * Fires whenever the board changed. The hub subscribes to this rather than broadcasting from its
+   * own handlers, because most changes do not come through the hub at all: an agent calling
+   * `factory_task_update`, and the bus blocking a task on a request, both reach this store directly.
+   * Without it the board is only right for whoever asked, and only until an agent touches it.
+   */
+  onChange(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private emitChange(): void {
+    for (const l of this.listeners) l();
   }
 
   /** Newest first: the board reads top-down and the newest card is the one being talked about. */

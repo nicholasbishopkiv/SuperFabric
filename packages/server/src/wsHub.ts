@@ -53,8 +53,11 @@ export class WsHub {
     this.tasks = opts.tasks;
     this.bus = opts.bus;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
-    // boundary), so the hub learns about traffic by subscribing rather than by being called.
+    // boundary), so the hub learns about traffic by subscribing rather than by being called. The
+    // board is the same story and for a stronger reason: an agent moving its own task with
+    // `factory_task_update`, and the bus blocking a task on a request, never pass through this hub.
     opts.bus?.onChange(() => this.scheduleBroadcast("messages"));
+    opts.tasks?.onChange(() => this.scheduleBroadcast("tasks"));
     store.onAppend((sessionId, seq, event) => {
       const msg: ServerMessage = { kind: "event", sessionId, seq, event };
       for (const [sock, sessions] of this.subs) {
@@ -165,13 +168,14 @@ export class WsHub {
           this.broadcastRooms();
           break;
         case "list_rooms": this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms() }); break;
-        // Tasks. The board is global state like rooms are, so a change is broadcast — but on the
+        // Tasks. The board is global state like rooms are, so a change is broadcast — on the
         // coalescing path, because an agent driving `factory_task_update` can change it as fast as
-        // it can call a tool. An unknown task or an assignee from the wrong room throws into the
-        // catch below and is reported to the socket that asked.
+        // it can call a tool. The broadcast is *not* scheduled here: the store announces its own
+        // changes (see the constructor), which is the only way the board also stays right for the
+        // changes that never come through this hub. An unknown task or an assignee from the wrong
+        // room throws into the catch below and is reported to the socket that asked.
         case "create_task":
           this.taskStore().create({ title: msg.title, detail: msg.detail, roomId: msg.roomId });
-          this.scheduleBroadcast("tasks");
           break;
         case "update_task":
           this.taskStore().update(msg.taskId, {
@@ -179,7 +183,6 @@ export class WsHub {
             ...(msg.roomId !== undefined ? { roomId: msg.roomId } : {}),
             ...(msg.agentId !== undefined ? { agentId: msg.agentId } : {}),
           });
-          this.scheduleBroadcast("tasks");
           break;
         case "list_tasks": this.safeSend(sock, { kind: "tasks", tasks: this.taskStore().list() }); break;
         // A query like the others: the socket that asked gets the bus's newest traffic, and nobody

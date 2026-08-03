@@ -606,6 +606,40 @@ describe("WsHub", () => {
       });
     });
 
+    it("broadcasts the board when an agent moves a task, not only when a socket does", async () => {
+      await withRooms(async ({ hub, tasks, sent, chat, settle }) => {
+        const task = tasks.create({ title: "Expose a webhook", roomId: chat.id });
+        const second = fakeSocket();
+        hub.attach(second.sock);
+        await settle();
+        const before = sent.filter(m => m.kind === "tasks").length;
+
+        // Exactly what `factory_task_update` does: the store, directly, with no frame from anyone.
+        tasks.update(task.id, { status: "in_progress" });
+        await settle();
+
+        expect(sent.filter(m => m.kind === "tasks").length).toBe(before + 1);
+        expect(lastTasks(sent)![0]).toMatchObject({ id: task.id, status: "in_progress" });
+        // …and every attached tab sees it, not just the one that happened to ask.
+        expect(lastTasks(second.sent)![0]).toMatchObject({ id: task.id, status: "in_progress" });
+      });
+    });
+
+    it("broadcasts the board when the bus blocks a task on a request", async () => {
+      await withRooms(async ({ hub, tasks, bus, sent, chat, payments, settle }) => {
+        const task = tasks.create({ title: "Expose a webhook", roomId: chat.id });
+        await settle();
+        const before = sent.filter(m => m.kind === "tasks").length;
+
+        const msg = bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "please" });
+        tasks.update(task.id, { status: "blocked", blockedOnMessageId: msg.id });
+        await settle();
+
+        expect(sent.filter(m => m.kind === "tasks").length).toBe(before + 1);
+        expect(lastTasks(sent)![0]).toMatchObject({ status: "blocked", blockedOnMessageId: msg.id });
+      });
+    });
+
     it("list_tasks answers only the socket that asked", async () => {
       await withRooms(({ hub, tasks, sock, sent }) => {
         tasks.create({ title: "Expose a webhook" });

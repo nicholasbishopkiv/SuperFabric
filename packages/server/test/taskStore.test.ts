@@ -175,6 +175,33 @@ describe("TaskStore", () => {
     expect(() => tasks.create({ title: "ok", detail: "d".repeat(4001) })).toThrow();
   });
 
+  it("announces its own changes, because most of them never pass through the hub", () => {
+    const { tasks } = makeStore();
+    const seen: string[] = [];
+    const off = tasks.onChange(() => seen.push("changed"));
+
+    // An agent's `factory_task_update`, and the bus blocking a task on a request, both land here
+    // directly: if the store stayed quiet the board would be stale until someone reloaded.
+    const t = tasks.create({ title: "Expose a webhook" });
+    expect(seen).toHaveLength(1);
+    tasks.update(t.id, { status: "in_progress" });
+    expect(seen).toHaveLength(2);
+
+    off();
+    tasks.update(t.id, { status: "done" });
+    expect(seen).toHaveLength(2);
+  });
+
+  it("does not announce a read", () => {
+    const { tasks } = makeStore();
+    const t = tasks.create({ title: "Expose a webhook" });
+    let changes = 0;
+    tasks.onChange(() => { changes++; });
+    tasks.get(t.id);
+    tasks.list();
+    expect(changes).toBe(0);
+  });
+
   it("survives a reopen: tasks are rows, not process state", () => {
     const { db, tasks } = makeStore();
     const t = tasks.create({ title: "Expose a webhook" });
