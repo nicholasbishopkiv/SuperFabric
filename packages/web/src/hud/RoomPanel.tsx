@@ -152,8 +152,15 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
       <div style={{ fontWeight: 700, marginBottom: 2 }}>{room.name}</div>
       {/* The path is the room: "room = folder" is the product's central claim, so the folder is
           shown rather than hidden behind an id. */}
-      <div style={{ color: HUD.dim, fontSize: 12, wordBreak: "break-all", marginBottom: 8 }}>
+      <div style={{ color: HUD.dim, fontSize: 12, wordBreak: "break-all", marginBottom: 4 }}>
         {room.path}
+      </div>
+      {/* The charter is where an agent learns it is a department with a bus. A room created here
+          gets that section written for it; a folder that already had a CLAUDE.md keeps its own,
+          untouched — so for those it is the operator who has to say it. */}
+      <div style={{ color: HUD.dim, fontSize: 12, marginBottom: 8 }}>
+        Charter: <code>CLAUDE.md</code> in that folder. New rooms are told about the factory bus in
+        theirs; a folder that already had one is never overwritten, so add it by hand there.
       </div>
 
       {agents.length === 0 ? (

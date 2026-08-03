@@ -4,7 +4,18 @@ import path from "node:path";
 import { RoomName, ringPosition, type RoomInfo, type ScenePosition } from "@superfabric/shared";
 import type { Db } from "./db.js";
 
-/** Charter template written into a new room's folder. Rooms are folders; this is the room's brief. */
+/**
+ * Charter template written into a new room's folder. Rooms are folders; this is the room's brief.
+ *
+ * The bus section is not decoration: a fresh agent has no other way to learn that it is a department
+ * in a factory, what that department is called, or that the `mcp__factory__*` tools in its tool list
+ * are how it reaches the other rooms. The tool names are the namespaced ones the model actually sees
+ * (`mcp__<server>__<tool>` — see `notes/agent-sdk-api.md`), so an agent can copy them verbatim.
+ *
+ * Kept short on purpose. This is a charter the operator will rewrite, not a manual: everything here
+ * has to survive being read once. An existing `CLAUDE.md` is never overwritten (see `createRoom`), so
+ * a room adopted from a folder that already had one needs this paragraph added by hand.
+ */
 function charter(name: string): string {
   return `# ${name}
 
@@ -19,6 +30,23 @@ _What other rooms can rely on from this one, and what it needs from them._
 ## Conventions
 
 _Anything an agent working here must follow._
+
+## The factory bus
+
+You are the **${name}** room of this factory. The other rooms are other agents working in other
+folders of this project, and you can talk to them:
+
+- \`mcp__factory__factory_send(to_room, kind, body)\` sends a message to another room, addressed by
+  the name on its building. \`kind\` is \`request\` when you need something back, \`response\` when you
+  are answering, \`info\` otherwise.
+- Messages **to** this room arrive as ordinary turns in this session, framed \`[factory bus]\` and
+  naming the room that sent them. Answer them as you would answer anyone — but reply with
+  \`factory_send\`, not just by writing text.
+- \`mcp__factory__factory_task_update(task_id, status)\` moves one of your tasks on the factory's
+  board; \`mcp__factory__factory_report_status(summary)\` puts one line about what you are doing in
+  front of the operator.
+- Do not poll. \`mcp__factory__factory_inbox\` is for re-reading traffic you already have, never for
+  checking whether any arrived — it arrives on its own.
 `;
 }
 

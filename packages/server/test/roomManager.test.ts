@@ -90,6 +90,25 @@ describe("RoomManager", () => {
       });
     });
 
+    it("tells the agent about the factory bus, by this room's own name", () => {
+      withProject(({ root, mgr }) => {
+        mgr.ensureProjectRoom();
+        mgr.createRoom("payments");
+        const charter = readFileSync(join(root, "payments", "CLAUDE.md"), "utf8");
+
+        // Its own identity: an agent cannot address anyone if it does not know who it is.
+        expect(charter).toContain("You are the **payments** room");
+        // The tools, under the names the model actually sees (mcp__<server>__<tool>).
+        expect(charter).toContain("mcp__factory__factory_send");
+        expect(charter).toContain("mcp__factory__factory_task_update");
+        expect(charter).toContain("mcp__factory__factory_inbox");
+        // Incoming messages are turns, not something to fetch…
+        expect(charter).toMatch(/arrive as ordinary turns/);
+        // …so the one instruction that saves tokens on every turn is explicit.
+        expect(charter).toMatch(/Do not poll/);
+      });
+    });
+
     it("puts the first rooms on a ring so the buildings do not stack", () => {
       withProject(({ mgr }) => {
         mgr.ensureProjectRoom();
