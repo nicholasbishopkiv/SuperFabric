@@ -337,10 +337,10 @@ function sameWaiting(a: readonly WaitingMessage[], b: readonly WaitingMessage[])
   return a.length === b.length && a.every((w, i) => w === b[i]);
 }
 
-/** Every field a figure or a beacon draws from. */
+/** Every field a figure, a beacon or an agent row in the HUD draws from. */
 function sameSession(a: SessionInfo, b: SessionInfo): boolean {
   return a.state === b.state && a.status === b.status && a.blocked === b.blocked
-    && a.autonomy === b.autonomy && a.roomId === b.roomId
+    && a.autonomy === b.autonomy && a.model === b.model && a.roomId === b.roomId
     && a.claudeSessionId === b.claudeSessionId && a.lastSeq === b.lastSeq;
 }
 

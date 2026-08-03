@@ -4,6 +4,7 @@ import type { EventRow } from "../store";
 import { useFabric } from "../store";
 import { send, subscribe } from "../wsClient";
 import { AutonomySelect, BypassWarning } from "./AutonomySelect";
+import { ModelNote, ModelSelect } from "./ModelSelect";
 import { HUD as C } from "./theme";
 import { useHudInset } from "./useHudInset";
 
@@ -76,6 +77,8 @@ export function ConsoleDrawer() {
   const [active, setActive] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [newAutonomy, setNewAutonomy] = useState<AutonomyMode>("auto");
+  /** The model the *next* session is created on; null leaves it on the CLI's own default. */
+  const [newModel, setNewModel] = useState<string | null>(null);
   const knownIds = useRef(new Set<string>());
   const wantNewest = useRef(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
@@ -177,13 +180,19 @@ export function ConsoleDrawer() {
         <button
           onClick={() => {
             wantNewest.current = true;
-            send({ kind: "create_session", autonomy: newAutonomy });
+            send({
+              kind: "create_session",
+              autonomy: newAutonomy,
+              // Omitted, not null: "no model" is the absence of a choice on the wire too.
+              ...(newModel === null ? {} : { model: newModel }),
+            });
           }}
           disabled={!connected}
         >
           New session
         </button>
         <AutonomySelect value={newAutonomy} disabled={!connected} onChange={setNewAutonomy} />
+        <ModelSelect value={newModel} disabled={!connected} onChange={setNewModel} />
         {sessions.map((s) => (
           <button
             key={s.id}
@@ -220,6 +229,20 @@ export function ConsoleDrawer() {
           }}
         />
         {activeSession?.autonomy === "bypass" && <BypassWarning />}
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginBottom: 12 }}>
+        <span style={{ color: C.dim }}>Model of this agent:</span>
+        {/* Changing it restarts this agent's executor on the new model and resumes the same
+            conversation, so the stored model and the running one cannot disagree. */}
+        <ModelSelect
+          value={activeSession?.model ?? null}
+          disabled={!canSend || activeSession === undefined}
+          onChange={(model) => {
+            if (active !== null) send({ kind: "set_model", sessionId: active, model });
+          }}
+        />
+        <ModelNote />
       </div>
 
       <div

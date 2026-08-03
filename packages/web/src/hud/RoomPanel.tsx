@@ -18,6 +18,7 @@ import {
 } from "../store";
 import { send } from "../wsClient";
 import { AutonomySelect } from "./AutonomySelect";
+import { ModelSelect } from "./ModelSelect";
 import { HUD } from "./theme";
 import { useHudInset } from "./useHudInset";
 
@@ -134,11 +135,13 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
   );
 });
 
-/** One agent of the selected room: what it is doing, and how much rope it has. */
+/** One agent of the selected room: what it is doing, how much rope it has, and what it runs on. */
 function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolean }) {
   const status = agentStatus(agent);
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+    // Two rows rather than one: the panel is 320px wide, and an agent now carries two controls.
+    // Wrapping keeps them both readable instead of squeezing each into a few characters.
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 6 }}>
       <StatusDot status={status} title={`${status} · ${agent.state}`} />
       <code style={{ fontSize: 12 }} title={agent.id}>
         {agent.id.slice(0, 8)}
@@ -157,6 +160,14 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
         onChange={(autonomy: AutonomyMode) =>
           send({ kind: "set_autonomy", sessionId: agent.id, autonomy })
         }
+      />
+      {/* Changing this restarts the agent's executor on the new model, resuming the same
+          conversation — see `SessionManager.setModel`. */}
+      <ModelSelect
+        value={agent.model}
+        disabled={!connected}
+        short
+        onChange={(model) => send({ kind: "set_model", sessionId: agent.id, model })}
       />
     </div>
   );

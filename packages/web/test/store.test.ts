@@ -32,7 +32,7 @@ beforeEach(() => {
 /** A `SessionInfo` with every field the protocol requires; cases override just what they are about. */
 const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
-  autonomy: "auto", roomId: null, status: "idle", blocked: false, ...over,
+  autonomy: "auto", model: null, roomId: null, status: "idle", blocked: false, ...over,
 });
 
 const room = (over: Partial<RoomInfo> = {}): RoomInfo => ({
@@ -106,6 +106,35 @@ describe("event store", () => {
       ],
     });
     expect(useFabric.getState().sessions.find((s) => s.id === "s1")?.autonomy).toBe("attended");
+  });
+
+  it("reflects each session's model, and re-renders the row when it changes", () => {
+    apply({
+      kind: "sessions",
+      sessions: [session({ id: "s1", model: null }), session({ id: "s2", model: "claude-haiku-4-5" })],
+    });
+    expect(useFabric.getState().sessions.map((s) => [s.id, s.model])).toEqual([
+      ["s1", null],
+      ["s2", "claude-haiku-4-5"],
+    ]);
+
+    const before = useFabric.getState().sessions;
+    // Unchanged rows keep their identity, so a rebroadcast repaints nothing…
+    apply({
+      kind: "sessions",
+      sessions: [session({ id: "s1", model: null }), session({ id: "s2", model: "claude-haiku-4-5" })],
+    });
+    expect(useFabric.getState().sessions[0]).toBe(before[0]);
+
+    // …but a switched model is a new row, or the picker would go on showing the old one.
+    apply({
+      kind: "sessions",
+      sessions: [session({ id: "s1", model: "claude-opus-5" }), session({ id: "s2", model: "claude-haiku-4-5" })],
+    });
+    const after = useFabric.getState().sessions;
+    expect(after[0]).not.toBe(before[0]);
+    expect(after[0].model).toBe("claude-opus-5");
+    expect(after[1]).toBe(before[1]);
   });
 
   it("carries the server's derived status and blocked flag through untouched", () => {
