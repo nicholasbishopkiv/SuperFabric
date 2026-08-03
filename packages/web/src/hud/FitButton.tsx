@@ -3,13 +3,16 @@ import { useFabric } from "../store";
 import { HUD } from "./theme";
 
 /**
- * "Fit" — put the whole factory back in frame.
+ * "Fit" — put the whole factory back in frame, at the default isometric angle.
  *
- * The camera frames the floor by itself, but only until the operator pans or zooms: after that the
- * view belongs to them and nothing may move it, or a new room appearing would yank the floor out
- * from under whatever they were looking at. That rule needs exactly one escape hatch, and this is
- * it. Also bound to `f`, because the one thing an operator does after losing the factory is reach
- * for the keyboard.
+ * The camera frames the floor by itself, but only until the operator touches it: after that the view
+ * belongs to them and nothing may move it, or a new room appearing would yank the floor out from
+ * under whatever they were looking at. That rule needs exactly one escape hatch, and this is it.
+ * Also bound to `f`, because the one thing an operator does after losing the factory is reach for the
+ * keyboard.
+ *
+ * Since the camera can be orbited and tilted, this is also the way *back*: it restores the opening
+ * orientation along with the framing (see `CameraFraming`), so no orbit is a one-way trip.
  */
 export function FitButton() {
   const requestCameraFit = useFabric((s) => s.requestCameraFit);
@@ -31,7 +34,7 @@ export function FitButton() {
   return (
     <button
       onClick={requestCameraFit}
-      title="Frame the whole factory (f)"
+      title="Frame the whole factory and restore the default view (f) — drag to pan, right-drag to orbit, wheel to zoom"
       style={{
         position: "fixed",
         left: 12,

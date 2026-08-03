@@ -137,7 +137,9 @@ Two layers, by explicit product decision — the factory must *look like a facto
   (`CatmullRomCurve3` splines) with package meshes animating along them when messages
   flow. Agent status renders on the buildings (lights/smoke/badges); later milestones
   add small animated agent characters (glTF + AnimationMixer) working inside rooms.
-  Camera: orthographic isometric with `MapControls` (pan/zoom). Perf discipline:
+  Camera: orthographic, opening on an isometric view, with `MapControls` — pan, zoom
+  (2…400), orbit and tilt, the tilt clamped just above the horizon so the camera can
+  never go under the floor. Perf discipline:
   instanced meshes for packages, zustand per-object selectors (never re-render the
   scene tree on a status tick), frameloop="demand" when idle.
 - **2D overlay (DOM)** — React above the canvas, built on a component library rather than hand-rolled inline styles (see `docs/decisions/0003-ui-library.md`): **task panel** (manual task
@@ -168,14 +170,19 @@ turned out to be different problems, and the second one is easy to lose one comm
    a ground ring and a label border. Repainting it destroys the information it was selected to read.
 4. **The frameloop gate is absolute.** `hasMotion` (any working agent, any package in flight, any
    drag) is the only thing that may put the canvas on `"always"`. Anything decorative must either
-   be gated by it or need no frames at all — which is why the beacons' glow is a quad at a
-   *constant* orientation (the camera cannot rotate) rather than a `<Billboard>`, and why soft
-   shadows are a shadow-map property rather than a per-frame pass.
+   be gated by it or need no frames at all — which is why the beacons' glow is a `THREE.Sprite`
+   (billboarded by the renderer, correct at every camera angle, zero per-frame JavaScript) rather
+   than a `<Billboard>`, and why soft shadows are a shadow-map property rather than a per-frame
+   pass. Camera input is the one thing outside `hasMotion` that needs frames, and it asks for them
+   itself: the controls' `change` event calls `invalidate()`, one frame per change.
 
 The camera frames the floor itself (`isoFraming`: the screen-space bounding box of every building,
 fitted into the rectangle the HUD panels leave uncovered, whose widths the panels report into the
-store) and **stops the first time the operator pans or zooms**. The `fit` control (and `f`) is the
-one documented way to hand it back.
+store) and **stops the first time the operator touches the camera** — pan, zoom, orbit or tilt. The
+`fit` control (and `f`) is the one documented way to hand it back, and it restores the opening
+*orientation* as well as the framing: `isoFraming` solves the fit for the default isometric angle,
+so fitting is deliberately "put the floor plan back" rather than "keep my angle". The ground plane
+and the slab are sized for the widest zoom, so the edge of the world is never the thing on screen.
 
 ### 2.3 Shared (`packages/shared`)
 Protocol types: WS envelopes, event payloads, bus message schema, task schema. Zod.

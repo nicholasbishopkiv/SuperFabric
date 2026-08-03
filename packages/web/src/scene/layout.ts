@@ -12,14 +12,66 @@ import { ringPosition, type RoomInfo, type ScenePosition } from "@superfabric/sh
  */
 export { ringPosition };
 
-/** Isometric-looking orthographic camera: equal x and z, lifted, looking at the origin. */
+/**
+ * The **default** view: an isometric-looking orthographic camera, equal x and z, lifted, looking at
+ * the origin. It is no longer the *only* view — the controls orbit and tilt — but it is where the
+ * camera starts and where `fit` puts it back, so a person who never touches the camera sees exactly
+ * the floor plan they always saw.
+ */
 export const ISO_CAMERA_POSITION: readonly [number, number, number] = [24, 20, 24];
 export const ISO_ZOOM = 38;
-export const ISO_ZOOM_MIN = 12;
-export const ISO_ZOOM_MAX = 90;
+/**
+ * How far the operator may zoom, in orthographic zoom units (pixels per world unit).
+ *
+ * Deliberately enormous in both directions, because both ends answer a real question. At
+ * `ISO_ZOOM_MAX` one world unit is 400 pixels, so a ~1.2-unit agent figure is nearly 500 px tall —
+ * you can read its vest, its helmet and its ungated marker. At `ISO_ZOOM_MIN` a 1440 px viewport
+ * spans 720 world units, which is an order of magnitude more than the ~70-unit footprint of a
+ * 25-room factory: the whole plant becomes a diagram on the ground.
+ */
+export const ISO_ZOOM_MIN = 2;
+export const ISO_ZOOM_MAX = 400;
 
-/** Half-extent of the ground plane and the grid drawn on it. */
-export const FLOOR_SIZE = 200;
+/**
+ * How far the orbit may tilt.
+ *
+ * `0` is straight down (a true plan view). The maximum stops just short of `PI / 2`, which is the
+ * horizon: an orbit that swings past it puts the camera **under the ground plane** and shows the
+ * underside of every building and the back of the floor's paint. That is not freedom, it is a bug,
+ * so the clamp sits a couple of degrees above horizontal — close enough to graze along the floor,
+ * never far enough to go through it.
+ */
+export const MIN_POLAR_ANGLE = 0;
+export const MAX_POLAR_ANGLE = Math.PI / 2 - 0.035;
+
+/**
+ * The polar angle of the default view, derived from where the default camera stands. Exported so the
+ * clamp above can be checked against it: a default view outside its own orbit limits would be
+ * yanked somewhere else on the first drag.
+ */
+export function isoPolarAngle(): number {
+  const [x, y, z] = ISO_CAMERA_POSITION;
+  return Math.acos(y / Math.hypot(x, y, z));
+}
+
+/**
+ * Extent of the ground plane (and of the invisible plane a building is dragged across).
+ *
+ * Far larger than any factory on purpose. The camera can now be pulled back to `ISO_ZOOM_MIN`, where
+ * a wide viewport spans hundreds of world units, and the edge of the world must never be the thing
+ * the operator is looking at. It is one quad, so the size costs nothing.
+ */
+export const FLOOR_SIZE = 4000;
+
+/**
+ * Orthographic clip planes. `near` is negative on purpose: an orthographic camera looking down a
+ * diagonal would otherwise clip the geometry standing between it and its target. Both are far wider
+ * than the old ±(200, 600) because the ground is now `FLOOR_SIZE` across and the camera can tilt
+ * almost to the horizon — at a grazing angle the far corner of the ground is thousands of units away
+ * along the view axis, and a tighter frustum would cut the floor in half across the screen.
+ */
+export const CAMERA_NEAR = -4000;
+export const CAMERA_FAR = 8000;
 
 /**
  * The point the camera should frame: the centroid of every building on the floor, so adding rooms
@@ -40,10 +92,19 @@ export function isoCameraTarget(rooms: readonly Pick<RoomInfo, "position">[]): [
 
 // ---- framing the floor -------------------------------------------------------------------------
 //
-// The camera never rotates, so "where on screen does this world point land" is a fixed 3x2 matrix
-// that can be written down once and reasoned about without a renderer. Everything the framing needs
-// — how big the factory is in screen units, and which way to pan to centre it between the two HUD
-// panels — falls out of that matrix, which is why none of this needs three or a mounted canvas.
+// All of this is the arithmetic of the **default** isometric view: "where on screen does this world
+// point land" is then a fixed 3x2 matrix that can be written down once and reasoned about without a
+// renderer. Everything the framing needs — how big the factory is in screen units, and which way to
+// pan to centre it between the two HUD panels — falls out of that matrix, which is why none of this
+// needs three or a mounted canvas.
+//
+// The camera can now be orbited away from that angle, so this matrix is no longer "the" projection.
+// That is a deliberate choice rather than an oversight: **fitting restores the default orientation**
+// (see `CameraFraming`), so the framing is always computed for the view it is about to put the
+// operator back into. Solving the fit for an arbitrary orbit would mean either re-deriving the basis
+// per frame from a live camera — dragging three into a pure module — or fitting a box the operator
+// is looking at edge-on, which produces a "correct" framing nobody asked for. One button, one known
+// answer: `⤢ fit` means "put the floor plan back".
 
 /** Unit vectors of the camera's screen plane, in world space, derived from where the camera stands. */
 function isoBasis(): { right: [number, number, number]; up: [number, number, number] } {
@@ -189,27 +250,38 @@ export function draggedPosition(floorPoint: ScenePosition, offset: ScenePosition
 
 /** Thickness of the poured slab, seen as a lip wherever the floor is edge-on. */
 export const SLAB_THICKNESS = 0.5;
-/** Clear concrete kept between the outermost building and the kerb. */
-export const SLAB_APRON = 4;
-/** The smallest slab we ever pour, so a one-room factory still stands in a building. */
-export const SLAB_MIN_HALF = 18;
+/** The least clear concrete kept between the outermost building and the kerb. */
+export const SLAB_APRON = 10;
+/**
+ * …and the apron actually poured, as a fraction of how far the factory reaches. A constant apron is
+ * what made the shell read as a lid clamped over the buildings: it hugged them at every size, so
+ * however far the operator zoomed out the first thing they saw was the edge. Growing it with the
+ * factory keeps the kerb comfortably outside the frame at the reading distance and still bounded at
+ * a distance, which is what a shell is for.
+ */
+export const SLAB_APRON_RATIO = 0.6;
+/** The smallest slab we ever pour, so a one-room factory still stands on a floor and not on a mat. */
+export const SLAB_MIN_HALF = 40;
 
 /**
- * Half-extent of the concrete slab: big enough to contain every building with an apron of clear
- * floor around it, snapped up to a whole number of grid sections so the painted joints always meet
- * the kerb squarely.
+ * Half-extent of the concrete slab: big enough to contain every building with a generous apron of
+ * clear floor around it, snapped up to a whole number of grid sections so the painted joints always
+ * meet the kerb squarely.
  *
  * Derived rather than constant because the floor grows: rooms are laid out on rings that step
  * outwards for ever, and a fixed slab would eventually have workshops standing on bare ground —
- * which would read as a bug, not as a big factory.
+ * which would read as a bug, not as a big factory. `SLAB_MIN_HALF` is well past what the default
+ * view shows (at `ISO_ZOOM` a 1440 px viewport spans ~38 world units), so nobody who has not gone
+ * looking for the edge of the factory ever finds it.
  */
 export function slabHalf(rooms: readonly Pick<RoomInfo, "position" | "kind">[]): number {
-  let reach = SLAB_MIN_HALF - SLAB_APRON;
+  let reach = 0;
   for (const room of rooms) {
     const half = buildingSize(room.kind).width / 2;
     reach = Math.max(reach, Math.abs(room.position.x) + half, Math.abs(room.position.z) + half);
   }
-  return Math.ceil((reach + SLAB_APRON) / 2) * 2;
+  const apron = Math.max(SLAB_APRON, reach * SLAB_APRON_RATIO);
+  return Math.max(SLAB_MIN_HALF, Math.ceil((reach + apron) / 2) * 2);
 }
 
 /**

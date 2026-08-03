@@ -22,11 +22,23 @@ interface OrbitLike {
  * re-does it when a room is added or removed, when a panel is collapsed or expanded, and when the
  * window is resized.
  *
- * **It stops the first time the operator pans or zooms.** A camera that keeps re-framing is worse
- * than one that never does: the operator leans in on one workshop, an unrelated room appears, and
- * the floor jumps. `MapControls` fires `start` on real user input and never for a programmatic
- * change, so that event is an exact "the view is theirs now" signal. The `fit` control (and `f`)
- * hands it back, which is the single documented way to re-arm the automatic framing.
+ * **It stops the first time the operator touches the camera** — pan, zoom, orbit or tilt. A camera
+ * that keeps re-framing is worse than one that never does: the operator leans in on one workshop, an
+ * unrelated room appears, and the floor jumps. `MapControls` fires `start` on real user input and
+ * never for a programmatic change, so that event is an exact "the view is theirs now" signal. The
+ * `fit` control (and `f`) hands it back, which is the single documented way to re-arm the automatic
+ * framing.
+ *
+ * **Fitting restores the default orientation as well as the framing**, and that is deliberate. The
+ * camera is free to orbit and tilt, but `isoFraming` solves the fit for the default isometric angle
+ * (see the note in `layout.ts`), so this sets the camera back onto the `ISO_CAMERA_POSITION` diagonal
+ * relative to the target it just computed. That makes `⤢ fit` mean one legible thing — "put the floor
+ * plan back" — rather than "keep my angle but move me somewhere I did not choose", and it is the way
+ * back from an orbit the operator has got lost in.
+ *
+ * Because the automatic re-frames only ever run while the view is *not* the operator's, they only
+ * ever run from the default angle too: a room appearing can never silently un-rotate a camera the
+ * operator is holding.
  *
  * Deliberately *not* re-framing on a building being **moved**: a drag is the operator arranging
  * their floor, and having the camera lurch on pointer-up would make every drag feel like a mistake.
@@ -70,6 +82,8 @@ export function CameraFraming() {
       rooms, size.width, size.height, insets.left, insets.right, insets.bottom,
     );
     camera.zoom = zoom;
+    // Position relative to the target, which is what puts the camera back on the default diagonal —
+    // `controls.update()` below then re-derives the orientation from it, undoing any orbit or tilt.
     camera.position.set(
       target[0] + ISO_CAMERA_POSITION[0],
       target[1] + ISO_CAMERA_POSITION[1],

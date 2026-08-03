@@ -1,9 +1,8 @@
 import { useFrame } from "@react-three/fiber";
 import { memo, useEffect, useRef } from "react";
 import type { Group } from "three";
-import { AdditiveBlending, CanvasTexture, Euler, PlaneGeometry, SRGBColorSpace } from "three";
+import { AdditiveBlending, CanvasTexture, SRGBColorSpace } from "three";
 import type { FactoryStatus } from "../store";
-import { ISO_CAMERA_POSITION } from "./layout";
 import { STATUS_COLOR, STATUS_EMISSIVE } from "./palette";
 
 /** Pulses per second while an agent in the room is working. Slow enough to read as breathing. */
@@ -39,23 +38,6 @@ function glowTexture(): CanvasTexture | null {
 }
 
 const GLOW_TEXTURE = glowTexture();
-const GLOW_GEOMETRY = new PlaneGeometry(1, 1);
-
-/**
- * The orientation that makes a plane face the camera.
- *
- * A `<Billboard>` would recompute this every frame, and every frame is exactly what
- * `frameloop="demand"` does not render. It does not need recomputing: rotation is disabled on the
- * controls, so the camera's orientation is a constant of the scene and this can be worked out once
- * from where it stands. `YXZ` order so the yaw is applied *after* the pitch, which is what makes the
- * plane's normal come out along the camera direction.
- */
-const BILLBOARD = new Euler(
-  -Math.atan2(ISO_CAMERA_POSITION[1], Math.hypot(ISO_CAMERA_POSITION[0], ISO_CAMERA_POSITION[2])),
-  Math.atan2(ISO_CAMERA_POSITION[0], ISO_CAMERA_POSITION[2]),
-  0,
-  "YXZ",
-);
 
 /** How wide the glow is, and how bright, per status. `idle` is a lamp that is on but not saying much. */
 const GLOW_SIZE: Record<FactoryStatus, number> = { idle: 1.5, working: 2.6, blocked: 3, error: 3 };
@@ -70,10 +52,17 @@ const GLOW_OPACITY: Record<FactoryStatus, number> = { idle: 0.18, working: 0.6, 
  * frozen mesh, not a subtle one. A `blocked` beacon is therefore bright and still — which is also the
  * right message: it is not making progress, it is waiting for you.
  *
- * The halo is a camera-facing additive quad rather than bloom. Bloom is an `EffectComposer` pass over
- * the whole frame and a ~200 kB dependency, to brighten a handful of pixels that are already the
- * brightest thing on screen; a shared 64px gradient does the same job for one draw call and no
- * frames.
+ * The halo is a camera-facing additive **sprite** rather than bloom. Bloom is an `EffectComposer`
+ * pass over the whole frame and a ~200 kB dependency, to brighten a handful of pixels that are
+ * already the brightest thing on screen; a shared 64px gradient does the same job for one draw call.
+ *
+ * A sprite, specifically, because the camera rotates now. This used to be a `PlaneGeometry` with a
+ * rotation worked out once from where the fixed camera stood — correct exactly as long as the camera
+ * could not move, and edge-on (i.e. invisible) the moment it could. `THREE.Sprite` is billboarded by
+ * the renderer itself, from whatever the camera's orientation is when the frame is drawn, so it is
+ * right at every angle and still costs **no per-frame JavaScript** — which keeps the
+ * `frameloop="demand"` contract intact, unlike a `<Billboard>` or a `useFrame` that would have to
+ * re-aim it.
  */
 export const StatusBeacon = memo(function StatusBeacon({
   status,
@@ -125,8 +114,8 @@ export const StatusBeacon = memo(function StatusBeacon({
       </mesh>
       {/* The glow proper: additive, so it brightens whatever is behind it instead of tinting it. */}
       {GLOW_TEXTURE !== null && (
-        <mesh geometry={GLOW_GEOMETRY} rotation={BILLBOARD} scale={GLOW_SIZE[status]}>
-          <meshBasicMaterial
+        <sprite scale={GLOW_SIZE[status]}>
+          <spriteMaterial
             map={GLOW_TEXTURE}
             color={color}
             transparent
@@ -135,7 +124,7 @@ export const StatusBeacon = memo(function StatusBeacon({
             depthWrite={false}
             toneMapped={false}
           />
-        </mesh>
+        </sprite>
       )}
       {/* The mast, so the lamp belongs to the building instead of floating over it. */}
       <mesh position-y={-0.62}>
