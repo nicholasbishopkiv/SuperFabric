@@ -46,7 +46,8 @@ contiguous. 44 tests green (+1 live-quota test, run manually).
 
 Still open for M1:
 
-- [ ] Task panel with manual task entry (auto-routing needs the orchestrator — M3).
+- [x] Task panel with manual task entry — delivered with M3a (auto-routing still needs the
+      orchestrator, so a task with no room stays unassigned and the board says so).
 - [ ] Roles library v1: ~10 presets (role = prompt + skills/superpowers + plugins/MCP + model).
 - [ ] Onboarding agent for an empty project (interview → CLAUDE.md / README).
 
@@ -63,18 +64,46 @@ Still open for M1:
 
 ## M3 — Factory bus and the orchestrator
 
-- Factory Bus: in-process MCP tools (`factory_send`, `factory_inbox`,
-  `factory_report_status`, `factory_task_update`, `factory_ask_orchestrator`),
-  push delivery by injecting a turn.
-- TaskStore + kanban panel + task badges on rooms.
+**M3a is complete (2026-08-04)** — the bus, tasks, and packages that mean something:
+
+- [x] Factory Bus (`factoryBus.ts`): messages are rows first (migration 4), delivery second.
+      Delivery is push — a turn injected into the recipient's input stream, never a poll — and
+      only at a turn boundary, so a busy agent is never interrupted mid-turn. A message for a
+      room with nobody free stays queued, survives a restart, and is flushed at the next boundary
+      (one message per boundary, so a queue of N takes N boundaries).
+- [x] The bus as in-process MCP tools (`busTools.ts`): `factory_send`, `factory_inbox`,
+      `factory_task_update`, `factory_report_status`, built per session from that session's room.
+      The sending room comes from the session row and never from tool input. The model sees them
+      as `mcp__factory__*`, and they are **never gated** — see
+      `docs/decisions/0002-factory-tools-are-not-gated.md`.
+- [x] `TaskStore` (`taskStore.ts`) with room/assignee/`blockedOnMessageId`, a bottom-edge task
+      board grouped by status, per-room task badges, and a "new task" form whose default is
+      unassigned.
+- [x] Packages ride real messages: a delivery becomes a box on the belt keyed by the message id,
+      an undelivered message is a still grey crate stacked at its sender's door, and the two are
+      the same object in two states.
+- [x] Room charters tell an agent it is a department with a bus, and what its own room is called.
+
+**Acceptance run (live, one operator prompt)**: two rooms with one `auto` agent each. The chat
+agent was told once to ask payments for a webhook's method and path; it called
+`mcp__factory__factory_send` with no approval card; the payments agent received the message as an
+injected turn **nobody prompted**, investigated, called `factory_report_status`, and answered with
+`factory_send`; the reply arrived in the chat agent's session the same way. Both directions
+persisted, both broadcast, and a package rode the belt each way. Separately, with a fake executor:
+a message sent to a room whose agent was mid-turn stayed `delivered_at = NULL` on disk across a
+hard kill, and after the restart the boot flush carried exactly one, the second draining at the
+next boundary. 474 tests green (shared 33, server 247 + 1 skipped live-quota test, web 194).
+
+Still open for M3 (M3b):
+
 - Orchestrator: dedicated session (Opus) with an overview of all rooms, task
-  distribution, blocker resolution; orchestrator console in the UI.
+  distribution, blocker resolution; orchestrator console in the UI, `factory_ask_orchestrator`.
 - **Task auto-routing**: a task from the task panel with no department chosen goes to
-  the orchestrator — it analyzes, assigns room and assignee, and dispatches.
+  the orchestrator — it analyzes, assigns room and assignee, and dispatches. Until then such a
+  task is shown as unassigned and nothing pretends otherwise.
 - **Chronicle v1**: `factory_record_decision` + `factory_search_history` tools,
   ADR files in `docs/decisions/`, FTS5 search over decisions + prompt/event history,
   chronicle timeline in the UI.
-- Package meshes travel the conveyors between workshops (spline animation).
 
 ## M4 — Containerization
 

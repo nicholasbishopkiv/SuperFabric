@@ -28,6 +28,17 @@ and a subscription limit monitor with auto-pause/resume.
   `bypass` agent comes back as `bypass`, an `attended` one as `attended`. A session's SDK
   permission mode is always set explicitly, so the operator's own Claude Code default can never
   decide what a factory agent may do.
+- **A room is never taken from tool input.** The room an agent speaks for comes from its session
+  row, and `busTools` bakes it into the closures — an agent cannot send a bus message *as* another
+  department, whatever it puts in the arguments. A roomless session gets no bus tools at all.
+- **The factory's own bus tools are never gated.** `canUseTool` auto-allows tool names belonging
+  to this session's own in-process (`type: "sdk"`) MCP servers — for a room, `mcp__factory__*` —
+  in every autonomy mode, and still appends a `tool_use` event so the log records the call.
+  Everything else keeps going through the operator. See
+  `docs/decisions/0002-factory-tools-are-not-gated.md`.
+- **The bus persists before it delivers, and delivers only at a turn boundary.** A message is a
+  row before anyone is told about it, and an agent mid-turn is never interrupted: its queue drains
+  one message per `turn_complete`.
 
 ## Autonomy (per-agent permission mode)
 
@@ -76,9 +87,11 @@ out in the README so users know what they're installing.
 
 ## Status
 
-Design approved 2026-08-03. **M0 (core session runner) is complete** — see
-`docs/ROADMAP.md` for the acceptance evidence. Next: **M1 — 3D factory floor, project
-block, rooms, roles library v1**.
+Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folders and the 3D
+floor)** and **M3a (the factory bus, tasks, and packages that ride real messages)** are complete —
+see `docs/ROADMAP.md` for the acceptance evidence of each. Next: **M3b — the orchestrator and task
+auto-routing**, then the rest of M1 (roles library, onboarding agent) and M2 (multi-account and the
+limit monitor).
 
 ## Running it
 
@@ -121,10 +134,16 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   one-file change) · `origin.ts` (WebSocket
   origin allow-list) · `eventStore.ts` (append-only log + subscriptions)
   · `executor.ts` (provider seam) · `executors/claudeCode.ts` (Agent SDK, streaming input)
-  · `executors/fake.ts` (scripted, for tests) · `sessionManager.ts` (sessions, approvals,
-  resume/stopAll) · `wsHub.ts` (replay-then-tail) · `index.ts` (wiring only) ·
+  · `executors/fake.ts` (scripted, for tests) · `roomManager.ts` (rooms as folders, charters)
+  · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
+  each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
+  `busTools.ts` (the bus as an in-process MCP server, one per session's room) ·
+  `taskStore.ts` (the task board; announces its own changes) · `wsHub.ts` (replay-then-tail plus
+  debounced `sessions`/`rooms`/`tasks`/`messages` broadcasts) · `index.ts` (wiring only) ·
   `notes/agent-sdk-api.md` (verified SDK API reference — trust it over memory).
   Its tests run under `bun test` (`test/_waitFor.ts` replaces `vi.waitFor`); `packages/shared`
   and `packages/web` stay on vitest.
-- `packages/web` — `store.ts` (zustand, dedupes replays) · `wsClient.ts` (reconnect +
-  resubscribe from `lastSeq`) · `App.tsx` (M0 console; M1 replaces it with the 3D floor).
+- `packages/web` — `store.ts` (zustand: dedupes replays, and turns the bus's message snapshot into
+  packages and waiting crates) · `wsClient.ts` (reconnect + resubscribe from `lastSeq`) ·
+  `App.tsx` (the 3D floor plus three HUD edges) · `scene/*` (the floor) · `hud/*` (room panel,
+  console drawer, task board).

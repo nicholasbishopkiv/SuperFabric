@@ -48,15 +48,32 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   Source of truth for the UI; the WebSocket is a lossy tail. Client reconnect sends
   `{sessionId, afterSeq}` and replays. (Pattern proven by Vibe Kanban's MsgStore and
   Crystal's SQLite buffering.)
-- **Factory Bus** — inter-room messaging. Implemented as **in-process MCP servers**
-  (`createSdkMcpServer`) injected into every session with tools:
-  `factory_send(to_room, kind, body)`, `factory_inbox()`, `factory_report_status(...)`,
-  `factory_ask_orchestrator(...)`, `factory_task_update(...)`. Messages persist in SQLite
-  (`messages` table). **Delivery is push**: when a message targets an idle agent, the
-  server injects a turn into that agent's input stream; busy agents get it queued and
-  delivered at next turn boundary. No polling loops burning tokens.
-- **TaskStore** — `tasks(id, room, title, status, assignee, blocked_on, ...)`. Agents
-  mutate via bus tools; UI renders board + canvas badges.
+- **Factory Bus** (`src/factoryBus.ts`, built in M3a) — inter-room messaging. Messages persist in
+  SQLite (`messages`, migration 4) **before** anything is delivered, so a message survives a crash
+  mid-delivery. **Delivery is push**: a message for an available agent is injected as a turn
+  immediately; one for a busy agent waits until `SessionManager` calls `flushRoom` at that room's
+  next `turn_complete`. No polling loops burning tokens. One message drains per boundary, so a
+  queue of N takes N boundaries. The bus knows nothing about `SessionManager` — it takes a
+  `deliver(sessionId, text)` callback and a `roomAgents(roomId)` lookup, which keeps the
+  dependency one-way and the delivery rules unit-testable without a session runner.
+  - The tool surface is separate (`src/busTools.ts`): an **in-process MCP server**
+    (`createSdkMcpServer`) built **per session from that session's room** and passed through
+    `ExecutorStartOptions.mcpServers`. Tools: `factory_send(to_room, kind, body, task_id?)`,
+    `factory_inbox()`, `factory_task_update(task_id, status?, detail?)`,
+    `factory_report_status(summary)`. `factory_ask_orchestrator` arrives with the orchestrator
+    (M3b). The model sees them namespaced as `mcp__factory__*`.
+  - **The sending room is never read from tool input** — it comes from the session row, so an
+    agent cannot send a message *as* another department. A roomless session gets no bus tools.
+  - These tools are **not gated**: `canUseTool` allows anything belonging to this session's own
+    in-process servers without asking the operator, and records the call as a `tool_use` event.
+    Everything else still raises a card. See `docs/decisions/0002-factory-tools-are-not-gated.md`.
+- **TaskStore** (`src/taskStore.ts`) — `tasks(id, title, detail, status, room_id, agent_id,
+  blocked_on_message_id, …)`, migration 4. Refuses a card that would lie: an unknown room, or an
+  assignee who does not work in the task's room. Agents mutate it through the bus tools and the
+  operator through `create_task`/`update_task`; either way the store announces its own changes and
+  the hub broadcasts the board, because most changes never pass through the hub. The UI renders a
+  bottom-edge board plus per-room badges. A task with no room is **unassigned**, which is the
+  intended state until the orchestrator (M3b) can route it.
 - **LimitMonitor** — per account: polls `GET https://api.anthropic.com/api/oauth/usage`
   (bearer from that account's `.credentials.json`, `anthropic-beta: oauth-2025-04-20`,
   claude-code User-Agent, ~180s interval). Reads `five_hour`, `seven_day`,
@@ -191,11 +208,14 @@ room folder and `--add-dir` for explicitly shared paths.
 
 ## 4. Key flows
 
-**Inter-room request**: chat-agent calls `factory_send("payments", "request", "need
-webhook X for push notifications")` → row in `messages` → server injects turn into
-payments-agent input → payments agent works, replies `factory_send("chat", "response",
-...)` → a package mesh travels the conveyor chat→payments→chat, task panel links the
-two tasks.
+**Inter-room request** (built and run live in M3a): chat-agent calls
+`factory_send("payments", "request", "need webhook X for push notifications")` → row in
+`messages` → server injects the turn into the payments agent's input (immediately if it is free,
+otherwise at its next turn boundary) → payments agent works and replies
+`factory_send("chat", "response", ...)` → each delivery is broadcast and the web store turns it
+into a package mesh travelling the conveyor, keyed by the message id; an undelivered message is
+drawn instead as a still crate stacked at the sender's door. A `request` naming a `task_id` sets
+that task `blocked` on the message and a `response` releases it.
 
 **Manual task with auto-routing**: user adds a task in the task panel without picking a
 room → server injects it into the orchestrator session → orchestrator analyzes it, calls
