@@ -1,0 +1,12 @@
+{
+  "name": "superfabric",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "pnpm -r --if-present test",
+    "build": "pnpm -r --if-present build",
+    "dev": "pnpm -r --parallel --if-present dev"
+  },
+  "devDependencies": { "typescript": "^5.6.0", "vitest": "^3.0.0" }
+}
