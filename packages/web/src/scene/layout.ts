@@ -181,6 +181,48 @@ export function draggedPosition(floorPoint: ScenePosition, offset: ScenePosition
   return { x: round3(floorPoint.x + offset.x), z: round3(floorPoint.z + offset.z) };
 }
 
+// ---- the factory shell -------------------------------------------------------------------------
+
+/** Thickness of the poured slab, seen as a lip wherever the floor is edge-on. */
+export const SLAB_THICKNESS = 0.5;
+/** Clear concrete kept between the outermost building and the kerb. */
+export const SLAB_APRON = 4;
+/** The smallest slab we ever pour, so a one-room factory still stands in a building. */
+export const SLAB_MIN_HALF = 18;
+
+/**
+ * Half-extent of the concrete slab: big enough to contain every building with an apron of clear
+ * floor around it, snapped up to a whole number of grid sections so the painted joints always meet
+ * the kerb squarely.
+ *
+ * Derived rather than constant because the floor grows: rooms are laid out on rings that step
+ * outwards for ever, and a fixed slab would eventually have workshops standing on bare ground —
+ * which would read as a bug, not as a big factory.
+ */
+export function slabHalf(rooms: readonly Pick<RoomInfo, "position" | "kind">[]): number {
+  let reach = SLAB_MIN_HALF - SLAB_APRON;
+  for (const room of rooms) {
+    const half = buildingSize(room.kind).width / 2;
+    reach = Math.max(reach, Math.abs(room.position.x) + half, Math.abs(room.position.z) + half);
+  }
+  return Math.ceil((reach + SLAB_APRON) / 2) * 2;
+}
+
+/**
+ * The painted zone circles on the slab: one under each ring that has a building on it, so the floor
+ * markings describe the layout the rooms actually use instead of decorating it arbitrarily.
+ */
+export function paintedZones(rooms: readonly Pick<RoomInfo, "position" | "kind">[]): number[] {
+  const radii = new Set<number>();
+  for (const room of rooms) {
+    const r = Math.hypot(room.position.x, room.position.z);
+    // The project block sits at the middle; it has no ring.
+    if (r < 1) continue;
+    radii.add(Math.round(r * 2) / 2);
+  }
+  return [...radii].sort((a, b) => a - b);
+}
+
 /** Footprint and height of a building, by room kind. The project block is the bigger one. */
 export function buildingSize(kind: RoomInfo["kind"]): { width: number; height: number } {
   return kind === "project" ? { width: 6, height: 5 } : { width: 4, height: 3 };

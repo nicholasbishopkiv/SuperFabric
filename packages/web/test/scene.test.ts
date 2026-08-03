@@ -18,7 +18,19 @@ import {
   ringPosition,
   roofTop,
 } from "../src/scene/layout";
-import { BYPASS_COLOR, STATUS_COLOR, STATUS_EMISSIVE } from "../src/scene/palette";
+import {
+  ACCENT_HUE_MAX,
+  ACCENT_HUE_MIN,
+  BYPASS_COLOR,
+  hsl,
+  PACKAGE_COLORS,
+  roomAccent,
+  roomAccentHue,
+  SELECT_COLOR,
+  STATUS_COLOR,
+  STATUS_EMISSIVE,
+  STATUS_HUE_BANDS,
+} from "../src/scene/palette";
 
 /**
  * jsdom has no WebGL, so a `<Canvas>` can never be mounted here. What is testable is every piece of
@@ -323,5 +335,111 @@ describe("the status palette", () => {
     expect(STATUS_EMISSIVE.idle).toBeLessThan(STATUS_EMISSIVE.working);
     expect(STATUS_EMISSIVE.blocked).toBeGreaterThanOrEqual(STATUS_EMISSIVE.working);
     expect(STATUS_EMISSIVE.error).toBeGreaterThanOrEqual(STATUS_EMISSIVE.working);
+  });
+});
+
+/** `#rrggbb` -> hue in degrees and saturation/lightness in 0..1. */
+function hslOf(hex: string): { h: number; s: number; l: number } {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  const d = max - min;
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  return { h: (h + 360) % 360, s, l };
+}
+
+const inBand = (h: number, [lo, hi]: readonly [number, number]): boolean =>
+  lo <= hi ? h >= lo && h <= hi : h >= lo || h <= hi;
+
+describe("hsl", () => {
+  it("agrees with the CSS colour it is named after", () => {
+    expect(hsl(0, 0, 0)).toBe("#000000");
+    expect(hsl(0, 0, 1)).toBe("#ffffff");
+    expect(hsl(0, 1, 0.5)).toBe("#ff0000");
+    expect(hsl(120, 1, 0.5)).toBe("#00ff00");
+    expect(hsl(240, 1, 0.5)).toBe("#0000ff");
+  });
+
+  it("wraps the hue rather than clipping it", () => {
+    expect(hsl(360, 1, 0.5)).toBe(hsl(0, 1, 0.5));
+    expect(hsl(-120, 1, 0.5)).toBe(hsl(240, 1, 0.5));
+  });
+});
+
+describe("room accents", () => {
+  const names = ["intake", "design", "backend", "frontend", "qa", "shipping", "docs", "infra"];
+
+  it("is stable for a name: the same department is the same colour everywhere, forever", () => {
+    expect(roomAccent("backend")).toEqual(roomAccent("backend"));
+    expect(roomAccentHue("backend")).toBe(roomAccentHue("backend"));
+  });
+
+  it("gives different departments different hues", () => {
+    const hues = names.map(roomAccentHue);
+    expect(new Set(hues).size).toBe(names.length);
+  });
+
+  it("**never collides with a status hue** — status is semantics, an accent is decoration", () => {
+    for (const name of names) {
+      const hue = roomAccentHue(name);
+      expect(hue).toBeGreaterThanOrEqual(ACCENT_HUE_MIN);
+      expect(hue).toBeLessThanOrEqual(ACCENT_HUE_MAX);
+      for (const band of STATUS_HUE_BANDS) expect(inBand(hue, band)).toBe(false);
+    }
+  });
+
+  it("puts every status colour and the bypass marker inside a band an accent may not use", () => {
+    // The bands are only worth having if they actually cover the colours they claim to.
+    for (const color of [...Object.values(STATUS_COLOR), BYPASS_COLOR]) {
+      const { h, s } = hslOf(color);
+      if (s < 0.2) continue; // `idle` is desaturated slate; its hue carries no meaning
+      expect(STATUS_HUE_BANDS.some((band) => inBand(h, band))).toBe(true);
+    }
+  });
+
+  it("stays quieter than any status colour, so status always wins the read", () => {
+    const loudestStatus = Math.min(
+      ...Object.values(STATUS_COLOR).map((c) => hslOf(c).s).filter((s) => s > 0.2),
+    );
+    for (const name of names) {
+      for (const shade of Object.values(roomAccent(name))) {
+        expect(hslOf(shade).s).toBeLessThan(loudestStatus);
+      }
+    }
+  });
+
+  it("shades an accent light to dark, so trim can be layered on one building", () => {
+    for (const name of names) {
+      const { band, deep, light } = roomAccent(name);
+      expect(hslOf(deep).l).toBeLessThan(hslOf(band).l);
+      expect(hslOf(band).l).toBeLessThan(hslOf(light).l);
+    }
+  });
+});
+
+describe("selection and packages", () => {
+  it("keeps the selection colour out of every status band and off the accent scale", () => {
+    const { h, s } = hslOf(SELECT_COLOR);
+    for (const band of STATUS_HUE_BANDS) expect(inBand(h, band)).toBe(false);
+    // Saturated, unlike every accent: the rim has to shout where a painted band murmurs.
+    expect(s).toBeGreaterThan(0.6);
+    expect(SELECT_COLOR).not.toBe(BYPASS_COLOR);
+    expect(Object.values(STATUS_COLOR)).not.toContain(SELECT_COLOR);
+  });
+
+  it("varies the packages by tone only, and keeps them all cardboard", () => {
+    expect(new Set(PACKAGE_COLORS).size).toBe(PACKAGE_COLORS.length);
+    const hues = PACKAGE_COLORS.map((c) => hslOf(c).h);
+    // one hue family (they are all cardboard), spread in lightness
+    expect(Math.max(...hues) - Math.min(...hues)).toBeLessThan(15);
+    const lightness = PACKAGE_COLORS.map((c) => hslOf(c).l);
+    expect(Math.max(...lightness) - Math.min(...lightness)).toBeGreaterThan(0.05);
   });
 });
