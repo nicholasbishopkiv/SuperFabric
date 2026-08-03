@@ -94,8 +94,9 @@ export class RoomManager {
    * created — the root already exists, and writing a charter into it would touch the user's repo.
    */
   ensureProjectRoom(): RoomInfo {
-    const existing = this.stmts.projectRoom.get() as { id: string } | undefined;
-    if (existing !== undefined) return this.getRoom(existing.id)!;
+    // `!= null`, not `!== undefined`: "no such row" is `null` for the driver db.ts uses.
+    const existing = this.stmts.projectRoom.get() as { id: string } | null;
+    if (existing != null) return this.getRoom(existing.id)!;
 
     const id = randomUUID();
     this.stmts.insert.run(id, this.projectRoomName(), this.root, "project", 0, 0);
@@ -120,7 +121,7 @@ export class RoomManager {
       throw new Error(`invalid room name ${JSON.stringify(name)}: ${parsed.error.issues[0]?.message ?? "rejected"}`);
     }
     if (dir === this.root) throw new Error(`room ${JSON.stringify(name)} would be the project root itself`);
-    if (this.stmts.byName.get(name) !== undefined) throw new Error(`room ${JSON.stringify(name)} already exists`);
+    if (this.stmts.byName.get(name) != null) throw new Error(`room ${JSON.stringify(name)} already exists`);
 
     mkdirSync(dir, { recursive: true });
     // Never clobber docs that are already there: a room may be an existing folder with its own
@@ -139,9 +140,10 @@ export class RoomManager {
     return (this.stmts.list.all() as RoomRow[]).map(toRoomInfo);
   }
 
+  /** `undefined` for an unknown room: the absent-row shape the rest of the package speaks. */
   getRoom(roomId: string): RoomInfo | undefined {
-    const row = this.stmts.one.get(roomId) as RoomRow | undefined;
-    return row === undefined ? undefined : toRoomInfo(row);
+    const row = this.stmts.one.get(roomId) as RoomRow | null;
+    return row == null ? undefined : toRoomInfo(row);
   }
 
   /** Move a building on the floor. The layout is persisted, so it survives a reload and a restart. */

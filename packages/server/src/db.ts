@@ -1,6 +1,10 @@
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 
-export type Db = Database.Database;
+/**
+ * The only file in the package that names the SQLite driver. Everything else takes a `Db`, so
+ * swapping the driver again stays a one-file change (see docs/decisions/0001-bun-runtime-keep-vite.md).
+ */
+export type Db = Database;
 
 /**
  * Ordered schema migrations. Step `i` takes the database from `user_version = i` to `i + 1`, so
@@ -63,20 +67,26 @@ export const SCHEMA_VERSION = MIGRATIONS.length;
 
 export function openDb(path: string): Db {
   const db = new Database(path);
-  if (path !== ":memory:") db.pragma("journal_mode = WAL");
+  if (path !== ":memory:") db.exec("PRAGMA journal_mode = WAL");
   migrate(db);
   return db;
 }
 
+/** Current `PRAGMA user_version`, i.e. how many migration steps this file has seen. */
+function userVersion(db: Db): number {
+  const row = db.query("PRAGMA user_version").get() as { user_version: number } | null;
+  return Number(row?.user_version ?? 0);
+}
+
 /** Apply every migration the database has not seen yet. Returns the resulting version. */
 export function migrate(db: Db): number {
-  const from = Number(db.pragma("user_version", { simple: true }));
+  const from = userVersion(db);
   if (from >= MIGRATIONS.length) return from;
   db.transaction(() => {
     for (let v = from; v < MIGRATIONS.length; v++) {
       db.exec(MIGRATIONS[v]!);
       // PRAGMA takes a literal, not a bound parameter; `v + 1` is a loop counter, not user input.
-      db.pragma(`user_version = ${v + 1}`);
+      db.exec(`PRAGMA user_version = ${v + 1}`);
     }
   })();
   return MIGRATIONS.length;

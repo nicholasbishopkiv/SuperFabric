@@ -96,8 +96,8 @@ export class SessionManager {
    * fails, the next boot starts the agent in the mode the operator asked for.
    */
   async setAutonomy(id: string, autonomy: AutonomyMode): Promise<void> {
-    const row = this.stmts.session.get(id) as SessionRow | undefined;
-    if (row === undefined) throw new Error(`unknown session ${id}`);
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
     this.stmts.setAutonomy.run(autonomy, id);
 
     const handle = this.handles.get(id);
