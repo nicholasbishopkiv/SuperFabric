@@ -192,6 +192,9 @@ describe("protocol", () => {
       expect(ClientMessage.parse({ kind: "update_task", taskId: "t1", roomId: null, agentId: null }))
         .toMatchObject({ roomId: null, agentId: null });
       expect(ClientMessage.parse({ kind: "list_tasks" }).kind).toBe("list_tasks");
+      // The bus's traffic is askable-for, not only pushed: a queued message is state a tab needs on
+      // connect, and the answer is the baseline that keeps later broadcasts from replaying history.
+      expect(ClientMessage.parse({ kind: "list_messages" }).kind).toBe("list_messages");
 
       expect(() => ClientMessage.parse({ kind: "create_task" })).toThrow();
       expect(() => ClientMessage.parse({ kind: "create_task", title: "" })).toThrow();

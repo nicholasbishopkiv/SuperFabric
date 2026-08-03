@@ -182,6 +182,9 @@ export class WsHub {
           this.scheduleBroadcast("tasks");
           break;
         case "list_tasks": this.safeSend(sock, { kind: "tasks", tasks: this.taskStore().list() }); break;
+        // A query like the others: the socket that asked gets the bus's newest traffic, and nobody
+        // else is spammed with a list they already hold.
+        case "list_messages": this.safeSend(sock, { kind: "messages", messages: this.busStore().list() }); break;
       }
     } catch (err) {
       this.safeSend(sock, { kind: "error", message: String(err) });
@@ -223,6 +226,12 @@ export class WsHub {
   private taskStore(): TaskStore {
     if (this.tasks === undefined) throw new Error("this server has no task board");
     return this.tasks;
+  }
+
+  /** Likewise for the bus: "no factory bus here" is an answer, an empty list would be a lie. */
+  private busStore(): FactoryBus {
+    if (this.bus === undefined) throw new Error("this server has no factory bus");
+    return this.bus;
   }
 
   /** Replay the log after `afterSeq`, then keep tailing from wherever the replay ended. */

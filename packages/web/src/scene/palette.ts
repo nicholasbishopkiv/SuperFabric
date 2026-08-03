@@ -171,6 +171,20 @@ export const PACKAGE_COLORS = ["#c58a4a", "#b87d42", "#d09a5c", "#a97239"] as co
 /** Legacy single-colour export, still the mean of the four. */
 export const PACKAGE_COLOR = PACKAGE_COLORS[0];
 
+/**
+ * A message nobody has picked up yet, stacked at its sender's loading bay.
+ *
+ * Cool grey rather than cardboard, and on purpose: warm cardboard is what *moves* on this floor, so
+ * a crate that is going nowhere should not be made of it. This is the same near-neutral slate as the
+ * buildings — it belongs to the architecture, not to the traffic.
+ *
+ * Deliberately **not** the amber that means `blocked`, either. A queue is not an approval waiting on
+ * the operator, and borrowing a status hue for it would make the one colour that means "answer me"
+ * mean two things. The distinction is carried by shape and stillness as well: a flat crate that does
+ * not move, versus a cube that travels and tumbles.
+ */
+export const WAITING_PACKAGE_COLOR = "#7d8794";
+
 // ---- per-room accents --------------------------------------------------------------------------
 
 /**

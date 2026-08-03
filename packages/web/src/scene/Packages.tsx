@@ -3,9 +3,9 @@ import { useLayoutEffect, useMemo, useRef } from "react";
 import type { CatmullRomCurve3, InstancedMesh } from "three";
 import { BoxGeometry, Color, Matrix4, MeshStandardMaterial, Quaternion, Vector3 } from "three";
 import type { PackageInFlight } from "../store";
-import { beltFan, useFabric } from "../store";
-import { conveyorCurve, pointAt } from "./conveyorPath";
-import { PACKAGE_COLORS } from "./palette";
+import { beltFan, useFabric, useWaitingMessages } from "../store";
+import { conveyorCurve, pointAt, waitingSlot, waitingStackIndices } from "./conveyorPath";
+import { PACKAGE_COLORS, WAITING_PACKAGE_COLOR } from "./palette";
 
 /**
  * How many packages can be in flight at once. A factory that saturates this is a factory whose bus is
@@ -154,12 +154,87 @@ export function Packages() {
   });
 
   return (
+    <>
+      <instancedMesh
+        ref={meshRef}
+        args={[PACKAGE_GEOMETRY, PACKAGE_MATERIAL, CAPACITY]}
+        castShadow
+        // Instance transforms are written by hand every frame, so the mesh's own bounding sphere (a
+        // half-metre box at the origin) says nothing useful about where the packages actually are.
+        frustumCulled={false}
+      />
+      <WaitingPackages />
+    </>
+  );
+}
+
+/** How many undelivered messages can be drawn at once. Past this the pile is a number, not a shape. */
+const WAITING_CAPACITY = 96;
+
+/**
+ * A flat crate rather than a cube: the silhouette is the distinction that survives being small on
+ * screen, in a way a colour difference alone does not.
+ */
+const WAITING_GEOMETRY = new BoxGeometry(0.62, 0.18, 0.62);
+const WAITING_MATERIAL = new MeshStandardMaterial({ color: WAITING_PACKAGE_COLOR, roughness: 0.9 });
+
+/**
+ * Messages nobody has picked up yet, stacked at the door they were posted from.
+ *
+ * **Deliberately still.** These are written once, when the queue changes, and never touched by the
+ * render loop — a pile-up is a state to read, and animating it would pin `frameloop` to `"always"`
+ * for as long as a room stayed busy. `FactoryScene` invalidates on the store change instead, which
+ * is one frame per change rather than sixty a second for ever.
+ *
+ * The transition to flight is not this component's job and does not need to be: a delivered message
+ * leaves this list and enters `packages` under the *same id*, and its belt curve starts at the same
+ * door, so the box picks up where the crate stood.
+ */
+function WaitingPackages() {
+  const waiting = useWaitingMessages();
+  const rooms = useFabric((s) => s.rooms);
+  const conveyors = useFabric((s) => s.conveyors);
+  const meshRef = useRef<InstancedMesh>(null);
+
+  const slots = useMemo(() => {
+    const byId = new Map(rooms.map((r) => [r.id, r]));
+    const indices = waitingStackIndices(waiting);
+    const placed: { point: Vector3; scale: number }[] = [];
+    for (const [i, msg] of waiting.entries()) {
+      const from = byId.get(msg.from);
+      const to = byId.get(msg.to);
+      // A message between rooms this client has not been told about has no door to stand at.
+      if (from === undefined || to === undefined || msg.from === msg.to) continue;
+      if (placed.length >= WAITING_CAPACITY) break;
+      const { t, lift } = waitingSlot(indices[i]);
+      const point = pointAt(conveyorCurve(from, to, undefined, beltFan(conveyors, msg.from, msg.to)), t);
+      point.y += lift;
+      // The pile settles as it grows: the crates further up are the older ones, slightly squashed
+      // under the newer, which reads as weight rather than as a floating stack.
+      placed.push({ point, scale: 1 - Math.min(indices[i], 5) * 0.03 });
+    }
+    return placed;
+  }, [waiting, rooms, conveyors]);
+
+  useLayoutEffect(() => {
+    const mesh = meshRef.current;
+    if (mesh === null) return;
+    for (const [i, { point, scale }] of slots.entries()) {
+      scratchQuaternion.setFromAxisAngle(UP, 0);
+      scratchScale.set(scale, 1, scale);
+      scratchMatrix.compose(point, scratchQuaternion, scratchScale);
+      mesh.setMatrixAt(i, scratchMatrix);
+    }
+    mesh.count = slots.length;
+    mesh.instanceMatrix.needsUpdate = true;
+  }, [slots]);
+
+  return (
     <instancedMesh
       ref={meshRef}
-      args={[PACKAGE_GEOMETRY, PACKAGE_MATERIAL, CAPACITY]}
+      args={[WAITING_GEOMETRY, WAITING_MATERIAL, WAITING_CAPACITY]}
       castShadow
-      // Instance transforms are written by hand every frame, so the mesh's own bounding sphere (a
-      // half-metre box at the origin) says nothing useful about where the packages actually are.
+      receiveShadow
       frustumCulled={false}
     />
   );

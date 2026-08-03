@@ -75,10 +75,13 @@ function RedrawOnStoreChange() {
   // one more after the last one is reaped to erase it — by then `hasMotion` is false again and the
   // loop is back on demand, so that final frame has to be asked for.
   const packages = useFabric((s) => s.packages);
+  // The waiting markers are static by design (see `WaitingPackages`), so nothing else will ever ask
+  // for the frame that draws a new one — or erases the one that just left on a belt.
+  const waiting = useFabric((s) => s.waiting);
 
   useEffect(() => {
     invalidate();
-  }, [invalidate, rooms, sessions, selectedRoomId, packages]);
+  }, [invalidate, rooms, sessions, selectedRoomId, packages, waiting]);
 
   return null;
 }

@@ -36,6 +36,9 @@ export function connect(): void {
     // building needs to draw itself (position, kind, live status), so a reload never shows a blank
     // factory waiting for the first event to arrive.
     send({ kind: "list_rooms" });
+    // The bus's traffic, for the same reason: a message queued for a busy room is drawn on the
+    // floor, and this snapshot is the baseline that keeps the belts from replaying old deliveries.
+    send({ kind: "list_messages" });
     // The server hard-terminates sockets on shutdown, so a reconnect must re-ask for the tail of
     // every session we were following — from the last contiguous seq we hold, not from 0.
     const { contiguousSeq } = useFabric.getState();

@@ -34,8 +34,14 @@ import {
   STATUS_COLOR,
   STATUS_EMISSIVE,
   STATUS_HUE_BANDS,
+  WAITING_PACKAGE_COLOR,
 } from "../src/scene/palette";
-import { wallDistance } from "../src/scene/conveyorPath";
+import {
+  wallDistance,
+  waitingSlot,
+  waitingStackIndices,
+  WAITING_STACK_MAX,
+} from "../src/scene/conveyorPath";
 
 /**
  * jsdom has no WebGL, so a `<Canvas>` can never be mounted here. What is testable is every piece of
@@ -546,5 +552,55 @@ describe("selection and packages", () => {
     expect(Math.max(...hues) - Math.min(...hues)).toBeLessThan(15);
     const lightness = PACKAGE_COLORS.map((c) => hslOf(c).l);
     expect(Math.max(...lightness) - Math.min(...lightness)).toBeGreaterThan(0.05);
+  });
+
+  it("keeps the waiting-crate colour out of the status vocabulary and off the cardboard", () => {
+    // A queue is not an approval waiting on the operator; borrowing amber would make the one colour
+    // that means "answer me" mean two things.
+    const { h, s } = hslOf(WAITING_PACKAGE_COLOR);
+    for (const band of STATUS_HUE_BANDS) expect(inBand(h, band)).toBe(false);
+    // Near-neutral, so it cannot be mistaken for a room's accent either (those sit at 0.3).
+    expect(s).toBeLessThan(0.2);
+    // Cool, where everything that moves on the belts is warm: a crate going nowhere is not goods.
+    expect(h).toBeGreaterThan(180);
+    expect(s).toBeLessThan(Math.min(...PACKAGE_COLORS.map((c) => hslOf(c).s)));
+  });
+});
+
+describe("messages waiting at a door", () => {
+  it("puts the first crate at the sender's end of the belt, not out on the road", () => {
+    const { t, lift } = waitingSlot(0);
+    expect(t).toBeGreaterThan(0);
+    expect(t).toBeLessThan(0.12);
+    expect(lift).toBe(0);
+  });
+
+  it("stacks each further crate a little along and a little higher", () => {
+    const a = waitingSlot(0);
+    const b = waitingSlot(1);
+    const c = waitingSlot(2);
+    expect(b.t).toBeGreaterThan(a.t);
+    expect(c.t).toBeGreaterThan(b.t);
+    expect(b.lift).toBeGreaterThan(a.lift);
+    expect(c.lift - b.lift).toBeCloseTo(b.lift - a.lift, 6);
+  });
+
+  it("stops spreading past the stack limit, so forty messages are not a staircase", () => {
+    const capped = waitingSlot(WAITING_STACK_MAX - 1);
+    expect(waitingSlot(WAITING_STACK_MAX)).toEqual(capped);
+    expect(waitingSlot(400)).toEqual(capped);
+    // A negative index is a caller bug, not a crate under the floor.
+    expect(waitingSlot(-3)).toEqual(waitingSlot(0));
+  });
+
+  it("counts each queue at its own sender, for its own recipient", () => {
+    expect(waitingStackIndices([
+      { from: "a", to: "b" },
+      { from: "a", to: "b" },
+      { from: "c", to: "b" },
+      // The other direction is a different pile: the marker stands at the sender's end.
+      { from: "b", to: "a" },
+      { from: "a", to: "b" },
+    ])).toEqual([0, 1, 0, 0, 2]);
   });
 });

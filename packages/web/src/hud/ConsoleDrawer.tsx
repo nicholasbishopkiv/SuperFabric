@@ -10,10 +10,11 @@ import { useHudInset } from "./useHudInset";
 type ApprovalRequest = Extract<SessionEvent, { type: "approval_request" }>;
 
 /**
- * **Placeholder for the M3 factory bus.** There is no inter-room messaging yet, so nothing on the
- * floor would ever put a package on a belt and the whole channel would be untestable. This control
- * calls the exact store action the bus will call (`sendPackage(from, to)`) and nothing else, so when
- * M3 lands the client side is already finished: delete this panel, call the action from a bus message.
+ * **A demo, and labelled as one.** Real traffic reaches the belts through `applyMessages`: an agent
+ * calls `factory_send`, the server broadcasts the bus's messages, and the store turns each new
+ * delivery into a package keyed by the message's own id. This button puts a box on a belt with no
+ * message behind it, which is worth keeping only for exercising the conveyors on a factory that has
+ * no agents running — so it says so, and its packages carry `demo-…` ids.
  */
 function PackageSender() {
   const rooms = useFabric((s) => s.rooms);
@@ -24,7 +25,7 @@ function PackageSender() {
   if (rooms.length < 2) {
     return (
       <div style={{ color: C.dim, marginBottom: 12 }}>
-        Factory bus (M3 placeholder) — needs two rooms on the floor.
+        Belt demo — needs two rooms on the floor.
       </div>
     );
   }
@@ -41,7 +42,9 @@ function PackageSender() {
 
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginBottom: 12 }}>
-      <span style={{ color: C.dim }}>Factory bus (M3 placeholder):</span>
+      <span style={{ color: C.dim }} title="No message behind it — real bus traffic animates on its own.">
+        Belt demo:
+      </span>
       <select aria-label="Package from" value={source} onChange={(e) => setFrom(e.target.value)} style={{ font: "inherit" }}>
         {options}
       </select>
@@ -50,7 +53,7 @@ function PackageSender() {
         {options}
       </select>
       <button onClick={() => sendPackage(source, target)} disabled={source === target}>
-        Send a package
+        Send a demo package
       </button>
     </div>
   );

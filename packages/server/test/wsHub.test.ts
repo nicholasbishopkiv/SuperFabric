@@ -639,6 +639,30 @@ describe("WsHub", () => {
       });
     });
 
+    it("list_messages answers only the socket that asked, queue included", async () => {
+      await withRooms(({ hub, bus, sock, sent, chat, payments }) => {
+        // Nobody is standing in payments, so this one stays queued — and a tab that connects has to
+        // be told about it, or the pile-up at the sender's door is invisible until something moves.
+        const msg = bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "nobody home" });
+        const second = fakeSocket();
+        hub.attach(second.sock);
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "list_messages" }));
+
+        const messages = lastMessages(sent)!;
+        expect(messages.map(m => m.id)).toEqual([msg.id]);
+        expect(messages[0].deliveredAt).toBeNull();
+        expect(second.sent).toHaveLength(0);
+      });
+    });
+
+    it("replies error without throwing to list_messages on a server with no bus", () => {
+      const { hub, sock, sent } = makeHub({ stores: false });
+      expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "list_messages" }))).not.toThrow();
+      expect(sent.filter(m => m.kind === "error")).toHaveLength(1);
+      expect(sent.some(m => m.kind === "messages")).toBe(false);
+    });
+
     it("reports an undelivered message as undelivered", async () => {
       await withRooms(async ({ hub, bus, sock, sent, chat, payments, settle }) => {
         hub.attach(sock);

@@ -1,4 +1,6 @@
 import type {
+  MessageInfo,
+  MessageKind,
   RoomInfo,
   ScenePosition,
   ServerMessage,
@@ -53,6 +55,25 @@ export interface PackageInFlight {
   to: string;
   startedAt: number;
   durationMs: number;
+}
+
+/**
+ * A bus message nobody has picked up yet, standing at the sending room's door.
+ *
+ * **A different fact from a package in flight, and drawn differently.** A message in transit is the
+ * factory working; a message nobody has collected is the factory *not* working — the recipient room
+ * is busy, or has no agent at all — and a pile of them at one door is exactly the thing an operator
+ * needs to notice. Collapsing the two into one animation would hide the second behind the first.
+ */
+export interface WaitingMessage {
+  /** The bus message's own id, so the marker and the package that replaces it are the same object. */
+  id: string;
+  /** Who sent it: the marker stands at that building. */
+  from: string;
+  /** Who it is for: the marker sits at the mouth of the belt leading there. */
+  to: string;
+  kind: MessageKind;
+  createdAt: number;
 }
 
 /**
@@ -120,6 +141,23 @@ export interface FabricState {
   conveyors: Conveyor[];
   /** Packages travelling a belt right now. Empty is the normal state. */
   packages: PackageInFlight[];
+  /** Bus messages still queued at their sender, oldest first. See `WaitingMessage`. */
+  waiting: WaitingMessage[];
+  /**
+   * Message ids whose delivery this tab has already turned into a package (or adopted as history on
+   * the first snapshot). `messages` is a **snapshot** of the newest 200, rebroadcast in full on every
+   * change, so without this every rebroadcast would re-animate everything it still contains.
+   *
+   * Pruned to what the newest snapshot still holds, so it cannot grow without bound.
+   */
+  animatedMessages: Record<string, true>;
+  /**
+   * Whether this tab has had its first `messages` snapshot since connecting. That first snapshot is
+   * history — the traffic of the last hour, replied to and forgotten — and replaying it as a burst of
+   * packages would be a lie about what the factory is doing *now*. So it is adopted silently, and
+   * only what changes afterwards animates.
+   */
+  messagesLoaded: boolean;
   /**
    * Pair key -> the room pair, for every pair that has ever exchanged a package. A belt outlives the
    * package that justified it: the channel between two rooms is a fact about the factory, and having
@@ -162,11 +200,23 @@ export interface FabricState {
   /** Let go. The caller sends the one `move_room`; the store only forgets the local position. */
   endRoomDrag(): void;
   /**
-   * Put a package on the belt between two rooms. **This is the seam the M3 factory bus plugs into**:
-   * when a real inter-room message exists, the bus calls this and nothing else on the client changes.
-   * Until then the console drawer's manual control is the only caller.
+   * **Demo only.** Puts a package on the belt between two rooms with no message behind it, so the
+   * conveyors can be exercised on a factory with no agents running. Real traffic arrives through
+   * `applyMessages`; this is the console drawer's labelled demo button and nothing else should call
+   * it. Its packages carry `demo-…` ids, which is what keeps them out of the bus's book-keeping.
    */
   sendPackage(from: string, to: string, durationMs?: number): void;
+  /**
+   * The bus's traffic, as the server sees it right now. A **snapshot** of the newest 200 messages,
+   * newest first — not a delta — so this has to be idempotent: applying the same snapshot twice must
+   * animate nothing the second time.
+   *
+   * What it does, per message: a delivery this tab has not seen yet becomes a package on the belt; a
+   * message with no `deliveredAt` becomes a waiting marker at its sender; and the same id flipping
+   * from the second to the first is one object changing state, which is why the package is keyed by
+   * the message id and starts at the door the marker was standing at.
+   */
+  applyMessages(messages: MessageInfo[]): void;
   /** Drop packages that have arrived. Called from the render loop and by a per-package timer. */
   reapPackages(now?: number): void;
 }
@@ -183,6 +233,9 @@ export const initialFabricState = {
   roomStatus: {} as Record<string, FactoryStatus>,
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
+  waiting: [] as WaitingMessage[],
+  animatedMessages: {} as Record<string, true>,
+  messagesLoaded: false,
   packagedPairs: {} as Record<string, Conveyor>,
   events: {} as Record<string, EventRow[]>,
   lastSeq: {} as Record<string, number>,
@@ -208,6 +261,16 @@ function sameRoom(a: RoomInfo, b: RoomInfo): boolean {
   return a.name === b.name && a.path === b.path && a.kind === b.kind
     && a.agentCount === b.agentCount
     && a.position.x === b.position.x && a.position.z === b.position.z;
+}
+
+/**
+ * Whether a rebroadcast changed the pile at all. Rows keep their identity across snapshots
+ * (`applyMessages` reuses them), so this is an identity comparison and the whole list keeps its own
+ * identity when nothing moved — which is what stops a `messages` broadcast that changed one
+ * delivery from re-rendering every waiting marker on the floor.
+ */
+function sameWaiting(a: readonly WaitingMessage[], b: readonly WaitingMessage[]): boolean {
+  return a.length === b.length && a.every((w, i) => w === b[i]);
 }
 
 /** Every field a figure or a beacon draws from. */
@@ -376,7 +439,10 @@ function applySessions(s: FabricState, incoming: SessionInfo[]): Partial<FabricS
 export const useFabric = create<FabricState>((set, get) => ({
   ...initialFabricState,
 
-  apply: (msg) =>
+  apply: (msg) => {
+    // Not a reducer: turning a delivery into a package also arms the reaper's timer, and a timer is
+    // a side effect that has no business inside `set`.
+    if (msg.kind === "messages") return get().applyMessages(msg.messages);
     set((s) => {
       if (msg.kind === "sessions") return applySessions(s, msg.sessions);
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
@@ -407,9 +473,17 @@ export const useFabric = create<FabricState>((set, get) => ({
         contiguousSeq: { ...s.contiguousSeq, [sessionId]: nextContiguous },
         needsResync: { ...s.needsResync, [sessionId]: nextContiguous < nextLast },
       };
-    }),
+    });
+  },
 
-  setConnected: (connected) => set({ connected }),
+  setConnected: (connected) =>
+    set((s) => {
+      // A reconnect re-baselines the bus: the snapshot that follows describes everything that
+      // happened while this tab was not listening, and replaying an hour of it as packages would
+      // animate a factory that has already moved on.
+      if (s.connected === connected) return s;
+      return connected ? { connected } : { connected, messagesLoaded: false };
+    }),
 
   selectRoom: (roomId) => set({ selectedRoomId: roomId }),
 
@@ -450,7 +524,7 @@ export const useFabric = create<FabricState>((set, get) => ({
       return {
         packages: [
           ...s.packages,
-          { id: `pkg-${++packageSeq}`, from, to, startedAt: Date.now(), durationMs },
+          { id: `demo-${++packageSeq}`, from, to, startedAt: Date.now(), durationMs },
         ],
         packagedPairs,
         conveyors: packagedPairs === s.packagedPairs
@@ -461,6 +535,76 @@ export const useFabric = create<FabricState>((set, get) => ({
     // The scene reaps the frame a package lands, but a backgrounded tab renders no frames at all —
     // and a package that is never reaped leaves `hasMotion` true forever. Belt and braces.
     setTimeout(() => get().reapPackages(), durationMs + 80);
+  },
+
+  applyMessages: (incoming) => {
+    const s = get();
+    const now = Date.now();
+    const animated = { ...s.animatedMessages };
+    const started: PackageInFlight[] = [];
+    const waiting: WaitingMessage[] = [];
+    const previousWaiting = new Map(s.waiting.map((w) => [w.id, w]));
+    const pairs: Record<string, Conveyor> = { ...s.packagedPairs };
+    let pairsChanged = false;
+
+    /** A message earns the belt it uses, whether it is riding it or queued at the end of it. */
+    const earnBelt = (from: string, to: string): void => {
+      const key = pairKey(from, to);
+      if (pairs[key] !== undefined) return;
+      pairs[key] = { from, to, fan: 0 };
+      pairsChanged = true;
+    };
+
+    // Oldest first: the snapshot is newest-first, and packages should leave in the order the
+    // messages were actually sent.
+    for (const m of [...incoming].sort((a, b) => a.createdAt - b.createdAt)) {
+      if (m.fromRoomId !== m.toRoomId) earnBelt(m.fromRoomId, m.toRoomId);
+
+      if (m.deliveredAt === null) {
+        // Identity is preserved across snapshots so a rebroadcast does not re-render the pile.
+        const prev = previousWaiting.get(m.id);
+        waiting.push(prev ?? {
+          id: m.id, from: m.fromRoomId, to: m.toRoomId, kind: m.kind, createdAt: m.createdAt,
+        });
+        continue;
+      }
+      // Delivered. Once per message id, ever: the snapshot keeps carrying it for as long as it is
+      // among the newest 200, and it must not fly again on every rebroadcast.
+      if (animated[m.id] === true) continue;
+      animated[m.id] = true;
+      // The first snapshot of a connection is history, not news — see `messagesLoaded`.
+      if (!s.messagesLoaded) continue;
+      // A room talking to itself has no belt to ride. The message is real and is in the log; there
+      // is simply nothing to animate.
+      if (m.fromRoomId === m.toRoomId) continue;
+      // Keyed by the message id, so the box that leaves is the same object as the marker that was
+      // standing there: the waiting marker and the package are two states of one message, and the
+      // package starts at the door the marker stood at rather than appearing from nothing.
+      started.push({
+        id: m.id, from: m.fromRoomId, to: m.toRoomId, startedAt: now, durationMs: DEFAULT_PACKAGE_MS,
+      });
+    }
+
+    const packages = started.length === 0 ? s.packages : [...s.packages, ...started];
+    // Keep only what the snapshot still carries (plus anything still in the air): the record exists
+    // to suppress re-animation of messages we can still be told about, and nothing else.
+    const live = new Set(incoming.map((m) => m.id));
+    for (const p of packages) live.add(p.id);
+    const kept: Record<string, true> = {};
+    for (const id of Object.keys(animated)) if (live.has(id)) kept[id] = true;
+
+    set({
+      packages,
+      waiting: sameWaiting(s.waiting, waiting) ? s.waiting : waiting,
+      animatedMessages: kept,
+      messagesLoaded: true,
+      packagedPairs: pairsChanged ? pairs : s.packagedPairs,
+      conveyors: pairsChanged ? nextConveyors(s.conveyors, s.rooms, pairs) : s.conveyors,
+    });
+
+    // Same belt-and-braces reap as the demo action: a backgrounded tab renders no frames, and an
+    // unreaped package would leave `hasMotion` true for ever.
+    if (started.length > 0) setTimeout(() => get().reapPackages(), DEFAULT_PACKAGE_MS + 80);
   },
 
   reapPackages: (now = Date.now()) =>
@@ -600,6 +744,13 @@ export function roomlessSessions(sessions: readonly SessionInfo[]): SessionInfo[
 
 export const useRoomlessSessions = (): SessionInfo[] =>
   useFabric(useShallow((s) => roomlessSessions(s.sessions)));
+
+/**
+ * The bus messages nobody has picked up yet. Deliberately *not* part of `hasMotion`: the marker is
+ * static, because a pile-up that pinned the frameloop to `"always"` would spin the GPU for as long as
+ * a room was busy — and a queue is a state to read, not an animation to watch.
+ */
+export const useWaitingMessages = (): WaitingMessage[] => useFabric((s) => s.waiting);
 
 /**
  * Whether anything in the scene needs animating. The canvas runs `frameloop="demand"` and only

@@ -149,6 +149,13 @@ export const ClientMessage = z.discriminatedUnion("kind", [
     agentId: z.string().nullable().optional(),
   }),
   z.object({ kind: z.literal("list_tasks") }),
+  /**
+   * The bus's recent traffic. A client needs this on connect for two reasons: a message still
+   * queued for a busy room is *state* the floor has to draw (the pile at its sender's door), and the
+   * answer is the baseline against which later broadcasts are new — without it a tab either shows no
+   * queue until something changes, or replays an hour of history as packages on the belt.
+   */
+  z.object({ kind: z.literal("list_messages") }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
