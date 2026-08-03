@@ -67,6 +67,12 @@ interface RoomRow {
 export interface CreateRoomOptions {
   /** The factory this room stands on. Defaults to the default project. */
   projectId?: string;
+  /**
+   * The room's working folder, used **as given**. Omitted, the room is `<project root>/<name>` and
+   * has to stay inside the root; given, it may point anywhere — a department is allowed to live in a
+   * separate repository, and that is the one case where containment does not apply.
+   */
+  path?: string;
 }
 
 /**
@@ -97,6 +103,7 @@ export class RoomManager {
       ),
       countRooms: db.prepare("SELECT COUNT(*) c FROM rooms WHERE project_id = ? AND kind != 'project'"),
       move: db.prepare("UPDATE rooms SET pos_x = ?, pos_z = ? WHERE id = ?"),
+      setPath: db.prepare("UPDATE rooms SET path = ? WHERE id = ?"),
       // One statement for the whole listing: the agent count is a join, not a query per room, and
       // it is the only thing this class ever asks about sessions.
       list: db.prepare(`
@@ -139,10 +146,12 @@ export class RoomManager {
    * directory that is already part of the repo is the normal case), in which case only the row is
    * new and an existing `CLAUDE.md` is left exactly as it is.
    *
+   * `opts.path` chooses the folder explicitly and is the *only* way past the containment check —
+   * see `resolveRoomDir`.
    */
   createRoom(name: string, opts: CreateRoomOptions = {}): RoomInfo {
     const projectId = opts.projectId ?? this.defaultProjectId();
-    const dir = this.resolveRoomDir(projectId, name);
+    const dir = this.resolveRoomDir(projectId, name, opts.path);
 
     if (this.stmts.byName.get(projectId, name) != null) {
       throw new Error(`room ${JSON.stringify(name)} already exists`);
@@ -154,6 +163,29 @@ export class RoomManager {
     const pos = ringPosition((this.stmts.countRooms.get(projectId) as { c: number }).c);
     this.stmts.insert.run(id, projectId, name, dir, "room", pos.x, pos.z);
     return this.getRoom(id)!;
+  }
+
+  /**
+   * Re-point a room at another folder. **Nothing on disk is moved**: this changes where the room *is*,
+   * not where its files are, and the operator is the one who knows whether anything needs copying.
+   *
+   * Agents already running keep the `cwd` their SDK session was started with — the SDK owns a live
+   * session's working directory and there is no way to change it under a running query — so only
+   * agents created after this call work in the new folder. The UI says so next to the field; a silent
+   * half-change would be the worst version of this feature.
+   *
+   * The project room is refused: its folder *is* the project root, and the two must not disagree.
+   */
+  setPath(roomId: string, newPath: string): RoomInfo {
+    const room = this.getRoom(roomId);
+    if (room === undefined) throw new Error(`unknown room ${roomId}`);
+    if (room.kind === "project") {
+      throw new Error("the project room's folder is the project root; create another project instead");
+    }
+    const dir = explicitDir(newPath, room.name);
+    this.adoptFolder(dir, room.name);
+    this.stmts.setPath.run(dir, roomId);
+    return this.getRoom(roomId)!;
   }
 
   /** One project's floor: its project room first, then its rooms in creation order. */
@@ -185,11 +217,22 @@ export class RoomManager {
   }
 
   /**
-   * Where a new room's folder is: `<project root>/<name>`, and the resolved directory must stay under
-   * the root. `..`, an absolute name, anything that climbs out is refused.
+   * Where a new room's folder is. Two cases, and the difference between them is the point:
+   *
+   * - **no explicit path** — `<project root>/<name>`, and the resolved directory must stay under the
+   *   root. This is the case the traversal check protects and it is not relaxed: `..`, an absolute
+   *   name, anything that climbs out is refused.
+   * - **an explicit path** — used as given, anywhere on the filesystem. A department may live in a
+   *   separate repository, so there is nothing to contain it to; the operator typed a path and the
+   *   path is the answer.
    */
-  private resolveRoomDir(projectId: string, name: string): string {
+  private resolveRoomDir(projectId: string, name: string, explicit: string | undefined): string {
     const root = this.projects.root(projectId);
+    if (explicit !== undefined) {
+      // The name is still a folder segment (it is the label on the building and has to be usable in
+      // a path), so it is checked either way — just not against the root.
+      return explicitDir(explicit, name);
+    }
     // Containment first, so a traversal attempt is reported as what it is even if it would also
     // fail the name rule. `path.resolve` collapses `..`, so this catches absolute paths too.
     const dir = path.resolve(root, name);
@@ -219,6 +262,16 @@ export class RoomManager {
   private defaultProjectId(): string {
     return this.projects.defaultProject().id;
   }
+}
+
+/** A folder the operator chose by hand: absolute, and named by a usable room name. */
+function explicitDir(given: string, name: string): string {
+  requireRoomName(name);
+  const trimmed = given.trim();
+  if (!path.isAbsolute(trimmed)) {
+    throw new Error(`a room folder must be an absolute path: ${JSON.stringify(given)}`);
+  }
+  return path.resolve(trimmed);
 }
 
 /** A room name is one folder segment, used verbatim. The wire checks it too; this is the second layer. */

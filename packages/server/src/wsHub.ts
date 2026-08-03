@@ -191,7 +191,12 @@ export class WsHub {
         // rebuild the floor from one message and never has to merge. A failure (duplicate name,
         // unknown id) throws into the catch below and is reported as an error instead.
         case "create_room":
-          this.rooms.createRoom(msg.name, { projectId: this.activeProject(sock) });
+          // `path` given => the room's folder is exactly that, anywhere on disk; omitted => the
+          // default `<project root>/<name>`, which still has to stay inside the root.
+          this.rooms.createRoom(msg.name, {
+            projectId: this.activeProject(sock),
+            ...(msg.path !== undefined ? { path: msg.path } : {}),
+          });
           this.broadcastRooms();
           break;
         case "move_room":
@@ -199,6 +204,24 @@ export class WsHub {
           this.rooms.moveRoom(msg.roomId, msg.position);
           this.broadcastRooms();
           break;
+        case "set_room_path": {
+          this.requireRoomOnFloor(sock, msg.roomId);
+          const room = this.rooms.setPath(msg.roomId, msg.path);
+          this.broadcastRooms();
+          // Not an error, but not nothing either: an agent already running in that room keeps the cwd
+          // its SDK session was started with, and an operator who is not told that will think the
+          // running agent moved with the room.
+          const running = this.mgr.listSessions(this.activeProject(sock))
+            .filter((s) => s.roomId === room.id && s.state === "active").length;
+          if (running > 0) {
+            this.safeSend(sock, {
+              kind: "error",
+              message: `room "${room.name}" now points at ${room.path}; ${running} agent(s) already `
+                + "running there keep their old folder until they are restarted",
+            });
+          }
+          break;
+        }
         case "list_rooms":
           this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms(this.activeProject(sock)) });
           break;
@@ -341,8 +364,8 @@ export class WsHub {
 
   /**
    * Refuse to touch a building that is not on the floor this socket is looking at. Room ids are
-   * globally unique, so without this a client holding another project's room id could move one — and
-   * the change would be broadcast to a floor that never asked for it.
+   * globally unique, so without this a client holding another project's room id could move or
+   * re-point it — and the change would be broadcast to a floor that never asked for it.
    */
   private requireRoomOnFloor(sock: SocketLike, roomId: string): void {
     const projectId = this.rooms.projectOf(roomId);

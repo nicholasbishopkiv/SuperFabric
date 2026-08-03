@@ -1045,16 +1045,101 @@ describe("WsHub", () => {
       });
     });
 
-    it("refuses to move a building on another floor", () => {
+    it("refuses to move or re-point a building on another floor", () => {
       withTwoProjects(({ hub, rooms, sock, sent, away }) => {
         const awayRoom = rooms.createRoom("vendor", { projectId: away });
         hub.handleMessage(sock, JSON.stringify({
           kind: "move_room", roomId: awayRoom.id, position: { x: 1, z: 2 },
         }));
-        expect(sent.filter((m) => m.kind === "error" && /another project/.test(m.message))).toHaveLength(1);
+        hub.handleMessage(sock, JSON.stringify({
+          kind: "set_room_path", roomId: awayRoom.id, path: tmpdir(),
+        }));
+        expect(sent.filter((m) => m.kind === "error" && /another project/.test(m.message))).toHaveLength(2);
         expect(rooms.getRoom(awayRoom.id)!.position).toEqual(awayRoom.position);
+        expect(rooms.getRoom(awayRoom.id)!.path).toBe(awayRoom.path);
       });
     });
   });
 
+  // ---- M1b: a room's working folder ----
+
+  describe("room folders", () => {
+    function withRoot<T>(fn: (ctx: ReturnType<typeof makeHub> & { root: string }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-folder-"));
+      const ctx = makeHub({ root });
+      ctx.rooms.ensureProjectRoom();
+      try {
+        return fn({ ...ctx, root });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    const lastRooms = (sent: any[]) => sent.filter((m) => m.kind === "rooms").at(-1)?.rooms as any[];
+
+    it("create_room with an explicit path puts the room outside the project root", () => {
+      withRoot(({ hub, root, sock, sent }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-hub-elsewhere-"));
+        try {
+          const dir = join(elsewhere, "vendor-repo");
+          hub.handleMessage(sock, JSON.stringify({ kind: "create_room", name: "vendor", path: dir }));
+
+          expect(lastRooms(sent).at(-1)).toMatchObject({ name: "vendor", path: dir });
+          expect(existsSync(join(dir, "CLAUDE.md"))).toBe(true);
+          expect(existsSync(join(root, "vendor"))).toBe(false);
+          expect(sent.some((m) => m.kind === "error")).toBe(false);
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("set_room_path re-points the room and broadcasts the floor", () => {
+      withRoot(({ hub, rooms, sock, sent }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-hub-elsewhere-"));
+        try {
+          const room = rooms.createRoom("backend");
+          sent.length = 0;
+          hub.handleMessage(sock, JSON.stringify({ kind: "set_room_path", roomId: room.id, path: elsewhere }));
+
+          expect(lastRooms(sent).find((r) => r.id === room.id).path).toBe(elsewhere);
+          expect(rooms.getRoom(room.id)!.path).toBe(elsewhere);
+          // nobody is running there, so nothing has to be explained
+          expect(sent.some((m) => m.kind === "error")).toBe(false);
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("says so when agents already running keep their old folder", () => {
+      withRoot(({ hub, rooms, mgr, sock, sent }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-hub-elsewhere-"));
+        try {
+          const room = rooms.createRoom("backend");
+          const id = mgr.createSession({ roomId: room.id });
+          sent.length = 0;
+          hub.handleMessage(sock, JSON.stringify({ kind: "set_room_path", roomId: room.id, path: elsewhere }));
+
+          // The SDK owns a live session's cwd; a silent half-change would be the worst version of it.
+          const notice = sent.find((m) => m.kind === "error" && /keep their old folder/.test(m.message));
+          expect(notice).toBeDefined();
+          expect(notice.message).toContain(elsewhere);
+          expect(mgr.listSessions().find((s) => s.id === id)).toBeDefined();
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("replies error without throwing for a relative path or an unknown room", () => {
+      withRoot(({ hub, rooms, sock, sent }) => {
+        const room = rooms.createRoom("backend");
+        hub.handleMessage(sock, JSON.stringify({ kind: "set_room_path", roomId: room.id, path: "relative/dir" }));
+        hub.handleMessage(sock, JSON.stringify({ kind: "set_room_path", roomId: "nope", path: tmpdir() }));
+        expect(sent.filter((m) => m.kind === "error")).toHaveLength(2);
+        expect(rooms.getRoom(room.id)!.path).toBe(room.path);
+      });
+    });
+  });
 });
