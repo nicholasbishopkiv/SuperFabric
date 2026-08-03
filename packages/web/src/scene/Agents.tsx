@@ -3,7 +3,7 @@ import { useFrame } from "@react-three/fiber";
 import { memo, useEffect, useMemo, useRef } from "react";
 import type { Group } from "three";
 import {
-  CapsuleGeometry,
+  BoxGeometry,
   ConeGeometry,
   MeshBasicMaterial,
   MeshStandardMaterial,
@@ -12,42 +12,70 @@ import {
 } from "three";
 import type { FactoryStatus } from "../store";
 import { agentStatus, useRoomAgents } from "../store";
-import { agentSlots } from "./layout";
+import { agentFacing, agentSlots } from "./layout";
 import { BYPASS_COLOR, STATUS_COLOR } from "./palette";
 
 /**
- * Geometries and materials are created **once for the whole factory**, not once per figure: eight
- * agents in a room must cost eight draw calls, not eight geometry allocations, and every figure of the
- * same status shares one material so three.js can batch them.
+ * A worker, in seven boxes and two spheres.
+ *
+ * The first pass was a capsule with a sphere on top, which from a fixed isometric camera reads as a
+ * map pin: no shoulders, no front, no sense of which way it is facing. What a figure needs to stop
+ * being a lollipop is a *waist* (two masses of different widths), *shoulders* (something wider than
+ * the head, with arms hanging off it) and an *orientation*. All three are here and all of it is still
+ * primitives — glTF characters are M5's.
+ *
+ * The status colour lives on the torso and nowhere else: a hi-viz vest is exactly the right metaphor
+ * for "this is what this person's state is", and it keeps the loudest colour on the biggest facing
+ * surface, where it is legible at low zoom. Trousers, arms, head and helmet are neutral, so the
+ * figure still reads as a figure rather than as a coloured pill.
+ *
+ * Every geometry and every material is created **once for the whole factory**: eight agents in a room
+ * must cost eight groups of draw calls, not eight geometry allocations, and every figure of the same
+ * status shares one material so three.js can batch them.
  */
-const BODY_RADIUS = 0.22;
-const BODY_LENGTH = 0.7;
-/** Total height of the capsule, so the head can sit exactly on top of it. */
-const BODY_HEIGHT = BODY_LENGTH + BODY_RADIUS * 2;
-const HEAD_RADIUS = 0.22;
+const LEG_HEIGHT = 0.46;
+const TORSO_HEIGHT = 0.54;
+const TORSO_TOP = LEG_HEIGHT + TORSO_HEIGHT;
+const HEAD_RADIUS = 0.155;
+const HEAD_Y = TORSO_TOP + HEAD_RADIUS + 0.03;
+/** The top of the helmet: everything the bypass marker stacks above starts here. */
+const CROWN_Y = HEAD_Y + HEAD_RADIUS + 0.1;
 
-const BODY_GEOMETRY = new CapsuleGeometry(BODY_RADIUS, BODY_LENGTH, 4, 10);
+const LEGS_GEOMETRY = new BoxGeometry(0.34, LEG_HEIGHT, 0.24);
+const TORSO_GEOMETRY = new BoxGeometry(0.44, TORSO_HEIGHT, 0.28);
+/** A shoulder yoke: wider than the torso, so the silhouette has a top to it. */
+const SHOULDER_GEOMETRY = new BoxGeometry(0.52, 0.1, 0.3);
+const ARM_GEOMETRY = new BoxGeometry(0.1, 0.42, 0.13);
 const HEAD_GEOMETRY = new SphereGeometry(HEAD_RADIUS, 12, 10);
+/** A hard hat: the top half of a sphere, plus a brim, which is a helmet in two primitives. */
+const HELMET_GEOMETRY = new SphereGeometry(0.175, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2);
+const BRIM_GEOMETRY = new BoxGeometry(0.36, 0.045, 0.34);
 /** The bypass marker: a ring at the feet and a spike over the head. */
 const RING_GEOMETRY = new RingGeometry(0.3, 0.42, 20);
 const SPIKE_GEOMETRY = new ConeGeometry(0.1, 0.24, 8);
 
-const BODY_MATERIALS: Record<FactoryStatus, MeshStandardMaterial> = {
+/** The vest, and the only place an agent's status appears on its body. */
+const VEST_MATERIALS: Record<FactoryStatus, MeshStandardMaterial> = {
   idle: new MeshStandardMaterial({ color: STATUS_COLOR.idle, roughness: 0.7 }),
   working: new MeshStandardMaterial({ color: STATUS_COLOR.working, roughness: 0.55 }),
   blocked: new MeshStandardMaterial({ color: STATUS_COLOR.blocked, roughness: 0.55 }),
   error: new MeshStandardMaterial({ color: STATUS_COLOR.error, roughness: 0.55 }),
 };
-/** Neutral, so the figure still reads as a figure rather than a coloured pill. */
-const HEAD_MATERIAL = new MeshStandardMaterial({ color: "#ece5da", roughness: 0.8 });
+/** Everything that is not the vest. Neutral, so the figure reads as a person wearing one. */
+const TROUSER_MATERIAL = new MeshStandardMaterial({ color: "#3d4550", roughness: 0.85 });
+const SLEEVE_MATERIAL = new MeshStandardMaterial({ color: "#4b5460", roughness: 0.8 });
+const SKIN_MATERIAL = new MeshStandardMaterial({ color: "#e3c6a8", roughness: 0.85 });
+const HELMET_MATERIAL = new MeshStandardMaterial({ color: "#eef0ee", roughness: 0.45 });
 /** Unlit on purpose: the ungated marker must be equally obvious on a shaded side of the floor. */
 const BYPASS_MATERIAL = new MeshBasicMaterial({ color: BYPASS_COLOR });
 
 /** Steps per second while working. Slow — this is a figure at a workbench, not a sprinter. */
 const BOB_HZ = 1.5;
-const BOB_HEIGHT = 0.11;
+const BOB_HEIGHT = 0.09;
 /** How far a working figure shuffles along the arc, in world units. */
 const SHUFFLE = 0.3;
+/** How far the arms swing while working, in radians. */
+const ARM_SWING = 0.5;
 
 /** A stable per-agent phase offset, so a room full of working agents does not bob in lockstep. */
 function phaseOf(id: string): number {
@@ -76,6 +104,8 @@ const AgentFigure = memo(function AgentFigure({
   z: number;
 }) {
   const ref = useRef<Group>(null);
+  const leftArm = useRef<Group>(null);
+  const rightArm = useRef<Group>(null);
   const working = status === "working";
   const phase = useMemo(() => phaseOf(id), [id]);
   // Shuffle along the arc's tangent, which for a point on a circle centred on the building is the
@@ -92,20 +122,49 @@ const AgentFigure = memo(function AgentFigure({
     const along = Math.sin(t * 0.22) * SHUFFLE;
     group.position.x = x + tangentX * along;
     group.position.z = z + tangentZ * along;
+    // Arms swing with the step, out of phase with each other. This is what makes the bob read as
+    // walking rather than as a mesh being scaled up and down.
+    const swing = Math.sin(t) * ARM_SWING;
+    if (leftArm.current !== null) leftArm.current.rotation.x = swing;
+    if (rightArm.current !== null) rightArm.current.rotation.x = -swing;
   });
 
   // Stopping work can happen on a frame that is never followed by another one, so the figure has to be
   // put back on its mark explicitly rather than drifting to a halt wherever the last frame left it.
   useEffect(() => {
-    if (!working) ref.current?.position.set(x, 0, z);
+    if (working) return;
+    ref.current?.position.set(x, 0, z);
+    if (leftArm.current !== null) leftArm.current.rotation.x = 0;
+    if (rightArm.current !== null) rightArm.current.rotation.x = 0;
   }, [working, x, z]);
+
+  const vest = VEST_MATERIALS[status];
 
   return (
     <group ref={ref} position={[x, 0, z]}>
-      {/* No castShadow: a 1.5-unit figure inside a 120-unit shadow frustum contributes a couple of
-          pixels, and N figures re-rendering the shadow map every frame is a real cost for it. */}
-      <mesh geometry={BODY_GEOMETRY} material={BODY_MATERIALS[status]} position-y={BODY_HEIGHT / 2} />
-      <mesh geometry={HEAD_GEOMETRY} material={HEAD_MATERIAL} position-y={BODY_HEIGHT + HEAD_RADIUS * 0.72} />
+      {/* Faced outward from the building, so nobody has their back to the camera or their nose in
+          the wall. The whole body turns, which is why this wraps everything below it. */}
+      <group rotation-y={agentFacing(x, z)}>
+        {/* No castShadow anywhere on a figure: a 1.5-unit body inside a 120-unit shadow frustum
+            contributes a couple of pixels, and N figures re-rendering the shadow map every frame is
+            a real cost for it. */}
+        <mesh geometry={LEGS_GEOMETRY} material={TROUSER_MATERIAL} position-y={LEG_HEIGHT / 2} />
+        <mesh geometry={TORSO_GEOMETRY} material={vest} position-y={LEG_HEIGHT + TORSO_HEIGHT / 2} />
+        <mesh geometry={SHOULDER_GEOMETRY} material={vest} position-y={TORSO_TOP - 0.02} />
+
+        {/* Arms pivot at the shoulder, which is why each is a group with the mesh hung below it. */}
+        <group ref={leftArm} position={[-0.27, TORSO_TOP - 0.06, 0]}>
+          <mesh geometry={ARM_GEOMETRY} material={SLEEVE_MATERIAL} position-y={-0.21} />
+        </group>
+        <group ref={rightArm} position={[0.27, TORSO_TOP - 0.06, 0]}>
+          <mesh geometry={ARM_GEOMETRY} material={SLEEVE_MATERIAL} position-y={-0.21} />
+        </group>
+
+        <mesh geometry={HEAD_GEOMETRY} material={SKIN_MATERIAL} position-y={HEAD_Y} />
+        <mesh geometry={HELMET_GEOMETRY} material={HELMET_MATERIAL} position-y={HEAD_Y - 0.02} />
+        <mesh geometry={BRIM_GEOMETRY} material={HELMET_MATERIAL} position-y={HEAD_Y - 0.02} />
+      </group>
+
       {bypass && (
         <>
           <mesh
@@ -114,11 +173,7 @@ const AgentFigure = memo(function AgentFigure({
             rotation-x={-Math.PI / 2}
             position-y={0.04}
           />
-          <mesh
-            geometry={SPIKE_GEOMETRY}
-            material={BYPASS_MATERIAL}
-            position-y={BODY_HEIGHT + HEAD_RADIUS * 2 + 0.16}
-          />
+          <mesh geometry={SPIKE_GEOMETRY} material={BYPASS_MATERIAL} position-y={CROWN_Y + 0.16} />
         </>
       )}
     </group>

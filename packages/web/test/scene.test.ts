@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ringPosition as sharedRingPosition } from "@superfabric/shared";
 import {
+  agentFacing,
   agentSlots,
   beaconHeight,
   buildingSize,
@@ -23,6 +24,7 @@ import {
 import {
   ACCENT_HUE_MAX,
   ACCENT_HUE_MIN,
+  ACCENT_HUE_STEP,
   BYPASS_COLOR,
   hsl,
   PACKAGE_COLORS,
@@ -383,6 +385,25 @@ describe("agentSlots", () => {
     }
   });
 
+  it("faces every figure out of the building it stands at", () => {
+    for (const count of [1, 3, 6]) {
+      for (const [x, z] of agentSlots(count, "room")) {
+        const yaw = agentFacing(x, z);
+        // a figure's front is its local +z; rotated by yaw that is (sin yaw, cos yaw)
+        const fx = Math.sin(yaw);
+        const fz = Math.cos(yaw);
+        // pointing away from the building's centre, not into its wall
+        expect(fx * x + fz * z).toBeGreaterThan(0);
+        // and exactly along its own radius
+        expect(Math.hypot(fx - x / Math.hypot(x, z), fz - z / Math.hypot(x, z))).toBeCloseTo(0, 6);
+      }
+    }
+  });
+
+  it("faces a figure standing dead centre at the camera rather than dividing by zero", () => {
+    expect(agentFacing(0, 0)).toBeCloseTo(Math.PI / 4, 6);
+  });
+
   it("pushes the arc further out for the bigger project block", () => {
     const [[rx, rz]] = agentSlots(1, "room");
     const [[px, pz]] = agentSlots(1, "project");
@@ -451,9 +472,23 @@ describe("room accents", () => {
     expect(roomAccentHue("backend")).toBe(roomAccentHue("backend"));
   });
 
-  it("gives different departments different hues", () => {
-    const hues = names.map(roomAccentHue);
-    expect(new Set(hues).size).toBe(names.length);
+  it("spreads a handful of departments over the band", () => {
+    const trims = names.map((n) => JSON.stringify(roomAccent(n)));
+    // Not "all distinct": the hue is quantised, so eight names over nine steps may tie. What must
+    // hold is that most of them differ, and that a tie is a *tie* rather than a near-miss.
+    expect(new Set(trims).size).toBeGreaterThanOrEqual(names.length - 2);
+  });
+
+  it("never puts two departments confusingly close: they tie exactly or differ by a whole step", () => {
+    // Two trims 1 degree apart are worse than two identical ones — identical says "these could not
+    // be told apart", nearly-identical says "these are different" and then does not show you how.
+    for (const a of names) {
+      for (const b of names) {
+        const gap = Math.abs(roomAccentHue(a) - roomAccentHue(b));
+        if (gap === 0) continue;
+        expect(gap).toBeGreaterThanOrEqual(ACCENT_HUE_STEP - 0.2);
+      }
+    }
   });
 
   it("**never collides with a status hue** — status is semantics, an accent is decoration", () => {

@@ -123,7 +123,7 @@ export const PROJECT = {
   wall: "#39424e",
   /** A darker band at the base, so the mass sits on the ground instead of floating on it. */
   plinth: "#2b323b",
-  roof: "#4b5563",
+  roof: "#545f6d",
   /** The eaves band and the finial, lighter again, to catch the key light. */
   ridge: "#78838f",
 } as const;
@@ -184,13 +184,30 @@ export const STATUS_HUE_BANDS: readonly (readonly [number, number])[] = [
 ];
 
 /**
- * Where accents are allowed to live: teal, through blue, to violet. 145° of range is enough to tell
+ * Where accents are allowed to live: cyan, through blue, to violet. 110° of range is enough to tell
  * six workshops apart and it contains no status hue.
+ *
+ * Both bounds were pulled in after looking at the thing. 170 is a blue-green that, even desaturated,
+ * reads close enough to the `working` green to make you check; 315 is a magenta that reads as a
+ * cousin of the `bypass` marker. The rule is not "outside the status band" but "not confusable with a
+ * status", and 190–300 is where that becomes true.
  */
-export const ACCENT_HUE_MIN = 170;
-export const ACCENT_HUE_MAX = 315;
+export const ACCENT_HUE_MIN = 190;
+export const ACCENT_HUE_MAX = 300;
 /** Kept well under the status colours' saturation, so an accent can never be mistaken for one. */
 const ACCENT_SATURATION = 0.3;
+
+/**
+ * How many hues the band is divided into, and the two lightnesses each of them comes in.
+ *
+ * **Quantised on purpose.** A hue taken continuously from a hash puts two departments 1° apart as
+ * readily as 60°, and two trims 1° apart are worse than two identical ones: identical says "I could
+ * not tell you these apart", nearly-identical says "these are different" and then does not show you
+ * how. Nine steps of 15.6° across the band, times two lightnesses, is eighteen trims that are each
+ * unmistakably not the others — and collisions become honest ties.
+ */
+const ACCENT_STEPS = 9;
+const ACCENT_LIGHTNESS = [0.45, 0.58] as const;
 
 /** A small, stable hash of a room's name. Deterministic across machines and reloads. */
 function hashName(name: string): number {
@@ -199,18 +216,19 @@ function hashName(name: string): number {
     hash ^= name.charCodeAt(i);
     hash = Math.imul(hash, 16777619);
   }
-  return (hash >>> 0) / 4294967296;
+  return hash >>> 0;
 }
+
+/** The gap between two adjacent accent hues, in degrees. Nothing may land between two steps. */
+export const ACCENT_HUE_STEP = (ACCENT_HUE_MAX - ACCENT_HUE_MIN) / (ACCENT_STEPS - 1);
 
 /**
  * A workshop's own hue, derived from its name so it is stable: the same department is the same colour
- * on every machine and after every reload, with nothing to persist. The hash is spread across the
- * allowed band by the golden ratio, which keeps two similar names from landing on similar hues.
+ * on every machine and after every reload, with nothing to persist.
  */
 export function roomAccentHue(name: string): number {
-  const span = ACCENT_HUE_MAX - ACCENT_HUE_MIN;
-  const t = (hashName(name) + 0.6180339887) % 1;
-  return Math.round((ACCENT_HUE_MIN + t * span) * 10) / 10;
+  const step = hashName(name) % ACCENT_STEPS;
+  return Math.round((ACCENT_HUE_MIN + step * ACCENT_HUE_STEP) * 10) / 10;
 }
 
 /** `hsl` to `#rrggbb`. Here rather than in a component: colours are data, not markup. */
@@ -235,9 +253,12 @@ export function hsl(hue: number, saturation: number, lightness: number): string 
  */
 export function roomAccent(name: string): { band: string; deep: string; light: string } {
   const hue = roomAccentHue(name);
+  // A second, independent slice of the hash: the same hue in two values doubles how many departments
+  // can be told apart without widening the band into a status colour.
+  const light = ACCENT_LIGHTNESS[(hashName(name) >>> 16) % ACCENT_LIGHTNESS.length];
   return {
-    band: hsl(hue, ACCENT_SATURATION, 0.52),
-    deep: hsl(hue, ACCENT_SATURATION, 0.34),
-    light: hsl(hue, ACCENT_SATURATION * 0.8, 0.7),
+    band: hsl(hue, ACCENT_SATURATION, light),
+    deep: hsl(hue, ACCENT_SATURATION, light * 0.62),
+    light: hsl(hue, ACCENT_SATURATION * 0.8, Math.min(0.82, light + 0.2)),
   };
 }

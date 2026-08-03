@@ -314,6 +314,20 @@ export function loadingBays(kind: RoomInfo["kind"], directions: readonly number[
  *
  * Pure and exported so it is testable — `Agents` only places what this returns.
  */
+/**
+ * Which way a figure standing at `(x, z)` in front of its building should face: **away** from the
+ * wall, along its own radius. A figure's front is its local `+z`, so this is the yaw that sends
+ * local `+z` to `(x, z)`.
+ *
+ * Orientation is most of what turns a primitive into a figure. Without it a room's agents all face
+ * the same arbitrary direction — several of them with their backs to the camera and one walking into
+ * the wall — and the eye reads a row of objects rather than people at work.
+ */
+export function agentFacing(x: number, z: number): number {
+  if (x === 0 && z === 0) return Math.PI / 4;
+  return Math.atan2(x, z);
+}
+
 export function agentSlots(count: number, kind: RoomInfo["kind"]): [x: number, z: number][] {
   if (count <= 0) return [];
   const { width } = buildingSize(kind);

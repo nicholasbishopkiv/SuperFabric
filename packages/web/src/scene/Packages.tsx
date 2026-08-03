@@ -1,11 +1,11 @@
 import { useFrame } from "@react-three/fiber";
 import { useLayoutEffect, useMemo, useRef } from "react";
 import type { CatmullRomCurve3, InstancedMesh } from "three";
-import { BoxGeometry, Matrix4, MeshStandardMaterial, Vector3 } from "three";
+import { BoxGeometry, Color, Matrix4, MeshStandardMaterial, Quaternion, Vector3 } from "three";
 import type { PackageInFlight } from "../store";
 import { beltFan, useFabric } from "../store";
 import { conveyorCurve, pointAt } from "./conveyorPath";
-import { PACKAGE_COLOR } from "./palette";
+import { PACKAGE_COLORS } from "./palette";
 
 /**
  * How many packages can be in flight at once. A factory that saturates this is a factory whose bus is
@@ -15,17 +15,56 @@ const CAPACITY = 128;
 
 /** One geometry, one material, one draw call — hoisted, so N packages allocate nothing. */
 const PACKAGE_GEOMETRY = new BoxGeometry(0.5, 0.5, 0.5);
-const PACKAGE_MATERIAL = new MeshStandardMaterial({ color: PACKAGE_COLOR, roughness: 0.65 });
+/**
+ * White, because the per-instance colour multiplies it: `instanceColor` is how one draw call gets to
+ * draw four different tones of cardboard.
+ */
+const PACKAGE_MATERIAL = new MeshStandardMaterial({ color: "#ffffff", roughness: 0.7 });
+
+/** The four cardboard tones, pre-parsed so a frame never allocates a `Color`. */
+const PACKAGE_TONES = PACKAGE_COLORS.map((hex) => new Color(hex));
+
+/**
+ * How much a box may differ from the nominal half-metre, up and down. Small on purpose: a stream of
+ * *identical* cubes reads as a repeating texture rather than as goods, and a stream of wildly
+ * different ones reads as a bug.
+ */
+const SIZE_SPREAD = 0.22;
+
+/**
+ * A package's look, derived from its id so it never changes mid-flight and never needs storing.
+ *
+ * Tone and size only. **No meaning**: which kind of message a package carries is M3's to say, and a
+ * colour vocabulary invented here would be one the operator cannot read and we would have to
+ * un-teach them.
+ */
+function variantOf(id: string): { tone: Color; scale: number } {
+  let hash = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const unit = (hash >>> 0) / 4294967296;
+  return {
+    tone: PACKAGE_TONES[(hash >>> 8) % PACKAGE_TONES.length],
+    scale: 1 - SIZE_SPREAD + unit * SIZE_SPREAD * 2,
+  };
+}
 
 /** How high the box lifts at the middle of its trip, so it reads as travelling rather than sliding. */
 const BOB = 0.15;
 
 const scratchPoint = new Vector3();
 const scratchMatrix = new Matrix4();
+const scratchQuaternion = new Quaternion();
+const scratchScale = new Vector3();
+const UP = new Vector3(0, 1, 0);
 
 interface Route {
   pkg: PackageInFlight;
   curve: CatmullRomCurve3;
+  tone: Color;
+  scale: number;
 }
 
 /**
@@ -58,7 +97,11 @@ export function Packages() {
       if (from === undefined || to === undefined) continue;
       // A `RoomInfo` is a `BeltEnd`: the curve needs the kind as well as the position, because it
       // starts and ends at the buildings' walls rather than at their centres.
-      built.push({ pkg, curve: conveyorCurve(from, to, undefined, beltFan(conveyors, pkg.from, pkg.to)) });
+      built.push({
+        pkg,
+        curve: conveyorCurve(from, to, undefined, beltFan(conveyors, pkg.from, pkg.to)),
+        ...variantOf(pkg.id),
+      });
     }
     return built;
   }, [packages, rooms, conveyors]);
@@ -69,7 +112,7 @@ export function Packages() {
     if (mesh === null) return false;
     let drawn = 0;
     let landed = false;
-    for (const { pkg, curve } of routes) {
+    for (const { pkg, curve, tone, scale } of routes) {
       const t = (now - pkg.startedAt) / pkg.durationMs;
       if (t >= 1) {
         // Arrived: stop drawing it this frame rather than parking a box on the destination roof.
@@ -78,15 +121,22 @@ export function Packages() {
       }
       if (drawn >= CAPACITY) break;
       pointAt(curve, t, scratchPoint);
-      scratchPoint.y += Math.sin(t * Math.PI) * BOB;
+      // Sit the box *on* the belt whatever size it is, then lift it as it travels.
+      scratchPoint.y += (scale - 1) * 0.25 + Math.sin(t * Math.PI) * BOB;
       // A slow tumble makes the box read as a solid object rather than a sprite.
-      scratchMatrix.makeRotationY(t * Math.PI);
-      scratchMatrix.setPosition(scratchPoint);
-      mesh.setMatrixAt(drawn++, scratchMatrix);
+      scratchQuaternion.setFromAxisAngle(UP, t * Math.PI);
+      scratchScale.setScalar(scale);
+      scratchMatrix.compose(scratchPoint, scratchQuaternion, scratchScale);
+      mesh.setMatrixAt(drawn, scratchMatrix);
+      // The instance colours have to be written here rather than once: which slot a package occupies
+      // changes every time one lands, so slot N is a different box from one frame to the next.
+      mesh.setColorAt(drawn, tone);
+      drawn++;
     }
     mesh.count = drawn;
     // Without this the GPU keeps last frame's transforms and the packages never move.
     mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor !== null) mesh.instanceColor.needsUpdate = true;
     return landed;
   }
 

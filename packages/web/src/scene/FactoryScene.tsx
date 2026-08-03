@@ -26,7 +26,9 @@ export function FactoryScene() {
 
   return (
     <Canvas
-      shadows
+      // "variance" is a VSM shadow map: blurred in the map, so the edges spread with distance from
+      // the caster. See `lighting.tsx` for why this is not drei's <SoftShadows>.
+      shadows="variance"
       frameloop={hasMotion ? "always" : "demand"}
       // A press that hit no building is a press on the floor, and that deselects. Buildings
       // `stopPropagation` on pointer-down, so this never fires for one of them.

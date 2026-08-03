@@ -1,4 +1,3 @@
-import { SoftShadows } from "@react-three/drei";
 import { LIGHT } from "./palette";
 
 /**
@@ -21,17 +20,22 @@ import { LIGHT } from "./palette";
  * The warm/cool split is doing real work: it is what separates a lit face from a shaded one by *hue*
  * as well as by value, which survives being looked at from across a room and at low zoom.
  *
- * `<SoftShadows>` replaces the shadow lookup in the depth material with PCSS, so the shadow edges
- * spread with distance from the caster instead of being one hard step. It is a shader patch applied
- * once at mount and needs no frames, so it costs the frameloop contract nothing — the price is
- * per-pixel samples while a frame *is* being drawn, which is why `samples` is 10 rather than the
- * showcase 25.
+ * ## Soft shadows: VSM, not drei's `<SoftShadows>`
+ *
+ * `<SoftShadows>` was tried first and **does not work on this stack**: it patches
+ * `ShaderChunk.shadowmap_pars_fragment` with a PCSS implementation that calls `unpackRGBAToDepth`,
+ * which three 0.185 no longer defines. The fragment shader fails to compile, and because the patch is
+ * global the casualty is whichever material happens to compile next — in our case the packages', so
+ * the boxes silently stopped being drawn at all. If drei fixes it, this is the place to reconsider.
+ *
+ * What is used instead is three's own variance shadow map (`shadows="variance"` on the `<Canvas>`),
+ * whose blur is a property of the shadow map rather than of the material shader: `shadow-radius` on
+ * the light below. Same result — edges that spread instead of one hard step — with nothing patched,
+ * no frames needed, and no chance of taking an unrelated material down with it.
  */
 export function FactoryLights() {
   return (
     <>
-      <SoftShadows size={22} samples={10} focus={0.7} />
-
       {/* Barely there. Its whole job is to stop a crevice reading as a hole. */}
       <ambientLight intensity={0.15} />
 
@@ -54,8 +58,11 @@ export function FactoryLights() {
         shadow-camera-bottom={-60}
         shadow-camera-near={-100}
         shadow-camera-far={200}
-        shadow-bias={-0.0006}
-        shadow-normalBias={0.02}
+        // VSM blurs the shadow map itself; this is how wide.
+        shadow-radius={5}
+        shadow-blurSamples={12}
+        shadow-bias={-0.0008}
+        shadow-normalBias={0.03}
       />
 
       {/* The fill. No shadow: a second shadow map for a light this weak buys nothing and costs a
