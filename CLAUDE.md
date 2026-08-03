@@ -21,6 +21,9 @@ and a subscription limit monitor with auto-pause/resume.
 - Message delivery to agents is push (inject a turn into the input stream), not polling.
 - No account pooling/rotation to evade limits (hard ToS line) — only monitoring, pause,
   and resume of the user's own accounts.
+- The server is a local privileged tool: bind 127.0.0.1 only, allow-list browser `Origin`s on
+  the WebSocket handshake (`src/origin.ts`), and never trust a client-supplied session id for
+  anything the log records (see `SessionManager.approve`).
 
 ## Stack
 
@@ -64,7 +67,8 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
 
 - `packages/shared` — zod protocol shared by server and web (`SessionEvent`,
   `ClientMessage`, `ServerMessage`).
-- `packages/server` — `db.ts` (schema) · `eventStore.ts` (append-only log + subscriptions)
+- `packages/server` — `db.ts` (schema + `PRAGMA user_version` migrations) · `origin.ts` (WebSocket
+  origin allow-list) · `eventStore.ts` (append-only log + subscriptions)
   · `executor.ts` (provider seam) · `executors/claudeCode.ts` (Agent SDK, streaming input)
   · `executors/fake.ts` (scripted, for tests) · `sessionManager.ts` (sessions, approvals,
   resume/stopAll) · `wsHub.ts` (replay-then-tail) · `index.ts` (wiring only) ·
