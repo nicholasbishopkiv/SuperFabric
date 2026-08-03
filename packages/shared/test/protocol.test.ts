@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  AGENT_MODELS, AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, MessageInfo, MessageKind, ModelId,
+  AGENT_MODELS, ATTACHMENTS_DIRNAME, AttachmentUploadResult, AutonomyMode, ClientMessage,
+  DEFAULT_AUTONOMY, MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
   ProjectInfo, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
 } from "../src/protocol.js";
 
@@ -358,6 +359,30 @@ describe("protocol", () => {
       expect(() => ClientMessage.parse({ kind: "set_room_path", roomId: "r1" })).toThrow();
       expect(() => ClientMessage.parse({ kind: "set_room_path", path: "/srv/other" })).toThrow();
       expect(() => ClientMessage.parse({ kind: "set_room_path", roomId: "r1", path: "" })).toThrow();
+    });
+  });
+
+  describe("notices and attachments", () => {
+    it("parses a notice — the channel that is not an error", () => {
+      expect(ServerMessage.parse({ kind: "notice", message: "saved to /p/attachments/a.png" }))
+        .toEqual({ kind: "notice", message: "saved to /p/attachments/a.png" });
+      expect(() => ServerMessage.parse({ kind: "notice" })).toThrow();
+      // and it stays a *distinct* kind from `error`: a client must be able to paint them differently
+      expect(ServerMessage.parse({ kind: "error", message: "nope" }).kind).toBe("error");
+    });
+
+    it("describes the upload endpoint's answer", () => {
+      const body = AttachmentUploadResult.parse({
+        saved: [{ name: "a.png", path: "/p/attachments/a.png", bytes: 12 }],
+      });
+      expect(body.saved[0]).toMatchObject({ name: "a.png", path: "/p/attachments/a.png" });
+      expect(() => AttachmentUploadResult.parse({ saved: [{ name: "a.png" }] })).toThrow();
+      expect(AttachmentUploadResult.parse({ saved: [] }).saved).toEqual([]);
+    });
+
+    it("fixes the destination folder and the size cap in one place", () => {
+      expect(ATTACHMENTS_DIRNAME).toBe("attachments");
+      expect(MAX_ATTACHMENT_BYTES).toBe(25 * 1024 * 1024);
     });
   });
 });

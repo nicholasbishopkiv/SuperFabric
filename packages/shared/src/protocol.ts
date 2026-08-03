@@ -180,6 +180,42 @@ export const MessageInfo = z.object({
 });
 export type MessageInfo = z.infer<typeof MessageInfo>;
 
+// ---- M1b: attachments (files in, paths out) ----
+
+/**
+ * The subdirectory an uploaded file lands in, under the project root or the selected room's folder.
+ *
+ * Predictable on purpose, and a plain visible folder rather than something under `.fabrica/`: the
+ * point of the whole feature is that an agent is handed **a path it can open**, and a hidden
+ * factory-state directory is the wrong place for the operator's own screenshot. One name, shared by
+ * the server that writes there and the UI that explains where things go.
+ */
+export const ATTACHMENTS_DIRNAME = "attachments";
+
+/**
+ * The biggest file the upload endpoint accepts, in bytes.
+ *
+ * A cap rather than no cap because the endpoint writes into the operator's repository: a runaway
+ * upload should be a clear rejection, not a full disk. 25 MB is comfortably more than a screenshot,
+ * a log or a PDF — the things this feature exists for — and anything genuinely large is a file the
+ * operator already has on disk and can simply name.
+ */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/** One file that made it to disk. `path` is absolute — it is the whole point of the feature. */
+export const SavedAttachment = z.object({
+  /** The final name on disk, which may not be the name the browser sent (sanitised, uniquified). */
+  name: z.string(),
+  /** Absolute path of the written file. This is what goes into the turn text. */
+  path: z.string(),
+  bytes: z.number().int().nonnegative(),
+});
+export type SavedAttachment = z.infer<typeof SavedAttachment>;
+
+/** The body of a successful `POST /attachments`. */
+export const AttachmentUploadResult = z.object({ saved: z.array(SavedAttachment) });
+export type AttachmentUploadResult = z.infer<typeof AttachmentUploadResult>;
+
 // ---- client -> server ----
 export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("subscribe"), sessionId: z.string(), afterSeq: z.number().int().nonnegative() }),
@@ -308,5 +344,18 @@ export const ServerMessage = z.discriminatedUnion("kind", [
     activeProjectId: z.string(),
   }),
   z.object({ kind: z.literal("error"), message: z.string() }),
+  /**
+   * "This worked, and here is what happened."
+   *
+   * The protocol had exactly one channel for saying anything to the operator — `error` — so every
+   * successful-but-worth-reporting outcome had to either travel on it (and be painted red) or be
+   * guessed at by the UI. Both have happened: a successful `set_room_path` was once reported as an
+   * error, and an attachment saved to disk has no other way to say *where*.
+   *
+   * Deliberately just a string, and deliberately not persisted: a notice is a fact about the request
+   * that just completed, not an event in a session's log. Anything an agent needs to know goes in the
+   * event log instead.
+   */
+  z.object({ kind: z.literal("notice"), message: z.string() }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;
