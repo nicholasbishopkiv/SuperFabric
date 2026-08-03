@@ -226,6 +226,8 @@ export class SessionManager {
       claudeSessionId: r.claude_session_id,
       lastSeq: r.last_seq,
       autonomy: asAutonomy(r.autonomy),
+      // Sessions gain a real room in migration 3; until then every session is roomless.
+      roomId: null,
     }));
   }
 }

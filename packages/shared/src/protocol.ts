@@ -32,15 +32,56 @@ export const SessionEvent = z.discriminatedUnion("type", [
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
+// ---- rooms ----
+
+/**
+ * A room name is used verbatim as a folder segment, so it must be safe on its own.
+ *
+ * The regex rejects `..` only because `.` cannot be the first character — `a..b` is still allowed
+ * and is a legal folder name, so traversal is prevented by the leading-character rule *plus* the
+ * no-separator rule together. Do not relax either. `RoomManager.createRoom` re-checks the resolved
+ * path against the project root anyway; this is the first of two layers, not the only one.
+ */
+export const RoomName = z.string().min(1).max(64).regex(
+  /^[a-z0-9][a-z0-9._-]*$/,
+  "lowercase letters, digits, dot, dash and underscore only; must not start with a separator",
+);
+
+export const ScenePosition = z.object({ x: z.number(), z: z.number() });
+export type ScenePosition = z.infer<typeof ScenePosition>;
+
+export const RoomInfo = z.object({
+  id: z.string(),
+  /** Folder segment and display name. */
+  name: RoomName,
+  /** Absolute path of the room's folder. */
+  path: z.string(),
+  /** Where the building stands on the factory floor. */
+  position: ScenePosition.default({ x: 0, z: 0 }),
+  /** "project" is the single central building; "room" is a workshop. */
+  kind: z.enum(["project", "room"]),
+  agentCount: z.number().int().nonnegative(),
+});
+export type RoomInfo = z.infer<typeof RoomInfo>;
+
 // ---- client -> server ----
 export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("subscribe"), sessionId: z.string(), afterSeq: z.number().int().nonnegative() }),
   z.object({ kind: z.literal("prompt"), sessionId: z.string(), text: z.string().min(1) }),
   z.object({ kind: z.literal("approval"), sessionId: z.string(), approvalId: z.string(), behavior: z.enum(["allow", "deny"]) }),
   z.object({ kind: z.literal("interrupt"), sessionId: z.string() }),
-  z.object({ kind: z.literal("create_session"), cwd: z.string().optional(), autonomy: AutonomyMode.optional() }),
+  z.object({
+    kind: z.literal("create_session"),
+    cwd: z.string().optional(),
+    /** Put the agent in a room; the room's folder becomes its cwd. Omitted => a roomless session. */
+    roomId: z.string().optional(),
+    autonomy: AutonomyMode.optional(),
+  }),
   z.object({ kind: z.literal("set_autonomy"), sessionId: z.string(), autonomy: AutonomyMode }),
   z.object({ kind: z.literal("list_sessions") }),
+  z.object({ kind: z.literal("create_room"), name: RoomName }),
+  z.object({ kind: z.literal("move_room"), roomId: z.string(), position: ScenePosition }),
+  z.object({ kind: z.literal("list_rooms") }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -53,12 +94,15 @@ export const SessionInfo = z.object({
   lastSeq: z.number().int(),
   /** Per-session, persisted, and re-applied on resume. */
   autonomy: AutonomyMode,
+  /** The room this agent works in, or null for a roomless session (every M0 session). */
+  roomId: z.string().nullable(),
 });
 export type SessionInfo = z.infer<typeof SessionInfo>;
 
 export const ServerMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("event"), sessionId: z.string(), seq: z.number().int(), event: SessionEvent }),
   z.object({ kind: z.literal("sessions"), sessions: z.array(SessionInfo) }),
+  z.object({ kind: z.literal("rooms"), rooms: z.array(RoomInfo) }),
   z.object({ kind: z.literal("error"), message: z.string() }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;

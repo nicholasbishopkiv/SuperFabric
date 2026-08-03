@@ -37,14 +37,14 @@ describe("event store", () => {
 
   it("replaces the session list on a sessions message", () => {
     useFabric.setState({
-      sessions: [{ id: "old", state: "done", claudeSessionId: null, lastSeq: 3, autonomy: "auto" }],
+      sessions: [{ id: "old", state: "done", claudeSessionId: null, lastSeq: 3, autonomy: "auto", roomId: null }],
     });
 
     apply({
       kind: "sessions",
       sessions: [
-        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 7, autonomy: "auto" },
-        { id: "s2", state: "paused", claudeSessionId: null, lastSeq: 0, autonomy: "attended" },
+        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 7, autonomy: "auto", roomId: null },
+        { id: "s2", state: "paused", claudeSessionId: null, lastSeq: 0, autonomy: "attended", roomId: null },
       ],
     });
 
@@ -55,8 +55,8 @@ describe("event store", () => {
     apply({
       kind: "sessions",
       sessions: [
-        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 7, autonomy: "bypass" },
-        { id: "s2", state: "active", claudeSessionId: "c2", lastSeq: 1, autonomy: "attended" },
+        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 7, autonomy: "bypass", roomId: null },
+        { id: "s2", state: "active", claudeSessionId: "c2", lastSeq: 1, autonomy: "attended", roomId: null },
       ],
     });
     expect(useFabric.getState().sessions.map((s) => [s.id, s.autonomy])).toEqual([
@@ -68,8 +68,8 @@ describe("event store", () => {
     apply({
       kind: "sessions",
       sessions: [
-        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 9, autonomy: "attended" },
-        { id: "s2", state: "active", claudeSessionId: "c2", lastSeq: 1, autonomy: "attended" },
+        { id: "s1", state: "active", claudeSessionId: "c1", lastSeq: 9, autonomy: "attended", roomId: null },
+        { id: "s2", state: "active", claudeSessionId: "c2", lastSeq: 1, autonomy: "attended", roomId: null },
       ],
     });
     expect(useFabric.getState().sessions.find((s) => s.id === "s1")?.autonomy).toBe("attended");
