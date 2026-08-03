@@ -51,6 +51,28 @@ Still open for M1:
 - [ ] Roles library v1: ~10 presets (role = prompt + skills/superpowers + plugins/MCP + model).
 - [ ] Onboarding agent for an empty project (interview → CLAUDE.md / README).
 
+## M1b — Projects, folders, files and a real UI
+
+Four capabilities the operator asked for once the floor existed. They are grouped because
+they all reshape the same surface: what the browser is looking at, and how a human puts
+things into it.
+
+- [ ] **Multiple projects, one SuperFabric.** Pick the project folder in the UI and switch
+      between projects; each is its own factory floor with its own rooms, agents, tasks,
+      messages and history. Everything scoped by `project_id` in one database, so a switch
+      is instant and does not restart the server. `SUPERFABRIC_PROJECT` becomes the default
+      for the first project, not the only one there can be.
+- [ ] **Per-room working folder.** A room defaults to `<project>/<name>/`, but the folder is
+      settable: a department may live in a separate repository. Adopting an existing folder
+      must never overwrite its `CLAUDE.md` (the invariant already holds — keep it).
+- [ ] **Files in, paths out.** Paste from the clipboard, drop onto the window, or upload.
+      The file is written into the project (or the selected room's) folder and the agent
+      receives **the path**, not the bytes — a colleague handed a file on disk. Images
+      pasted from the clipboard get a sensible generated name and extension.
+- [ ] **A real UI.** Rebuild the HUD on a component library instead of hand-rolled inline
+      styles, so the panels look designed rather than assembled. Choice and reasoning:
+      `docs/decisions/0003-ui-library.md`.
+
 ## M2 — Multi-account and the limit monitor
 
 - AccountManager: profiles via `CLAUDE_CONFIG_DIR`; **"Add session" button** opening an
@@ -120,7 +142,7 @@ Still open for M3 (M3b):
   (phone push desirable), event history/search.
 - Roles library expansion (50+ presets, user-defined presets).
 - Metrics: per-account burn rate, cost-equivalent analytics (ccusage math).
-- Factory export/import, multi-project support (several factories).
+- Factory export/import (multi-project moved up to M1b).
 
 ## Planned after v1
 

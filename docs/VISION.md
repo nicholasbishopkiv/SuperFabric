@@ -31,6 +31,16 @@
 > building: it distributes work, clears blockers, makes technical direction decisions,
 > and junior agents come to it for research and rulings.
 >
+> **One SuperFabric, many factories.** The user picks the project folder in the UI and can
+> switch between projects — each is its own factory floor with its own rooms, agents,
+> tasks and history. A room defaults to a subfolder of the project, but its working folder
+> can be pointed anywhere: a department may live in a separate repository.
+>
+> **Files go in by hand, paths go to the agent.** Anything the user pastes from the
+> clipboard, drops onto the window, or uploads is saved into the project (or the room's)
+> folder, and the agent simply receives the path — the way a colleague would be handed a
+> file on disk rather than an attachment.
+>
 > Accounts are added right from the UI: the **"Add session"** button opens an embedded
 > terminal where the user logs into a Claude account; every new room or agent is then
 > bound to one of the registered accounts. Claude Code is the first supported engine;

@@ -140,7 +140,7 @@ Two layers, by explicit product decision — the factory must *look like a facto
   Camera: orthographic isometric with `MapControls` (pan/zoom). Perf discipline:
   instanced meshes for packages, zustand per-object selectors (never re-render the
   scene tree on a status tick), frameloop="demand" when idle.
-- **2D overlay (DOM)** — plain React above the canvas: **task panel** (manual task
+- **2D overlay (DOM)** — React above the canvas, built on a component library rather than hand-rolled inline styles (see `docs/decisions/0003-ui-library.md`): **task panel** (manual task
   entry; leaving "department" empty routes the task to the orchestrator, which
   analyzes it, picks the room and assignee, and dispatches it), limit meters (per
   account: 5h + weekly + per-model, reset timers), approval cards, agent chat drawer,
@@ -189,6 +189,25 @@ Protocol types: WS envelopes, event payloads, bus message schema, task schema. Z
   from Anthropic's reference devcontainer (`init-firewall.sh`), `Memory/NanoCpus/
   PidsLimit` caps, `--dangerously-skip-permissions` becomes safe inside the sandbox.
   Runner speaks WS back to the server (same event protocol).
+
+### 2.5 Projects, room folders and attachments (M1b)
+
+- **ProjectManager** — a `projects` table (`id`, `name`, `root`, `last_opened_at`) and a
+  `project_id` on rooms, sessions, tasks and messages. One SuperFabric serves many
+  factories; switching is a client-side scope change plus a re-scoped set of broadcasts,
+  not a server restart. `SUPERFABRIC_PROJECT` seeds the first project and stops being the
+  only one that can exist. Everything the operator sees — floor, board, chronicle — is
+  filtered by the active project.
+- **Room folders are settable.** A room still defaults to `<project>/<name>/`, but its
+  `path` may point anywhere, so a department can live in a separate repository. The
+  containment check that protects the default case does not apply to an explicitly chosen
+  folder; adopting one never overwrites an existing `CLAUDE.md`.
+- **AttachmentStore** — files arrive from the browser by paste, drop or upload and are
+  written into the project (or the selected room's) folder under a predictable
+  subdirectory. **The agent is given the path, never the bytes**: an attachment becomes a
+  line in the injected turn pointing at a file on disk, which is what an agent with file
+  tools actually wants and what keeps the event log small. Clipboard images get a
+  generated name and a real extension sniffed from the payload.
 
 ## 3. Filesystem contract
 
