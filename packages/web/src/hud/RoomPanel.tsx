@@ -162,6 +162,74 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
   );
 }
 
+/**
+ * The room's folder, and how to point it somewhere else.
+ *
+ * Kept next to the path rather than behind a settings screen because the folder *is* the room: a
+ * department may live in a separate repository, and re-pointing it is a normal thing to do rather than
+ * a repair. The two things an operator must know are said out loud: nothing is moved on disk, and an
+ * agent already running keeps the folder its session started in.
+ */
+function RoomFolder({ roomId, path: current, connected }: { roomId: string; path: string; connected: boolean }) {
+  const [editing, setEditing] = useState(false);
+  const [path, setPath] = useState(current);
+  const clearError = useFabric((s) => s.clearError);
+
+  function submit(e: React.FormEvent): void {
+    e.preventDefault();
+    const wanted = path.trim();
+    if (wanted === "" || wanted === current) {
+      setEditing(false);
+      return;
+    }
+    clearError();
+    send({ kind: "set_room_path", roomId, path: wanted });
+    setEditing(false);
+  }
+
+  if (!editing) {
+    return (
+      <div style={{ marginBottom: 4 }}>
+        {/* The path is the room: "room = folder" is the product's central claim, so the folder is
+            shown rather than hidden behind an id. */}
+        <div style={{ color: HUD.dim, fontSize: 12, wordBreak: "break-all" }}>{current}</div>
+        <button
+          onClick={() => { setPath(current); setEditing(true); }}
+          disabled={!connected}
+          style={{ font: "inherit", fontSize: 12, marginTop: 2 }}
+        >
+          Change folder…
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={submit} style={{ marginBottom: 4 }}>
+      <input
+        name="roomPath"
+        value={path}
+        onChange={(e) => setPath(e.target.value)}
+        placeholder="/absolute/path/to/the/folder"
+        style={{ width: "100%", boxSizing: "border-box", padding: "5px 7px", font: "inherit" }}
+      />
+      <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+        <button type="submit" disabled={!connected} style={{ font: "inherit" }}>
+          Re-point
+        </button>
+        <button type="button" onClick={() => setEditing(false)} style={{ font: "inherit" }}>
+          Cancel
+        </button>
+      </div>
+      <div style={{ color: HUD.dim, fontSize: 12, marginTop: 4 }}>
+        An absolute path, typed by hand — the browser cannot hand the server a real folder path, so
+        there is no picker. Nothing is moved: this re-points the room. Agents already running here keep
+        their old folder until they are restarted; new ones use the new one.
+      </div>
+    </form>
+  );
+}
+
 /** The selected room in full: where it lives on disk, who works there, and how to add someone. */
 function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolean }) {
   const room = useRoom(roomId);
@@ -171,11 +239,15 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
   return (
     <section style={{ borderTop: `1px solid ${HUD.line}`, paddingTop: 10, marginBottom: 12 }}>
       <div style={{ fontWeight: 700, marginBottom: 2 }}>{room.name}</div>
-      {/* The path is the room: "room = folder" is the product's central claim, so the folder is
-          shown rather than hidden behind an id. */}
-      <div style={{ color: HUD.dim, fontSize: 12, wordBreak: "break-all", marginBottom: 4 }}>
-        {room.path}
-      </div>
+      {room.kind === "project" ? (
+        // The central building stands for the project root itself, so its folder is the project's —
+        // changing it here would let the two disagree. Another factory is another project.
+        <div style={{ color: HUD.dim, fontSize: 12, wordBreak: "break-all", marginBottom: 4 }}>
+          {room.path}
+        </div>
+      ) : (
+        <RoomFolder roomId={roomId} path={room.path} connected={connected} />
+      )}
       {/* The charter is where an agent learns it is a department with a bus. A room created here
           gets that section written for it; a folder that already had a CLAUDE.md keeps its own,
           untouched — so for those it is the operator who has to say it. */}
@@ -237,6 +309,9 @@ function UnassignedSessions() {
 export function RoomPanel() {
   const [open, setOpen] = useState(true);
   const [name, setName] = useState("");
+  /** An explicit folder for the new room, empty for the default `<project>/<name>`. */
+  const [path, setPath] = useState("");
+  const [showPath, setShowPath] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const roomIds = useRoomIds();
   const selectedRoomId = useSelectedRoomId();
@@ -265,11 +340,15 @@ export function RoomPanel() {
     const bad = nameProblem(wanted);
     setProblem(bad);
     if (bad !== null) return;
+    const folder = showPath ? path.trim() : "";
     // A stale rejection ("already exists") must not sit under a fresh attempt.
     clearError();
     pending.current = wanted;
-    send({ kind: "create_room", name: wanted });
+    // With a folder the room lives exactly there, anywhere on disk; without one it is
+    // `<project root>/<name>` and the server keeps it inside the root.
+    send({ kind: "create_room", name: wanted, ...(folder === "" ? {} : { path: folder }) });
     setName("");
+    setPath("");
   }
 
   return (
@@ -322,6 +401,40 @@ export function RoomPanel() {
           <div style={{ color: HUD.dim, fontSize: 12, marginTop: 4 }}>
             The name is the folder name: {NAME_RULE}.
           </div>
+          {/* The default is `<project>/<name>`, which is what "room = folder" means most of the
+              time. A department that lives in a separate repository is the exception, so the field
+              for it is out of the way until it is asked for. */}
+          {showPath ? (
+            <>
+              <input
+                name="roomPath"
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                placeholder="/absolute/path/to/an/existing/repo"
+                style={{ width: "100%", boxSizing: "border-box", marginTop: 6, padding: "5px 7px", font: "inherit" }}
+              />
+              <div style={{ color: HUD.dim, fontSize: 12, marginTop: 4 }}>
+                Typed by hand — the browser cannot hand the server a real folder path, so there is no
+                picker. Leave it empty to use the project's own folder. An existing{" "}
+                <code>CLAUDE.md</code> there is never overwritten.{" "}
+                <button
+                  type="button"
+                  onClick={() => { setShowPath(false); setPath(""); }}
+                  style={{ font: "inherit", fontSize: 12 }}
+                >
+                  use the default
+                </button>
+              </div>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowPath(true)}
+              style={{ font: "inherit", fontSize: 12, marginTop: 4 }}
+            >
+              Choose a folder outside the project…
+            </button>
+          )}
           {problem !== null && <div style={{ color: HUD.err, fontSize: 12, marginTop: 4 }}>{problem}</div>}
           {lastError !== null && (
             <div style={{ color: HUD.err, fontSize: 12, marginTop: 4 }}>server: {lastError}</div>

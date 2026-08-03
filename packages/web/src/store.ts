@@ -1,6 +1,7 @@
 import type {
   MessageInfo,
   MessageKind,
+  ProjectInfo,
   RoomInfo,
   ScenePosition,
   ServerMessage,
@@ -107,6 +108,14 @@ let packageSeq = 0;
 const pairKey = (a: string, b: string): string => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
 export interface FabricState {
+  /** Every factory this server serves, in the server's order. */
+  projects: ProjectInfo[];
+  /**
+   * The factory this tab is looking at, or null before the server has said. Server-owned: the socket
+   * holds the active project, so this is whatever the last `projects` message carried and never
+   * something the UI sets on its own.
+   */
+  activeProjectId: string | null;
   sessions: SessionInfo[];
   /** The factory floor: the project building first, then one workshop per room. */
   rooms: RoomInfo[];
@@ -230,12 +239,53 @@ export interface FabricState {
    * the message id and starts at the door the marker was standing at.
    */
   applyMessages(messages: MessageInfo[]): void;
+  /**
+   * The server's project list and the one this socket is on.
+   *
+   * When the active project **changes**, everything scoped to a project is *dropped* rather than
+   * merged: rooms, agents, the board, bus traffic, packages, belts and every transcript. A stale
+   * building from another factory standing on this floor is the visible symptom of merging here, and
+   * it cannot be cleaned up later because nothing in the new project's snapshots mentions it. The
+   * camera is asked to re-frame for the same reason: the new floor is somewhere else.
+   */
+  applyProjects(projects: ProjectInfo[], activeProjectId: string): void;
   /** Drop packages that have arrived. Called from the render loop and by a per-package timer. */
   reapPackages(now?: number): void;
 }
 
+/**
+ * Everything a project owns, back to empty. Deliberately *not* `initialFabricState`: the HUD's panel
+ * widths, the socket's connected flag and the project list itself are properties of the tab, not of
+ * the factory it happens to be showing.
+ */
+const EMPTY_PROJECT_STATE = {
+  sessions: [] as SessionInfo[],
+  rooms: [] as RoomInfo[],
+  roomIds: [] as string[],
+  selectedRoomId: null as string | null,
+  drag: null as RoomDrag | null,
+  roomStatus: {} as Record<string, FactoryStatus>,
+  conveyors: [] as Conveyor[],
+  packages: [] as PackageInFlight[],
+  tasks: [] as TaskInfo[],
+  waiting: [] as WaitingMessage[],
+  animatedMessages: {} as Record<string, true>,
+  // The next project's first `messages` snapshot is history, not news — the same reason a reconnect
+  // re-baselines. Without this every queued message on the new floor would fly down a belt at once.
+  messagesLoaded: false,
+  packagedPairs: {} as Record<string, Conveyor>,
+  events: {} as Record<string, EventRow[]>,
+  lastSeq: {} as Record<string, number>,
+  contiguousSeq: {} as Record<string, number>,
+  needsResync: {} as Record<string, boolean>,
+  // An error about the factory we just left would sit under whatever the operator does next.
+  lastError: null as string | null,
+} as const;
+
 /** Everything except the actions — exported so tests can reset between cases. */
 export const initialFabricState = {
+  projects: [] as ProjectInfo[],
+  activeProjectId: null as string | null,
   sessions: [] as SessionInfo[],
   rooms: [] as RoomInfo[],
   roomIds: [] as string[],
@@ -479,6 +529,7 @@ export const useFabric = create<FabricState>((set, get) => ({
     // Not a reducer: turning a delivery into a package also arms the reaper's timer, and a timer is
     // a side effect that has no business inside `set`.
     if (msg.kind === "messages") return get().applyMessages(msg.messages);
+    if (msg.kind === "projects") return get().applyProjects(msg.projects, msg.activeProjectId);
     set((s) => {
       if (msg.kind === "sessions") return applySessions(s, msg.sessions);
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
@@ -644,6 +695,34 @@ export const useFabric = create<FabricState>((set, get) => ({
     if (started.length > 0) setTimeout(() => get().reapPackages(), DEFAULT_PACKAGE_MS + 80);
   },
 
+  applyProjects: (projects, activeProjectId) =>
+    set((s) => {
+      const sameList = projects.length === s.projects.length
+        && projects.every((p, i) => {
+          const prev = s.projects[i];
+          return prev !== undefined && prev.id === p.id && prev.name === p.name
+            && prev.root === p.root && prev.lastOpenedAt === p.lastOpenedAt;
+        });
+      // A `projects` frame arrives whenever *anyone* adds or opens a project, so the common case is
+      // that nothing about this tab changed at all.
+      if (sameList && activeProjectId === s.activeProjectId) return s;
+
+      const list = sameList ? s.projects : projects;
+      // First frame of a connection: there is nothing to drop, and dropping would throw away rooms
+      // that legitimately arrived in the same round trip.
+      if (s.activeProjectId === null || s.activeProjectId === activeProjectId) {
+        return { projects: list, activeProjectId };
+      }
+      return {
+        ...EMPTY_PROJECT_STATE,
+        projects: list,
+        activeProjectId,
+        // The new floor is somewhere else on the ground plane; keeping the old camera would leave the
+        // operator looking at empty concrete.
+        fitRequests: s.fitRequests + 1,
+      };
+    }),
+
   reapPackages: (now = Date.now()) =>
     set((s) => {
       const packages = s.packages.filter((p) => now - p.startedAt < p.durationMs);
@@ -657,6 +736,16 @@ export const useFabric = create<FabricState>((set, get) => ({
 // room and its own agent count, so one room's change re-renders one building.
 
 export const useRoomIds = (): string[] => useFabric((s) => s.roomIds);
+
+// ---- projects ----
+
+export const useProjects = (): ProjectInfo[] => useFabric((s) => s.projects);
+
+export const useActiveProjectId = (): string | null => useFabric((s) => s.activeProjectId);
+
+/** The factory this tab is showing, or undefined before the server has said which. */
+export const useActiveProject = (): ProjectInfo | undefined =>
+  useFabric((s) => s.projects.find((p) => p.id === s.activeProjectId));
 
 export const useRoom = (roomId: string): RoomInfo | undefined =>
   useFabric((s) => s.rooms.find((r) => r.id === roomId));

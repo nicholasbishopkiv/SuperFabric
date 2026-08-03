@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
 import { FitButton } from "./hud/FitButton";
+import { ProjectSwitcher } from "./hud/ProjectSwitcher";
 import { RoomPanel } from "./hud/RoomPanel";
 import { TaskPanel } from "./hud/TaskPanel";
 import { FactoryScene } from "./scene/FactoryScene";
@@ -21,10 +22,12 @@ export default function App() {
     <>
       <FactoryScene />
       {/* Three overlays, three edges: rooms on the left, the one-agent console on the right, the
-          task board along the bottom between them. The top is left clear on purpose. */}
+          task board along the bottom between them. The top edge carries only the project switcher —
+          which factory this tab is looking at — and is otherwise left clear. */}
       <RoomPanel />
       <ConsoleDrawer />
       <TaskPanel />
+      <ProjectSwitcher />
       {/* Last, so it paints over the panel's own corner. */}
       <FitButton />
     </>

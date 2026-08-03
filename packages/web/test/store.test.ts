@@ -1,4 +1,4 @@
-import type { MessageInfo, RoomInfo, SessionInfo, TaskInfo } from "@superfabric/shared";
+import type { MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   agentStatus,
@@ -25,6 +25,7 @@ beforeEach(() => {
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
     selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
+    projects: [], activeProjectId: null,
   });
 });
 
@@ -1024,5 +1025,130 @@ describe("hasMotion", () => {
     apply({ kind: "messages", messages: [message({ id: "m1", deliveredAt: null })] });
     expect(useFabric.getState().waiting).toHaveLength(1);
     expect(hasMotion(useFabric.getState())).toBe(false);
+  });
+});
+
+// ---- M1b: switching factories ----
+
+describe("projects", () => {
+  const project = (over: Partial<ProjectInfo> = {}): ProjectInfo => ({
+    id: "p1", name: "shop", root: "/code/shop", lastOpenedAt: null, ...over,
+  });
+  const other = project({ id: "p2", name: "vendor", root: "/code/vendor" });
+
+  /** A floor with a building, an agent, a card, a belt and a queued crate — a factory in use. */
+  function fillFactory(): void {
+    apply({
+      kind: "rooms",
+      rooms: [
+        room({ id: "p", name: "shop", kind: "project", position: { x: 0, z: 0 } }),
+        room({ id: "r1" }),
+        room({ id: "r2", name: "web", position: { x: 0, z: 8 } }),
+      ],
+    });
+    apply({ kind: "sessions", sessions: [session({ id: "s1", roomId: "r1", status: "working" })] });
+    apply({
+      kind: "tasks",
+      tasks: [{
+        id: "t1", title: "Expose a webhook", detail: "", status: "open",
+        roomId: "r1", agentId: null, blockedOnMessageId: null, createdAt: 1, updatedAt: 1,
+      }],
+    });
+    useFabric.getState().selectRoom("r1");
+    useFabric.getState().setConnected(true);
+    apply({ kind: "messages", messages: [message({ id: "m1", deliveredAt: null })] });
+    apply({ kind: "event", sessionId: "s1", seq: 1, event: { type: "agent_text", text: "working" } });
+  }
+
+  it("records the list and the active project the server says this socket is on", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    const s = useFabric.getState();
+    expect(s.projects.map((p) => p.id)).toEqual(["p1", "p2"]);
+    expect(s.activeProjectId).toBe("p1");
+  });
+
+  it("keeps the floor that arrived in the same round trip as the first projects frame", () => {
+    // On connect the client asks for projects first, but the answers can land either way round.
+    fillFactory();
+    apply({ kind: "projects", projects: [project()], activeProjectId: "p1" });
+    expect(useFabric.getState().roomIds).toHaveLength(3);
+    expect(useFabric.getState().tasks).toHaveLength(1);
+  });
+
+  it("drops the previous factory entirely when the active project changes", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    fillFactory();
+    // sanity: there is something to lose
+    const before = useFabric.getState();
+    expect(before.rooms.length).toBeGreaterThan(0);
+    expect(before.conveyors.length).toBeGreaterThan(0);
+    expect(before.waiting).toHaveLength(1);
+    expect(before.events["s1"]).toHaveLength(1);
+
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p2" });
+
+    const s = useFabric.getState();
+    // A stale building from another factory standing on this floor is the symptom of merging here.
+    expect(s.rooms).toEqual([]);
+    expect(s.roomIds).toEqual([]);
+    expect(s.sessions).toEqual([]);
+    expect(s.tasks).toEqual([]);
+    expect(s.waiting).toEqual([]);
+    expect(s.packages).toEqual([]);
+    expect(s.conveyors).toEqual([]);
+    expect(s.packagedPairs).toEqual({});
+    expect(s.animatedMessages).toEqual({});
+    expect(s.roomStatus).toEqual({});
+    expect(s.events).toEqual({});
+    expect(s.lastSeq).toEqual({});
+    expect(s.contiguousSeq).toEqual({});
+    expect(s.selectedRoomId).toBeNull();
+    // …and the tab's own state is not a casualty of the switch
+    expect(s.activeProjectId).toBe("p2");
+    expect(s.projects.map((p) => p.id)).toEqual(["p1", "p2"]);
+    expect(s.connected).toBe(true);
+  });
+
+  it("re-baselines the bus, so the new factory's queue does not fly down a belt", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    fillFactory();
+    expect(useFabric.getState().messagesLoaded).toBe(true);
+
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p2" });
+    expect(useFabric.getState().messagesLoaded).toBe(false);
+
+    // The new floor's first snapshot is history: it is adopted, not animated.
+    apply({ kind: "rooms", rooms: [room({ id: "r1" }), room({ id: "r2", name: "web", position: { x: 0, z: 8 } })] });
+    apply({ kind: "messages", messages: [message({ id: "m9", deliveredAt: 3_000 })] });
+    expect(useFabric.getState().packages).toEqual([]);
+  });
+
+  it("asks the camera to re-frame, because the new floor is somewhere else", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    const before = useFabric.getState().fitRequests;
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p2" });
+    expect(useFabric.getState().fitRequests).toBe(before + 1);
+  });
+
+  it("changes nothing when the same frame arrives twice", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    fillFactory();
+    const before = useFabric.getState();
+    // Every tab is told when anyone adds or opens a project, so a no-op frame is the common case.
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    const after = useFabric.getState();
+    expect(after.rooms).toBe(before.rooms);
+    expect(after.projects).toBe(before.projects);
+    expect(after.fitRequests).toBe(before.fitRequests);
+  });
+
+  it("takes a changed project list without touching the floor", () => {
+    apply({ kind: "projects", projects: [project()], activeProjectId: "p1" });
+    fillFactory();
+    const rooms = useFabric.getState().rooms;
+    // Another tab created a project: the switcher gains an entry, this floor does not change.
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    expect(useFabric.getState().projects.map((p) => p.id)).toEqual(["p1", "p2"]);
+    expect(useFabric.getState().rooms).toBe(rooms);
   });
 });

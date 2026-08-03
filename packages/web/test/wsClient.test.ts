@@ -60,8 +60,10 @@ describe("wsClient", () => {
     // The bus's snapshot is part of the floor: a message queued for a busy room is drawn on it, and
     // this answer is the baseline that stops later broadcasts replaying old deliveries as packages.
     // The board is server state too — a reload must not have to wait for a task to change.
+    // Projects come first: the answer says which factory this socket is on, and every list that
+    // follows is scoped to it.
     expect(sock.sent.map((m) => m.kind))
-      .toEqual(["list_sessions", "list_rooms", "list_messages", "list_tasks"]);
+      .toEqual(["list_projects", "list_sessions", "list_rooms", "list_messages", "list_tasks"]);
   });
 
   it("re-asks for the floor after a reconnect", async () => {
@@ -76,6 +78,33 @@ describe("wsClient", () => {
     const reconnected = FakeWebSocket.instances.at(-1)!;
     reconnected.onopen?.();
     expect(reconnected.sent.map((m) => m.kind)).toContain("list_rooms");
+  });
+});
+
+describe("wsClient projects", () => {
+  it("open_project forgets the sessions this tab was following", async () => {
+    const { client, sock } = await freshClient();
+    client.subscribe("s");
+    client.openProject("p2");
+    expect(sock.sent.at(-1)).toEqual({ kind: "open_project", projectId: "p2" });
+
+    // Those transcripts belong to the floor we just left; a reconnect must not ask for them again.
+    sock.onclose?.();
+    vi.useFakeTimers();
+    try { client.connect(); } finally { vi.useRealTimers(); }
+    const reconnected = FakeWebSocket.instances.at(-1)!;
+    reconnected.onopen?.();
+    expect(subscribes(reconnected)).toEqual([]);
+  });
+
+  it("create_project sends the root, and a name only when there is one", async () => {
+    const { client, sock } = await freshClient();
+    client.createProject("/code/shop");
+    expect(sock.sent.at(-1)).toEqual({ kind: "create_project", root: "/code/shop" });
+    client.createProject("/code/shop", "Shop");
+    expect(sock.sent.at(-1)).toEqual({ kind: "create_project", root: "/code/shop", name: "Shop" });
+    client.createProject("/code/shop", "");
+    expect(sock.sent.at(-1)).toEqual({ kind: "create_project", root: "/code/shop" });
   });
 });
 
