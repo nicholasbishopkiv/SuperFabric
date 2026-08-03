@@ -60,6 +60,37 @@ const MIGRATIONS: readonly string[] = [
     );
     ALTER TABLE sessions ADD COLUMN room_id TEXT;
   `,
+  // 4 — M3a tasks and the factory bus. Both tables are deliberately free of foreign keys, for the
+  // same reason `events` is: a task's card and a message's record must outlive whatever happens to
+  // the room or session they name (a deleted room must not erase the history of what it asked for).
+  // `tasks.room_id` NULL means unassigned — the orchestrator routes it (M3b).
+  // `messages.delivered_at` NULL means "persisted, nobody has carried it yet"; the index is what
+  // makes "what is still queued for this room" a lookup rather than a scan of all traffic, and it
+  // is the query `FactoryBus.flushRoom` runs at every turn boundary.
+  `
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      detail TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'open',
+      room_id TEXT,
+      agent_id TEXT,
+      blocked_on_message_id TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      from_room_id TEXT NOT NULL,
+      to_room_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      body TEXT NOT NULL,
+      task_id TEXT,
+      delivered_at INTEGER,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS messages_undelivered ON messages (to_room_id, delivered_at);
+  `,
 ];
 
 /** Schema version a freshly opened database is brought up to. */

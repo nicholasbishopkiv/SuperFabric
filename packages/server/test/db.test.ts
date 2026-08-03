@@ -184,4 +184,83 @@ describe("db", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // ---- migration 4: tasks and bus messages ----
+
+  it("creates the tasks table with an unassigned, open default shape", () => {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO tasks (id, title) VALUES (?, ?)").run("t1", "Expose a webhook");
+    expect(db.prepare("SELECT detail, status, room_id, agent_id, blocked_on_message_id FROM tasks WHERE id = 't1'").get())
+      .toEqual({ detail: "", status: "open", room_id: null, agent_id: null, blocked_on_message_id: null });
+    const row = db.prepare("SELECT created_at, updated_at FROM tasks WHERE id = 't1'").get() as
+      { created_at: number; updated_at: number };
+    expect(row.created_at).toBeGreaterThan(0);
+    expect(row.updated_at).toBeGreaterThan(0);
+  });
+
+  it("creates the messages table with delivered_at nullable and an undelivered index", () => {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO messages (id, from_room_id, to_room_id, kind, body) VALUES (?, ?, ?, ?, ?)")
+      .run("m1", "r1", "r2", "request", "please expose a webhook");
+    expect(db.prepare("SELECT task_id, delivered_at FROM messages WHERE id = 'm1'").get())
+      .toEqual({ task_id: null, delivered_at: null });
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'")
+      .all() as { name: string }[];
+    expect(indexes.map(i => i.name)).toContain("messages_undelivered");
+    // the undelivered lookup is the one the bus runs at every turn boundary, so it must be indexed
+    const plan = db.prepare("EXPLAIN QUERY PLAN SELECT id FROM messages WHERE to_room_id = ? AND delivered_at IS NULL")
+      .all("r2") as { detail: string }[];
+    expect(plan.map(p => p.detail).join(" ")).toContain("messages_undelivered");
+  });
+
+  it("upgrades a user_version = 3 database to tasks + messages, keeping its rows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-v3-"));
+    try {
+      const path = join(dir, "v3.db");
+      // A database exactly as migration 3 left it.
+      const v3 = new Database(path);
+      v3.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, claude_session_id TEXT,
+          state TEXT NOT NULL DEFAULT 'active', cwd TEXT NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          autonomy TEXT NOT NULL DEFAULT 'auto', room_id TEXT
+        );
+        CREATE TABLE events (
+          session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          ts INTEGER NOT NULL DEFAULT (unixepoch()),
+          type TEXT NOT NULL, payload TEXT NOT NULL,
+          PRIMARY KEY (session_id, seq)
+        );
+        CREATE TABLE rooms (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'room',
+          pos_x REAL NOT NULL DEFAULT 0, pos_z REAL NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+      `);
+      v3.exec("PRAGMA user_version = 3");
+      v3.prepare("INSERT INTO rooms (id, name, path) VALUES (?, ?, ?)").run("r1", "payments", "/m1/payments");
+      v3.prepare("INSERT INTO sessions (id, cwd, room_id) VALUES (?, ?, ?)").run("m1", "/m1/payments", "r1");
+      v3.close();
+
+      const db = openDb(path);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(4);
+
+      // the M1a room and its agent survived intact
+      expect(db.prepare("SELECT room_id FROM sessions WHERE id = 'm1'").get()).toEqual({ room_id: "r1" });
+      expect(db.prepare("SELECT name FROM rooms WHERE id = 'r1'").get()).toEqual({ name: "payments" });
+      // and the new tables are there to fill
+      db.prepare("INSERT INTO tasks (id, title, room_id) VALUES (?, ?, ?)").run("t1", "Expose a webhook", "r1");
+      db.prepare("INSERT INTO messages (id, from_room_id, to_room_id, kind, body, task_id) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("m1", "r1", "r1", "request", "body", "t1");
+      expect((db.prepare("SELECT COUNT(*) c FROM tasks").get() as { c: number }).c).toBe(1);
+      expect((db.prepare("SELECT COUNT(*) c FROM messages").get() as { c: number }).c).toBe(1);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
