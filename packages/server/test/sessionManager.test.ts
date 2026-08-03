@@ -8,6 +8,8 @@ import { EventStore } from "../src/eventStore.js";
 import { RoomManager } from "../src/roomManager.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
+import { FactoryBus } from "../src/factoryBus.js";
+import { TaskStore } from "../src/taskStore.js";
 import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../src/executor.js";
 
 function make(db = openDb(":memory:")) {
@@ -464,6 +466,157 @@ describe("SessionManager", () => {
         mgr.createSession({ roomId: room.id });
         mgr.createSession({ roomId: room.id });
         expect(rooms.listRooms().find((r) => r.id === room.id)!.agentCount).toBe(2);
+      });
+    });
+  });
+
+  // ---- M3a: the factory bus as a per-session tool set ----
+
+  describe("bus tools", () => {
+    /** Records every start(), so a test can assert the tool servers the executor was handed. */
+    class RecordingExecutor implements Executor {
+      readonly name = "recording";
+      readonly starts: ExecutorStartOptions[] = [];
+      start(opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
+        this.starts.push(opts);
+        ev.onEvent({ type: "session_status", status: "idle" });
+        return {
+          providerSessionId: Promise.resolve("claude-session-bus"),
+          send: () => {},
+          interrupt: async () => {},
+          stop: async () => {},
+        };
+      }
+    }
+
+    /** A manager wired to a real bus and task store over two real rooms. */
+    function withBus<T>(fn: (ctx: {
+      db: ReturnType<typeof openDb>; store: EventStore; exec: RecordingExecutor; rooms: RoomManager;
+      mgr: SessionManager; bus: FactoryBus; tasks: TaskStore;
+      chat: ReturnType<RoomManager["createRoom"]>; payments: ReturnType<RoomManager["createRoom"]>;
+      delivered: { sessionId: string; text: string }[];
+    }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-session-bus-"));
+      const db = openDb(":memory:");
+      try {
+        const store = new EventStore(db);
+        const exec = new RecordingExecutor();
+        const rooms = new RoomManager(db, root);
+        rooms.ensureProjectRoom();
+        const chat = rooms.createRoom("chat");
+        const payments = rooms.createRoom("payments");
+        const delivered: { sessionId: string; text: string }[] = [];
+        const tasks = new TaskStore(db);
+        const bus = new FactoryBus({
+          db, rooms,
+          deliver: (sessionId, text) => { delivered.push({ sessionId, text }); },
+          roomAgents: () => [],
+        });
+        const mgr = new SessionManager(db, store, exec, rooms, { bus, tasks });
+        return fn({ db, store, exec, rooms, mgr, bus, tasks, chat, payments, delivered });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    /** A tool as the MCP server holds it: what the SDK will actually offer the model. */
+    interface Registered {
+      handler: (args: unknown, extra: unknown) => Promise<unknown>;
+    }
+
+    /**
+     * The tools registered on the in-process MCP server a start() was handed. `_registeredTools` is
+     * the MCP SDK's own private map; reaching into it is the only way to assert what the *server*
+     * carries rather than what our builder returned, which is the point of these cases.
+     */
+    function registeredTools(opts: ExecutorStartOptions): Record<string, Registered> {
+      const server = opts.mcpServers?.factory as { instance?: { _registeredTools?: Record<string, Registered> } };
+      return server?.instance?._registeredTools ?? {};
+    }
+
+    function toolsOf(opts: ExecutorStartOptions): string[] {
+      return Object.keys(registeredTools(opts));
+    }
+
+    it("gives a session in a room the factory MCP server", () => {
+      withBus(({ exec, mgr, chat }) => {
+        mgr.createSession({ roomId: chat.id });
+        const opts = exec.starts[0]!;
+        expect(Object.keys(opts.mcpServers ?? {})).toEqual(["factory"]);
+        expect(toolsOf(opts)).toEqual([
+          "factory_send", "factory_inbox", "factory_task_update", "factory_report_status",
+        ]);
+      });
+    });
+
+    it("gives a roomless session no bus tools: it has no department to speak for", () => {
+      withBus(({ exec, mgr }) => {
+        mgr.createSession({ cwd: tmpdir() });
+        expect(exec.starts[0]!.mcpServers).toEqual({});
+      });
+    });
+
+    it("gives no bus tools at all when the manager was built without a bus", () => {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-session-nobus-"));
+      try {
+        const db = openDb(":memory:");
+        const store = new EventStore(db);
+        const exec = new RecordingExecutor();
+        const rooms = new RoomManager(db, root);
+        rooms.ensureProjectRoom();
+        const room = rooms.createRoom("chat");
+        // an M0-shaped server: no bus, no task store, and rooms that simply have no tools
+        new SessionManager(db, store, exec, rooms).createSession({ roomId: room.id });
+        expect(exec.starts[0]!.mcpServers).toEqual({});
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("scopes the tool set to the session's own room, not to one an agent could name", async () => {
+      await withBus(async ({ exec, mgr, bus, chat, payments }) => {
+        mgr.createSession({ roomId: chat.id });
+        const send = registeredTools(exec.starts[0]!).factory_send!;
+
+        // the arguments claim to be the payments room; the message must still come from chat
+        await send.handler(
+          { to_room: "payments", kind: "request", body: "who is speaking?", from_room: "payments" },
+          {},
+        );
+        expect(bus.list()[0]).toMatchObject({ fromRoomId: chat.id, toRoomId: payments.id });
+      });
+    });
+
+    it("keeps the tool set across a restart, built from the stored room", () => {
+      withBus(({ db, store, rooms, bus, tasks, mgr, chat }) => {
+        mgr.createSession({ roomId: chat.id });
+        const exec2 = new RecordingExecutor();
+        const mgr2 = new SessionManager(db, store, exec2, rooms, { bus, tasks });
+        expect(mgr2.resumeAll()).toHaveLength(1);
+        expect(Object.keys(exec2.starts[0]!.mcpServers ?? {})).toEqual(["factory"]);
+      });
+    });
+
+    it("rebuilds the tool set when a live session's autonomy is switched", async () => {
+      await withBus(async ({ exec, mgr, chat }) => {
+        const id = mgr.createSession({ roomId: chat.id });
+        await mgr.setAutonomy(id, "bypass");
+        expect(exec.starts).toHaveLength(2);
+        // the restarted executor must still have the bus, or a mode toggle would silently mute an agent
+        expect(Object.keys(exec.starts[1]!.mcpServers ?? {})).toEqual(["factory"]);
+      });
+    });
+
+    it("factory_report_status lands in the session's own log", async () => {
+      await withBus(async ({ exec, mgr, store, chat }) => {
+        const id = mgr.createSession({ roomId: chat.id });
+        await registeredTools(exec.starts[0]!).factory_report_status!
+          .handler({ summary: "reading the charter" }, {});
+
+        const reported = store.listAfter(id, 0)
+          .map((e) => e.event)
+          .find((e) => e.type === "session_status" && e.detail === "reading the charter");
+        expect(reported).toBeTruthy();
       });
     });
   });

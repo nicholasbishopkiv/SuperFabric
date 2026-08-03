@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
+import { FACTORY_MCP_SERVER_NAME, busTools } from "./busTools.js";
 import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
+import type { FactoryBus } from "./factoryBus.js";
 import type { RoomManager } from "./roomManager.js";
+import type { TaskStore } from "./taskStore.js";
 import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
 
 /** A tool call waiting on an operator decision, bound to the session that asked. */
@@ -25,6 +28,16 @@ export interface CreateSessionOptions {
   autonomy?: AutonomyMode;
 }
 
+/**
+ * Optional collaborators. Both are needed together to give an agent the factory bus, and both are
+ * optional so a session runner is still constructible (and testable) without one — an M0-shaped
+ * server with no bus is a valid configuration, not a broken one.
+ */
+export interface SessionManagerOptions {
+  bus?: FactoryBus;
+  tasks?: TaskStore;
+}
+
 export class SessionManager {
   private handles = new Map<string, ExecutorHandle>();
   /**
@@ -37,13 +50,19 @@ export class SessionManager {
   private stopping = false;
   private readonly stmts;
 
-  constructor(private db: Db, private store: EventStore, private executor: Executor, private rooms: RoomManager) {
+  constructor(
+    private db: Db,
+    private store: EventStore,
+    private executor: Executor,
+    private rooms: RoomManager,
+    private opts: SessionManagerOptions = {},
+  ) {
     this.stmts = {
       insertSession: db.prepare("INSERT INTO sessions (id, cwd, autonomy, room_id) VALUES (?, ?, ?, ?)"),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
-      activeSessions: db.prepare("SELECT id, cwd, claude_session_id, autonomy FROM sessions WHERE state = 'active'"),
+      activeSessions: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id FROM sessions WHERE state = 'active'"),
       markError: db.prepare("UPDATE sessions SET state = 'error' WHERE id = ? AND state = 'active'"),
-      session: db.prepare("SELECT id, cwd, claude_session_id, autonomy FROM sessions WHERE id = ?"),
+      session: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id FROM sessions WHERE id = ?"),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
       // `status` and `blocked` are derived from the log by correlated subqueries rather than a
@@ -98,7 +117,7 @@ export class SessionManager {
 
     const id = randomUUID();
     this.stmts.insertSession.run(id, cwd, autonomy, roomId);
-    this.startExecutor(id, cwd, null, autonomy);
+    this.startExecutor(id, cwd, null, autonomy, roomId);
     return id;
   }
 
@@ -141,7 +160,7 @@ export class SessionManager {
     // now would leak a CLI subprocess past the server's exit; the stored mode still applies on the
     // next boot.
     if (this.stopping) return;
-    this.startExecutor(id, row.cwd, row.claude_session_id, autonomy);
+    this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id);
   }
 
   /**
@@ -155,15 +174,36 @@ export class SessionManager {
       if (this.handles.has(r.id)) continue;
       // The stored mode is what a session comes back as: a bypass agent stays bypass across a
       // restart, an attended one stays attended.
-      this.startExecutor(r.id, r.cwd, r.claude_session_id, asAutonomy(r.autonomy));
+      this.startExecutor(r.id, r.cwd, r.claude_session_id, asAutonomy(r.autonomy), r.room_id);
       started.push(r.id);
     }
     return started;
   }
 
-  private startExecutor(id: string, cwd: string, resume: string | null, autonomy: AutonomyMode) {
+  /**
+   * The factory bus as this session's own tool set. The room is read from the session row — never
+   * from anything an agent could say — so an agent can only ever send messages as the department it
+   * actually works in. A roomless session gets no bus tools at all: it has no department to speak
+   * for, and a tool that would have to guess one is worse than an absent tool.
+   */
+  private busToolServers(sessionId: string, roomId: string | null): Record<string, ReturnType<typeof busTools>> {
+    const { bus, tasks } = this.opts;
+    if (roomId === null || bus === undefined || tasks === undefined) return {};
+    return {
+      [FACTORY_MCP_SERVER_NAME]: busTools({
+        bus, tasks, rooms: this.rooms, roomId,
+        // factory_report_status is a line in this session's own log: the operator reads the agent's
+        // own words next to everything else it did, rather than in a separate channel.
+        reportStatus: (summary) => {
+          this.store.append(sessionId, { type: "session_status", status: "working", detail: summary });
+        },
+      }),
+    };
+  }
+
+  private startExecutor(id: string, cwd: string, resume: string | null, autonomy: AutonomyMode, roomId: string | null) {
     const handle = this.executor.start(
-      { cwd, resumeSessionId: resume, autonomy },
+      { cwd, resumeSessionId: resume, autonomy, mcpServers: this.busToolServers(id, roomId) },
       {
         onEvent: (event) => {
           this.store.append(id, event);
@@ -287,6 +327,7 @@ interface SessionRow {
   cwd: string;
   claude_session_id: string | null;
   autonomy: string;
+  room_id: string | null;
 }
 
 /**

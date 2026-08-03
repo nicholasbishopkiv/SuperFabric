@@ -151,6 +151,10 @@ export class ClaudeCodeExecutor implements Executor {
     // It is set only for that mode, so nothing about the other two modes changes.
     if (permissionMode === "bypassPermissions") options.allowDangerouslySkipPermissions = true;
     if (opts.resumeSessionId) options.resume = opts.resumeSessionId;
+    // In-process MCP servers (the factory bus). `mcpServers` is the SDK's exact option name, and an
+    // `{ type: "sdk", instance }` entry is one variant of its config union — the tools run in this
+    // process, with no transport and no subprocess.
+    if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0) options.mcpServers = opts.mcpServers;
     if (this.defaults.model) options.model = this.defaults.model;
     if (this.defaults.appendSystemPrompt) {
       // There is no `appendSystemPrompt` option; appending lives inside the preset object form.

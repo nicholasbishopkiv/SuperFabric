@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { Options, Query, SDKAssistantMessage, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionEvent } from "@superfabric/shared";
 import { ClaudeCodeExecutor, sdkPermissionMode, type ClaudeCodeExecutorOptions, type QueryFn } from "../src/executors/claudeCode.js";
@@ -477,5 +478,34 @@ describe("ClaudeCodeExecutor", () => {
     expect(o.model).toBeUndefined();
     expect(o.systemPrompt).toBeUndefined();
     expect(o.env).toBeUndefined();
+    expect(o.mcpServers).toBeUndefined();
+  });
+
+  // ---- M3a: in-process MCP tool servers (the factory bus) ----
+
+  describe("mcpServers", () => {
+    it("threads a per-session in-process server into Options under the SDK's own field name", () => {
+      const fq = makeFakeQuery();
+      const server = createSdkMcpServer({
+        name: "factory",
+        tools: [tool("factory_ping", "test tool", {}, async () => ({ content: [{ type: "text", text: "pong" }] }))],
+      });
+      new ClaudeCodeExecutor({ query: fq.fn })
+        .start({ cwd: "/repo", mcpServers: { factory: server } }, { onEvent: () => {}, requestApproval: async () => "deny" });
+
+      const o = fq.options()!;
+      expect(o.mcpServers).toEqual({ factory: server });
+      // an in-process server carries a live instance, so it must be passed by reference
+      expect(o.mcpServers!.factory).toBe(server);
+      expect((o.mcpServers!.factory as { type?: string }).type).toBe("sdk");
+    });
+
+    it("omits mcpServers entirely for a session with no tool servers", () => {
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: fq.fn })
+        .start({ cwd: "/repo", mcpServers: {} }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      // an empty record would tell the CLI "this session has MCP servers"; a roomless session has none
+      expect(fq.options()!.mcpServers).toBeUndefined();
+    });
   });
 });
