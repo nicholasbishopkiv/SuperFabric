@@ -38,6 +38,127 @@ export function isoCameraTarget(rooms: readonly Pick<RoomInfo, "position">[]): [
   return [round(x), 0, round(z)];
 }
 
+// ---- framing the floor -------------------------------------------------------------------------
+//
+// The camera never rotates, so "where on screen does this world point land" is a fixed 3x2 matrix
+// that can be written down once and reasoned about without a renderer. Everything the framing needs
+// — how big the factory is in screen units, and which way to pan to centre it between the two HUD
+// panels — falls out of that matrix, which is why none of this needs three or a mounted canvas.
+
+/** Unit vectors of the camera's screen plane, in world space, derived from where the camera stands. */
+function isoBasis(): { right: [number, number, number]; up: [number, number, number] } {
+  const [px, py, pz] = ISO_CAMERA_POSITION;
+  const len = Math.hypot(px, py, pz);
+  // The camera looks at the origin, so forward is the negated (normalised) position.
+  const f: [number, number, number] = [-px / len, -py / len, -pz / len];
+  // right = normalise(forward x worldUp); worldUp is (0, 1, 0), which collapses the cross product.
+  const rLen = Math.hypot(-f[2], f[0]);
+  const right: [number, number, number] = [-f[2] / rLen, 0, f[0] / rLen];
+  // up = right x forward
+  const up: [number, number, number] = [
+    right[1] * f[2] - right[2] * f[1],
+    right[2] * f[0] - right[0] * f[2],
+    right[0] * f[1] - right[1] * f[0],
+  ];
+  return { right, up };
+}
+
+const ISO_BASIS = isoBasis();
+
+/**
+ * Where a world point lands on screen, in **world units** (multiply by `camera.zoom` for pixels),
+ * relative to whatever the camera is looking at. `+x` is right, `+y` is up.
+ */
+export function isoProject(x: number, y: number, z: number): [number, number] {
+  const { right, up } = ISO_BASIS;
+  return [
+    x * right[0] + y * right[1] + z * right[2],
+    x * up[0] + y * up[1] + z * up[2],
+  ];
+}
+
+/**
+ * The floor movement that shifts the view by `(dsx, dsy)` screen units — the inverse of
+ * `isoProject` restricted to the floor plane, so panning to recentre the factory never lifts the
+ * camera's target off the ground.
+ */
+export function isoFloorDelta(dsx: number, dsy: number): ScenePosition {
+  const { right, up } = ISO_BASIS;
+  const [a, b] = [right[0], right[2]];
+  const [c, d] = [up[0], up[2]];
+  const det = a * d - b * c;
+  return { x: round3((dsx * d - dsy * b) / det), z: round3((dsy * a - dsx * c) / det) };
+}
+
+/** Clear floor left around the factory when the view is fitted to it, in CSS pixels. */
+export const FIT_MARGIN_PX = 56;
+
+/** What the camera should look at and how far it should be zoomed out to show the whole factory. */
+export interface Framing {
+  zoom: number;
+  target: [number, number, number];
+}
+
+/**
+ * Frame the whole factory, allowing for the HUD.
+ *
+ * Two things make this more than "look at the centroid". First, the buildings have *extent*: a
+ * ring-14 workshop is 4 wide and carries a beacon and a label above its roof, so fitting the
+ * centres would still clip the thing the operator is trying to read. Second, the two overlay panels
+ * cover the left and right edges of the canvas — the canvas is full-bleed behind them — so the
+ * usable rectangle is neither the viewport nor centred on it, and a view centred on the canvas puts
+ * the factory half under the console drawer. Both are handled here: the screen-space bounding box of
+ * every building is fitted into the *unobstructed* rectangle, and the target is panned so the box's
+ * centre lands at that rectangle's centre rather than the canvas's.
+ *
+ * The zoom only ever pulls **back**: `ISO_ZOOM` is the designed reading distance, and a floor with
+ * one building on it should look like a factory with room to grow, not a close-up of a shed.
+ */
+export function isoFraming(
+  rooms: readonly Pick<RoomInfo, "position" | "kind">[],
+  viewWidth: number,
+  viewHeight: number,
+  leftInset = 0,
+  rightInset = 0,
+): Framing {
+  const target = isoCameraTarget(rooms);
+  if (rooms.length === 0) return { zoom: ISO_ZOOM, target };
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const room of rooms) {
+    const half = buildingSize(room.kind).width / 2;
+    // The footprint's four corners, at the floor and at the top of everything stacked on the roof.
+    for (const dx of [-half, half]) {
+      for (const dz of [-half, half]) {
+        for (const y of [0, labelHeight(room.kind)]) {
+          const [sx, sy] = isoProject(room.position.x + dx, y, room.position.z + dz);
+          if (sx < minX) minX = sx;
+          if (sx > maxX) maxX = sx;
+          if (sy < minY) minY = sy;
+          if (sy > maxY) maxY = sy;
+        }
+      }
+    }
+  }
+
+  const usableWidth = Math.max(1, viewWidth - leftInset - rightInset - 2 * FIT_MARGIN_PX);
+  const usableHeight = Math.max(1, viewHeight - 2 * FIT_MARGIN_PX);
+  const spanX = Math.max(maxX - minX, 0.001);
+  const spanY = Math.max(maxY - minY, 0.001);
+  const fitted = Math.min(usableWidth / spanX, usableHeight / spanY, ISO_ZOOM);
+  const zoom = Math.round(Math.max(ISO_ZOOM_MIN, Math.min(ISO_ZOOM_MAX, fitted)) * 1000) / 1000;
+
+  // Where the usable rectangle's centre sits relative to the canvas's, in screen units.
+  const offsetX = (leftInset - rightInset) / 2 / zoom;
+  const [cx, cy] = isoProject(target[0], 0, target[2]);
+  // Pan so the bounding box's centre lands on the usable rectangle's centre.
+  const pan = isoFloorDelta((minX + maxX) / 2 - cx - offsetX, (minY + maxY) / 2 - cy);
+  return { zoom, target: [round3(target[0] + pan.x), 0, round3(target[2] + pan.z)] };
+}
+
 /** Positions on the floor are kept to this many decimals, in the store and on the wire alike. */
 const round3 = (v: number) => Math.round(v * 1000) / 1000;
 

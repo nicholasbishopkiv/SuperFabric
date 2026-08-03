@@ -5,6 +5,7 @@ import { useFabric } from "../store";
 import { send, subscribe } from "../wsClient";
 import { AutonomySelect, BypassWarning } from "./AutonomySelect";
 import { HUD as C } from "./theme";
+import { useHudInset } from "./useHudInset";
 
 type ApprovalRequest = Extract<SessionEvent, { type: "approval_request" }>;
 
@@ -113,6 +114,9 @@ export function ConsoleDrawer() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [rows.length, pendingCount]);
 
+  // How much of the canvas this drawer covers, so the camera can frame the floor that is visible.
+  const inset = useHudInset<HTMLDivElement>("right");
+
   function answer(approvalId: string, behavior: "allow" | "deny"): void {
     if (active === null) return;
     send({ kind: "approval", sessionId: active, approvalId, behavior });
@@ -131,6 +135,7 @@ export function ConsoleDrawer() {
 
   return (
     <div
+      ref={inset}
       style={{
         position: "fixed",
         top: 0,

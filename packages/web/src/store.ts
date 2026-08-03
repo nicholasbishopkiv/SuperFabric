@@ -80,6 +80,20 @@ export interface FabricState {
   roomIds: string[];
   /** The building the operator clicked, shared by the scene and the room panel. */
   selectedRoomId: string | null;
+  /**
+   * How many CSS pixels of the canvas each HUD panel covers. The canvas is full-bleed *behind* the
+   * overlays, so without this the camera frames the factory in the middle of the viewport and the
+   * middle of the viewport is under the console drawer. The panels measure themselves and report it
+   * here (they know their own collapsed/expanded width; the scene must not go reading their DOM),
+   * and the camera framing subtracts it.
+   */
+  hudInsets: { left: number; right: number };
+  /**
+   * Bumped by the "fit" control. The camera frames the floor automatically only until the operator
+   * pans or zooms — after that the view is theirs — so there has to be one explicit way to ask for
+   * the framing back, and this is it.
+   */
+  fitRequests: number;
   /** The building under the pointer right now, or null. See `RoomDrag`. */
   drag: RoomDrag | null;
   /**
@@ -118,6 +132,10 @@ export interface FabricState {
   apply(msg: ServerMessage): void;
   setConnected(connected: boolean): void;
   selectRoom(roomId: string | null): void;
+  /** Report how wide one of the overlay panels is right now. A no-op when it has not changed. */
+  setHudInset(side: "left" | "right", px: number): void;
+  /** Ask the camera to frame the whole factory again. */
+  requestCameraFit(): void;
   /**
    * Forget the last server error. The overlay shows `lastError` next to whatever the operator was
    * doing when it arrived, so a rejected room name has to stop being shown once they try again —
@@ -149,6 +167,8 @@ export const initialFabricState = {
   rooms: [] as RoomInfo[],
   roomIds: [] as string[],
   selectedRoomId: null as string | null,
+  hudInsets: { left: 0, right: 0 } as { left: number; right: number },
+  fitRequests: 0,
   drag: null as RoomDrag | null,
   roomStatus: {} as Record<string, FactoryStatus>,
   conveyors: [] as Conveyor[],
@@ -361,6 +381,17 @@ export const useFabric = create<FabricState>((set, get) => ({
 
   selectRoom: (roomId) => set({ selectedRoomId: roomId }),
 
+  setHudInset: (side, px) =>
+    set((s) => {
+      // A ResizeObserver fires for sub-pixel changes and while a panel animates; rounding and
+      // comparing first is what keeps a panel resize from re-framing the camera dozens of times.
+      const next = Math.max(0, Math.round(px));
+      if (s.hudInsets[side] === next) return s;
+      return { hudInsets: { ...s.hudInsets, [side]: next } };
+    }),
+
+  requestCameraFit: () => set((s) => ({ fitRequests: s.fitRequests + 1 })),
+
   clearError: () => set((s) => (s.lastError === null ? s : { lastError: null })),
 
   beginRoomDrag: (roomId, position) => set({ drag: { roomId, position } }),
@@ -443,6 +474,9 @@ export const useRoomKind = (roomId: string): RoomInfo["kind"] | undefined =>
   useFabric((s) => s.rooms.find((r) => r.id === roomId)?.kind);
 
 export const useSelectedRoomId = (): string | null => useFabric((s) => s.selectedRoomId);
+
+export const useHudInsets = (): { left: number; right: number } =>
+  useFabric(useShallow((s) => s.hudInsets));
 
 /** Whether *any* building is being dragged. Subscribing to the boolean, not to the moving position. */
 export const useIsDragging = (): boolean => useFabric((s) => s.drag !== null);

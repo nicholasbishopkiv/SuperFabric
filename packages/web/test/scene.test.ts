@@ -11,6 +11,9 @@ import {
   ISO_ZOOM_MAX,
   ISO_ZOOM_MIN,
   isoCameraTarget,
+  isoFloorDelta,
+  isoFraming,
+  isoProject,
   labelHeight,
   ringPosition,
   roofTop,
@@ -99,6 +102,130 @@ describe("isoCameraTarget", () => {
 
   it("rounds to three decimals so a pan target never carries float noise", () => {
     expect(isoCameraTarget([at(1, 0), at(0, 0), at(0, 0)])).toEqual([0.333, 0, 0]);
+  });
+});
+
+describe("isoProject / isoFloorDelta", () => {
+  it("puts the origin at the middle of the view", () => {
+    expect(isoProject(0, 0, 0)).toEqual([0, 0]);
+  });
+
+  it("sends +x right and +z left, which is what makes the view read as isometric", () => {
+    expect(isoProject(1, 0, 0)[0]).toBeGreaterThan(0);
+    expect(isoProject(0, 0, 1)[0]).toBeLessThan(0);
+    // and equally so: the camera has equal x and z
+    expect(isoProject(1, 0, 0)[0]).toBeCloseTo(-isoProject(0, 0, 1)[0], 6);
+  });
+
+  it("sends height up the screen and distance down it", () => {
+    expect(isoProject(0, 1, 0)[1]).toBeGreaterThan(0);
+    expect(isoProject(1, 0, 1)[1]).toBeLessThan(0);
+  });
+
+  it("is a rigid projection: it never changes the scale of anything", () => {
+    // the diagonal towards the camera is the most foreshortened direction there is, and even it
+    // must not stretch
+    for (const p of [[1, 0, 0], [0, 0, 1], [1, 0, 1], [3, 2, -4]] as const) {
+      const [sx, sy] = isoProject(p[0], p[1], p[2]);
+      expect(Math.hypot(sx, sy)).toBeLessThanOrEqual(Math.hypot(p[0], p[1], p[2]) + 1e-9);
+    }
+  });
+
+  it("inverts itself on the floor plane, so a pan can be aimed in screen units", () => {
+    for (const [dsx, dsy] of [[1, 0], [0, 1], [-3.5, 2.25]] as const) {
+      const { x, z } = isoFloorDelta(dsx, dsy);
+      const [sx, sy] = isoProject(x, 0, z);
+      expect(sx).toBeCloseTo(dsx, 2);
+      expect(sy).toBeCloseTo(dsy, 2);
+    }
+  });
+});
+
+describe("isoFraming", () => {
+  const floor = (n: number) =>
+    [
+      { position: { x: 0, z: 0 }, kind: "project" as const },
+      ...Array.from({ length: n }, (_, i) => ({ position: ringPosition(i), kind: "room" as const })),
+    ];
+
+  /** Every corner of every building, in screen pixels relative to the canvas centre. */
+  const cornersPx = (rooms: ReturnType<typeof floor>, f: ReturnType<typeof isoFraming>) => {
+    const [cx, cy] = isoProject(f.target[0], 0, f.target[2]);
+    const out: [number, number][] = [];
+    for (const r of rooms) {
+      const half = buildingSize(r.kind).width / 2;
+      for (const dx of [-half, half]) {
+        for (const dz of [-half, half]) {
+          for (const y of [0, labelHeight(r.kind)]) {
+            const [sx, sy] = isoProject(r.position.x + dx, y, r.position.z + dz);
+            out.push([(sx - cx) * f.zoom, (sy - cy) * f.zoom]);
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  it("frames the origin at the designed zoom when the floor is empty", () => {
+    expect(isoFraming([], 1440, 900)).toEqual({ zoom: ISO_ZOOM, target: [0, 0, 0] });
+  });
+
+  it("never zooms in past the designed reading distance", () => {
+    // one small building could technically be fitted at zoom 90; a factory with room to grow is
+    // the truthful picture
+    expect(isoFraming(floor(0), 1440, 900).zoom).toBe(ISO_ZOOM);
+    expect(isoFraming(floor(1), 1440, 900).zoom).toBeLessThanOrEqual(ISO_ZOOM);
+  });
+
+  it("keeps every building inside the viewport, which the default framing did not", () => {
+    const rooms = floor(6);
+    const f = isoFraming(rooms, 1440, 900);
+    for (const [px, py] of cornersPx(rooms, f)) {
+      expect(Math.abs(px)).toBeLessThanOrEqual(1440 / 2);
+      expect(Math.abs(py)).toBeLessThanOrEqual(900 / 2);
+    }
+  });
+
+  it("keeps every building clear of the panels, not merely on the canvas", () => {
+    const rooms = floor(8);
+    const left = 320;
+    const right = 560;
+    const f = isoFraming(rooms, 1440, 900, left, right);
+    for (const [px, py] of cornersPx(rooms, f)) {
+      // canvas x of this corner, from a canvas-centre-relative offset
+      const x = 1440 / 2 + px;
+      expect(x).toBeGreaterThanOrEqual(left);
+      expect(x).toBeLessThanOrEqual(1440 - right);
+      expect(Math.abs(py)).toBeLessThanOrEqual(900 / 2);
+    }
+  });
+
+  it("pans towards the uncovered floor rather than centring on the canvas", () => {
+    const rooms = floor(6);
+    const centred = isoFraming(rooms, 1440, 900);
+    const withPanels = isoFraming(rooms, 1440, 900, 320, 560);
+    // the console drawer is the wider panel, so the visible strip — and the view — moves left
+    expect(isoProject(withPanels.target[0], 0, withPanels.target[2])[0])
+      .toBeGreaterThan(isoProject(centred.target[0], 0, centred.target[2])[0]);
+  });
+
+  it("zooms out as the factory grows and never past the clamp", () => {
+    const zooms = [1, 4, 8, 16, 24].map((n) => isoFraming(floor(n), 1440, 900, 320, 560).zoom);
+    for (let i = 1; i < zooms.length; i++) expect(zooms[i]).toBeLessThanOrEqual(zooms[i - 1]);
+    for (const z of zooms) {
+      expect(z).toBeGreaterThanOrEqual(ISO_ZOOM_MIN);
+      expect(z).toBeLessThanOrEqual(ISO_ZOOM_MAX);
+    }
+  });
+
+  it("survives panels that cover the whole viewport instead of dividing by zero", () => {
+    const f = isoFraming(floor(6), 600, 400, 400, 400);
+    expect(Number.isFinite(f.zoom)).toBe(true);
+    expect(f.zoom).toBeGreaterThanOrEqual(ISO_ZOOM_MIN);
+  });
+
+  it("keeps the target on the floor plane", () => {
+    expect(isoFraming(floor(5), 1440, 900, 320, 560).target[1]).toBe(0);
   });
 });
 

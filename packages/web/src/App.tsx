@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
+import { FitButton } from "./hud/FitButton";
 import { RoomPanel } from "./hud/RoomPanel";
 import { FactoryScene } from "./scene/FactoryScene";
 import { connect } from "./wsClient";
@@ -21,6 +22,8 @@ export default function App() {
       {/* Two overlays, two edges: rooms on the left, the one-agent console on the right. */}
       <RoomPanel />
       <ConsoleDrawer />
+      {/* Last, so it paints over the panel's own corner. */}
+      <FitButton />
     </>
   );
 }

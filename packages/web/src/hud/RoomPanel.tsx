@@ -18,6 +18,7 @@ import {
 import { send } from "../wsClient";
 import { AutonomySelect } from "./AutonomySelect";
 import { HUD } from "./theme";
+import { useHudInset } from "./useHudInset";
 
 /**
  * The room panel: the first surface from which a person can actually build a factory. Until now a
@@ -215,6 +216,8 @@ export function RoomPanel() {
   const selectRoom = useFabric((s) => s.selectRoom);
   /** The name we are waiting for the server to confirm, so the new room can be selected on arrival. */
   const pending = useRef<string | null>(null);
+  // How much of the canvas this panel covers, so the camera can frame the floor that is visible.
+  const inset = useHudInset<HTMLElement>("left");
 
   // Select a room the operator just created the moment the broadcast introduces it: they asked for
   // it, so it is what they want to look at — and the detail section is where "New agent here" is.
@@ -241,6 +244,7 @@ export function RoomPanel() {
 
   return (
     <aside
+      ref={inset}
       style={{
         position: "fixed",
         top: 0,

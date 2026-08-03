@@ -3,6 +3,7 @@ import { Canvas, useThree } from "@react-three/fiber";
 import { useEffect } from "react";
 import { useFabric, useHasMotion } from "../store";
 import { Buildings } from "./Buildings";
+import { CameraFraming } from "./CameraFraming";
 import { Conveyors } from "./Conveyor";
 import { Floor } from "./Floor";
 import { Packages } from "./Packages";
@@ -60,8 +61,10 @@ export function FactoryScene() {
         minZoom={ISO_ZOOM_MIN}
         maxZoom={ISO_ZOOM_MAX}
       />
-      {/* After MapControls, so `makeDefault` has already registered the controls it has to silence. */}
+      {/* After MapControls, so `makeDefault` has already registered the controls both of these
+          need: the drag has to silence them, and the framing has to notice the operator using them. */}
       <RoomDrag />
+      <CameraFraming />
       <RedrawOnStoreChange />
     </Canvas>
   );
