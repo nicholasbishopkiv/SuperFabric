@@ -35,6 +35,11 @@ const MIGRATIONS: readonly string[] = [
       PRIMARY KEY (session_id, seq)
     );
   `,
+  // 2 — per-agent autonomy (attended | auto | bypass). Existing rows inherit the product
+  // default, so a database written before this column behaves exactly as it did.
+  `
+    ALTER TABLE sessions ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'auto';
+  `,
 ];
 
 /** Schema version a freshly opened database is brought up to. */

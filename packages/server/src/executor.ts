@@ -1,4 +1,4 @@
-import type { SessionEvent } from "@superfabric/shared";
+import type { AutonomyMode, SessionEvent } from "@superfabric/shared";
 
 export interface ExecutorEvents {
   onEvent: (event: SessionEvent) => void;
@@ -6,10 +6,17 @@ export interface ExecutorEvents {
   requestApproval: (toolName: string, input: unknown) => Promise<"allow" | "deny">;
 }
 
+/**
+ * Per-session configuration. Anything that varies between agents belongs here rather than on the
+ * executor's constructor, so one executor instance can serve every session: the constructor only
+ * carries process-wide defaults. (Multi-account `configDir` moves here the same way in M2.)
+ */
 export interface ExecutorStartOptions {
   cwd: string;
   /** Provider-native session id to resume, if any. */
   resumeSessionId?: string | null;
+  /** How much this agent is allowed to do unattended. Omitted => the executor's own default. */
+  autonomy?: AutonomyMode;
 }
 
 export interface ExecutorHandle {

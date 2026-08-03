@@ -1,7 +1,24 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { Options, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { SessionEvent } from "@superfabric/shared";
+import type { AutonomyMode, SessionEvent } from "@superfabric/shared";
 import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../executor.js";
+
+type SdkPermissionMode = NonNullable<Options["permissionMode"]>;
+
+/**
+ * The single place our `AutonomyMode` vocabulary meets the SDK's `permissionMode` strings. The
+ * protocol deliberately does not speak SDK — if the SDK renames a mode or adds a seventh, only
+ * this table changes.
+ */
+const SDK_PERMISSION_MODE: Record<AutonomyMode, SdkPermissionMode> = {
+  attended: "default",        // canUseTool is consulted for every gated call → approval card
+  auto: "auto",               // the CLI's classifier decides; cards become rare, not impossible
+  bypass: "bypassPermissions", // nothing is gated at all
+};
+
+export function sdkPermissionMode(autonomy: AutonomyMode): SdkPermissionMode {
+  return SDK_PERMISSION_MODE[autonomy];
+}
 
 /**
  * Coarse classification of executor failures. Rate limits are the one class the runner has to
@@ -23,11 +40,11 @@ export interface ClaudeCodeExecutorOptions {
   /** Appended to the claude_code system-prompt preset. */
   appendSystemPrompt?: string;
   /**
-   * Permission mode for this session. Defaults to "default" (every gated tool call goes
-   * through canUseTool → an operator approval card). Rooms running autonomously pass
-   * "bypassPermissions" — only meaningful once sessions are sandboxed.
+   * Fallback SDK permission mode for sessions started without an explicit
+   * `ExecutorStartOptions.autonomy`. Defaults to "auto" (the product default). Per-agent
+   * autonomy is the normal lever; this is only a process-wide default.
    */
-  permissionMode?: NonNullable<Options["permissionMode"]>;
+  permissionMode?: SdkPermissionMode;
   /** Test seam: defaults to the SDK's query(). */
   query?: QueryFn;
 }
@@ -97,20 +114,29 @@ export class ClaudeCodeExecutor implements Executor {
 
     ev.onEvent({ type: "session_status", status: "starting" });
 
+    // Per-session autonomy wins; then the process-wide default; then the product default.
+    const permissionMode: SdkPermissionMode = opts.autonomy !== undefined
+      ? sdkPermissionMode(opts.autonomy)
+      : this.defaults.permissionMode ?? "auto";
+
     const options: Options = {
       cwd: opts.cwd,
       abortController: abort,
       // SuperFabric owns an agent's configuration; it does not inherit the operator's personal
       // Claude Code setup. Being explicit matters for both fields:
-      //   permissionMode — a user-level `defaultMode: "bypassPermissions"` would otherwise
-      //     disable gating entirely and the approval cards would never fire. (Note "auto" still
-      //     gates genuinely dangerous calls, and the CLI auto-allows safe commands like `echo`
-      //     in every mode — canUseTool is consulted only for calls the CLI would ask about.)
+      //   permissionMode — the product default is "auto" (the CLI's classifier decides, so an
+      //     approval card is the exception rather than the rule). It is still set explicitly on
+      //     every session so the operator's own `defaultMode` can never leak in and silently
+      //     change what a factory agent is allowed to do. `attended` ("default") keeps the
+      //     approval card on every gated call; `bypass` ("bypassPermissions") gates nothing at
+      //     all and is an explicit per-agent opt-in — only safe once sessions are sandboxed (M4).
+      //     Note the CLI auto-allows safe commands like `echo` in every mode, so canUseTool is
+      //     consulted only for calls the CLI would ask about anyway.
       //   settingSources — dropping "user" keeps the operator's global hooks, model default and
       //     permission rules out of factory agents, so a room behaves the same on any machine.
       //     "project"/"local" stay because a room's own CLAUDE.md, skills and agents live in its
       //     folder and are meant to apply.
-      permissionMode: this.defaults.permissionMode ?? "default",
+      permissionMode,
       settingSources: ["project", "local"],
       canUseTool: async (toolName, input): Promise<PermissionResult> => {
         const behavior = await ev.requestApproval(toolName, input);
@@ -120,6 +146,10 @@ export class ClaudeCodeExecutor implements Executor {
           : { behavior: "deny", message: "Denied by the SuperFabric operator." };
       },
     };
+    // The SDK requires this alongside "bypassPermissions" ("a safety measure to ensure
+    // intentional bypassing"); it turns into the CLI's --allow-dangerously-skip-permissions.
+    // It is set only for that mode, so nothing about the other two modes changes.
+    if (permissionMode === "bypassPermissions") options.allowDangerouslySkipPermissions = true;
     if (opts.resumeSessionId) options.resume = opts.resumeSessionId;
     if (this.defaults.model) options.model = this.defaults.model;
     if (this.defaults.appendSystemPrompt) {

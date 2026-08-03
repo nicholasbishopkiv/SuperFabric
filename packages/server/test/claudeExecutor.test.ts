@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { Options, Query, SDKAssistantMessage, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionEvent } from "@superfabric/shared";
-import { ClaudeCodeExecutor, type ClaudeCodeExecutorOptions, type QueryFn } from "../src/executors/claudeCode.js";
+import { ClaudeCodeExecutor, sdkPermissionMode, type ClaudeCodeExecutorOptions, type QueryFn } from "../src/executors/claudeCode.js";
 
 // ---------------------------------------------------------------------------
 // scripted SDKMessage builders
@@ -407,8 +407,9 @@ describe("ClaudeCodeExecutor", () => {
     const exec = new ClaudeCodeExecutor({ query: fq.fn });
     exec.start({ cwd: "/repo" }, { onEvent: () => {}, requestApproval: async () => "deny" });
     const o = fq.options()!;
-    // Explicit mode: a user-level "bypassPermissions" default would otherwise silence approvals.
-    expect(o.permissionMode).toBe("default");
+    // Explicit mode, always: a user-level defaultMode must never decide what an agent may do.
+    // With no autonomy and no constructor default, that is the product default, "auto".
+    expect(o.permissionMode).toBe("auto");
     // "user" excluded so the operator's personal hooks/model/permission rules stay out of
     // factory agents; project/local stay because a room's own config lives in its folder.
     expect(o.settingSources).toEqual(["project", "local"]);
@@ -419,6 +420,52 @@ describe("ClaudeCodeExecutor", () => {
     const exec = new ClaudeCodeExecutor({ permissionMode: "bypassPermissions", query: fq.fn });
     exec.start({ cwd: "/repo" }, { onEvent: () => {}, requestApproval: async () => "deny" });
     expect(fq.options()!.permissionMode).toBe("bypassPermissions");
+  });
+
+  // ---- per-session autonomy (ExecutorStartOptions.autonomy) ----
+
+  describe("autonomy", () => {
+    it("maps every mode to its SDK permission mode", () => {
+      expect(sdkPermissionMode("attended")).toBe("default");
+      expect(sdkPermissionMode("auto")).toBe("auto");
+      expect(sdkPermissionMode("bypass")).toBe("bypassPermissions");
+    });
+
+    for (const [autonomy, permissionMode] of [
+      ["attended", "default"],
+      ["auto", "auto"],
+      ["bypass", "bypassPermissions"],
+    ] as const) {
+      it(`passes autonomy "${autonomy}" to the SDK as "${permissionMode}"`, () => {
+        const fq = makeFakeQuery();
+        const exec = new ClaudeCodeExecutor({ query: fq.fn });
+        exec.start({ cwd: "/repo", autonomy }, { onEvent: () => {}, requestApproval: async () => "deny" });
+        expect(fq.options()!.permissionMode).toBe(permissionMode);
+        // canUseTool stays wired in every mode: the attended mode needs it, and in the other two
+        // a classifier-escalated call must still be able to reach the operator.
+        expect(typeof fq.options()!.canUseTool).toBe("function");
+      });
+    }
+
+    it("per-session autonomy wins over the constructor default", () => {
+      const fq = makeFakeQuery();
+      const exec = new ClaudeCodeExecutor({ permissionMode: "bypassPermissions", query: fq.fn });
+      exec.start({ cwd: "/repo", autonomy: "attended" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      expect(fq.options()!.permissionMode).toBe("default");
+    });
+
+    it("sets allowDangerouslySkipPermissions only for bypass", () => {
+      const gated = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: gated.fn })
+        .start({ cwd: "/repo", autonomy: "auto" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      expect(gated.options()!.allowDangerouslySkipPermissions).toBeUndefined();
+
+      const bypass = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: bypass.fn })
+        .start({ cwd: "/repo", autonomy: "bypass" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      // The SDK requires this flag alongside "bypassPermissions".
+      expect(bypass.options()!.allowDangerouslySkipPermissions).toBe(true);
+    });
   });
 
   it("omits optional Options when no defaults are given", () => {

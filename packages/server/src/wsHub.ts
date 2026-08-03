@@ -53,11 +53,20 @@ export class WsHub {
           });
           break;
         case "create_session": {
-          const id = this.mgr.createSession(msg.cwd ?? process.cwd());
+          // `autonomy` omitted => SessionManager applies the product default ("auto").
+          const id = this.mgr.createSession(msg.cwd ?? process.cwd(), msg.autonomy);
           this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions() });
           this.subscribe(sock, id, 0); // auto-subscribe the creator from seq 0
           break;
         }
+        case "set_autonomy":
+          // Restarting the executor is async, so the outcome is reported from the promise — an
+          // unhandled rejection would exit the process on Node 22.
+          void this.mgr.setAutonomy(msg.sessionId, msg.autonomy).then(
+            () => { this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions() }); },
+            (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
+          );
+          break;
         case "list_sessions": this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions() }); break;
       }
     } catch (err) {

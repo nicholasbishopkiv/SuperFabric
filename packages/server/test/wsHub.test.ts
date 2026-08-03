@@ -125,6 +125,48 @@ describe("WsHub", () => {
     });
   });
 
+  // ---- per-agent autonomy over the wire ----
+
+  describe("set_autonomy", () => {
+    it("creates a session in the requested mode and reports it back", () => {
+      const { hub, sock, sent } = makeHub();
+      hub.handleMessage(sock, JSON.stringify({ kind: "create_session", cwd: "/tmp", autonomy: "bypass" }));
+      const sessions = sent.find(m => m.kind === "sessions").sessions;
+      expect(sessions[0].autonomy).toBe("bypass");
+    });
+
+    it("switches a live session and replies with an updated sessions message", async () => {
+      const { hub, mgr, sock, sent } = makeHub();
+      const id = mgr.createSession("/tmp", "auto");
+      hub.handleMessage(sock, JSON.stringify({ kind: "set_autonomy", sessionId: id, autonomy: "attended" }));
+      await vi.waitFor(() => {
+        const last = sent.filter(m => m.kind === "sessions").at(-1);
+        if (last === undefined) throw new Error("no sessions reply yet");
+        if (last.sessions.find((s: any) => s.id === id).autonomy !== "attended") throw new Error("not yet");
+      });
+      expect(sent.some(m => m.kind === "error")).toBe(false);
+      expect(mgr.listSessions()[0].autonomy).toBe("attended");
+    });
+
+    it("replies error for an unknown session without throwing", async () => {
+      const { hub, sock, sent } = makeHub();
+      expect(() => hub.handleMessage(sock, JSON.stringify({ kind: "set_autonomy", sessionId: "nope", autonomy: "bypass" })))
+        .not.toThrow();
+      await vi.waitFor(() => {
+        if (!sent.some(m => m.kind === "error" && /unknown session/.test(m.message))) throw new Error("not yet");
+      });
+      expect(sent.some(m => m.kind === "sessions")).toBe(false);
+    });
+
+    it("rejects an autonomy value outside the protocol enum", () => {
+      const { hub, mgr, sock, sent } = makeHub();
+      const id = mgr.createSession("/tmp", "auto");
+      hub.handleMessage(sock, JSON.stringify({ kind: "set_autonomy", sessionId: id, autonomy: "bypassPermissions" }));
+      expect(sent.some(m => m.kind === "error" && m.message === "bad message")).toBe(true);
+      expect(mgr.listSessions()[0].autonomy).toBe("auto");
+    });
+  });
+
   // ---- I9: a detached socket must not resurrect itself ----
 
   it("ignores messages from a socket that was already detached", async () => {

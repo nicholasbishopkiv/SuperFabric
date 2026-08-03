@@ -227,6 +227,142 @@ describe("SessionManager", () => {
     expect(exec2.starts[0].cwd).toBe(cwd);
   });
 
+  // ---- per-agent autonomy: persisted, passed to the executor, survives resume ----
+
+  describe("autonomy", () => {
+    /** Records every start() so a test can assert the mode the executor was handed. */
+    class RecordingExecutor implements Executor {
+      readonly name = "recording";
+      readonly starts: ExecutorStartOptions[] = [];
+      readonly stops: number[] = [];
+      constructor(private readonly providerId = "claude-session-auto") {}
+      start(opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
+        this.starts.push(opts);
+        ev.onEvent({ type: "session_status", status: "idle" });
+        return {
+          providerSessionId: Promise.resolve(this.providerId),
+          send: () => {},
+          interrupt: async () => {},
+          stop: async () => { this.stops.push(Date.now()); },
+        };
+      }
+    }
+
+    const setup = (db = openDb(":memory:")) => {
+      const store = new EventStore(db);
+      const exec = new RecordingExecutor();
+      return { db, store, exec, mgr: new SessionManager(db, store, exec) };
+    };
+
+    const stored = (db: ReturnType<typeof openDb>, id: string) =>
+      (db.prepare("SELECT autonomy FROM sessions WHERE id = ?").get(id) as { autonomy: string }).autonomy;
+
+    it("defaults a new session to auto and passes it to the executor", () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession("/tmp");
+      expect(stored(db, id)).toBe("auto");
+      expect(exec.starts[0].autonomy).toBe("auto");
+      expect(mgr.listSessions()[0].autonomy).toBe("auto");
+    });
+
+    it("createSession with bypass persists it and hands it to the executor", () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession("/tmp", "bypass");
+      expect(stored(db, id)).toBe("bypass");
+      expect(exec.starts).toHaveLength(1);
+      expect(exec.starts[0].autonomy).toBe("bypass");
+      expect(mgr.listSessions()[0].autonomy).toBe("bypass");
+    });
+
+    it("setAutonomy persists, restarts the live executor with the new mode, and logs it", async () => {
+      const { db, store, exec, mgr } = setup();
+      const id = mgr.createSession("/tmp", "auto");
+      // the provider session id lands asynchronously; the restart must resume from it
+      await vi.waitFor(() => {
+        const row = db.prepare("SELECT claude_session_id c FROM sessions WHERE id = ?").get(id) as { c: string | null };
+        if (row.c === null) throw new Error("not persisted yet");
+      });
+
+      await mgr.setAutonomy(id, "bypass");
+
+      expect(stored(db, id)).toBe("bypass");
+      expect(mgr.listSessions().find(s => s.id === id)!.autonomy).toBe("bypass");
+      // the old executor was stopped and a new one started under the new mode, resuming the
+      // provider session so the conversation is preserved
+      expect(exec.stops).toHaveLength(1);
+      expect(exec.starts).toHaveLength(2);
+      expect(exec.starts[1].autonomy).toBe("bypass");
+      expect(exec.starts[1].resumeSessionId).toBe("claude-session-auto");
+      // the change is visible in the transcript, and the log records it
+      const detail = store.listAfter(id, 0)
+        .map(e => e.event)
+        .filter(e => e.type === "session_status")
+        .map(e => (e as { detail?: string }).detail)
+        .find(d => d !== undefined && d.includes("bypass"));
+      expect(detail).toContain("autonomy: bypass");
+      // prompting still works against the freshly started executor
+      expect(() => mgr.prompt(id, "still here")).not.toThrow();
+    });
+
+    it("persists without restarting when the session is not live", async () => {
+      const { db, store, exec, mgr } = setup();
+      const id = mgr.createSession("/tmp", "auto");
+      await mgr.stopAll();
+      const startsBefore = exec.starts.length;
+
+      await mgr.setAutonomy(id, "attended");
+
+      expect(stored(db, id)).toBe("attended");
+      expect(exec.starts).toHaveLength(startsBefore);
+      const statuses = store.listAfter(id, 0).map(e => e.event).filter(e => e.type === "session_status");
+      expect((statuses.at(-1) as { detail?: string }).detail).toContain("autonomy: attended");
+    });
+
+    it("does not spawn a replacement executor when shutdown starts mid-toggle", async () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession("/tmp", "auto");
+      // the toggle suspends while stopping the old executor; shutdown begins in the meantime
+      const toggling = mgr.setAutonomy(id, "bypass");
+      await mgr.stopAll();
+      await toggling;
+      // nothing was restarted, but the mode is stored for the next boot
+      expect(exec.starts).toHaveLength(1);
+      expect(stored(db, id)).toBe("bypass");
+    });
+
+    it("rejects an unknown session instead of persisting anything", async () => {
+      const { db, mgr } = setup();
+      await expect(mgr.setAutonomy("nope", "bypass")).rejects.toThrow(/unknown session/);
+      expect((db.prepare("SELECT COUNT(*) c FROM sessions").get() as { c: number }).c).toBe(0);
+    });
+
+    it("resumeAll restarts a session with its stored mode, so bypass stays bypass", async () => {
+      const db = openDb(":memory:");
+      const { store, mgr } = setup(db);
+      const id = mgr.createSession("/tmp", "bypass");
+      await mgr.stopAll();
+
+      // a second manager over the same db simulates a server restart
+      const exec2 = new RecordingExecutor();
+      const mgr2 = new SessionManager(db, store, exec2);
+      expect(mgr2.resumeAll()).toEqual([id]);
+      expect(exec2.starts[0].autonomy).toBe("bypass");
+      expect(mgr2.listSessions().find(s => s.id === id)!.autonomy).toBe("bypass");
+    });
+
+    it("falls back to auto for an unparseable stored mode", () => {
+      const db = openDb(":memory:");
+      const { store, mgr } = setup(db);
+      const id = mgr.createSession("/tmp", "bypass");
+      db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?").run("nonsense", id);
+      expect(mgr.listSessions()[0].autonomy).toBe("auto");
+      const exec2 = new RecordingExecutor();
+      const mgr2 = new SessionManager(db, store, exec2);
+      mgr2.resumeAll();
+      expect(exec2.starts[0].autonomy).toBe("auto");
+    });
+  });
+
   describe("stopAll", () => {
     it("stops every live executor; prompt() on a stopped session then throws", async () => {
       const { mgr } = make();

@@ -80,7 +80,39 @@ describe("db", () => {
       expect(db.prepare("SELECT cwd FROM sessions WHERE id = 'legacy'").get()).toEqual({ cwd: "/legacy/cwd" });
       expect((db.prepare("SELECT payload FROM events WHERE session_id='legacy' AND seq=1").get() as { payload: string }).payload)
         .toContain("from before");
+      // migration 2: the pre-existing row inherits the product default instead of a NULL
+      expect(db.prepare("SELECT autonomy FROM sessions WHERE id = 'legacy'").get()).toEqual({ autonomy: "auto" });
       db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ---- migration 2: per-agent autonomy ----
+
+  it("adds sessions.autonomy defaulting to 'auto'", () => {
+    const db = openDb(":memory:");
+    const cols = db.prepare("SELECT name, \"notnull\", dflt_value FROM pragma_table_info('sessions')")
+      .all() as { name: string; notnull: number; dflt_value: string | null }[];
+    const autonomy = cols.find(c => c.name === "autonomy");
+    expect(autonomy).toBeDefined();
+    expect(autonomy!.notnull).toBe(1);
+    expect(autonomy!.dflt_value).toBe("'auto'");
+    // an insert that says nothing about autonomy lands on the default
+    db.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("s1", "/tmp");
+    expect(db.prepare("SELECT autonomy FROM sessions WHERE id = 's1'").get()).toEqual({ autonomy: "auto" });
+  });
+
+  it("preserves an explicitly stored autonomy across a reopen", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-autonomy-"));
+    try {
+      const path = join(dir, "test.db");
+      const first = openDb(path);
+      first.prepare("INSERT INTO sessions (id, cwd, autonomy) VALUES (?, ?, ?)").run("s1", "/tmp", "bypass");
+      first.close();
+      const second = openDb(path);
+      expect(second.prepare("SELECT autonomy FROM sessions WHERE id = 's1'").get()).toEqual({ autonomy: "bypass" });
+      second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
