@@ -32,6 +32,10 @@ export function connect(): void {
     reconnectDelayMs = RECONNECT_MIN_MS;
     useFabric.getState().setConnected(true);
     send({ kind: "list_sessions" });
+    // The floor is rebuilt from the server on every connect: rooms and sessions carry everything a
+    // building needs to draw itself (position, kind, live status), so a reload never shows a blank
+    // factory waiting for the first event to arrive.
+    send({ kind: "list_rooms" });
     // The server hard-terminates sockets on shutdown, so a reconnect must re-ask for the tail of
     // every session we were following — from the last contiguous seq we hold, not from 0.
     const { contiguousSeq } = useFabric.getState();

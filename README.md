@@ -51,8 +51,11 @@ pnpm -F @superfabric/server dev   # 127.0.0.1:4620
 pnpm -F @superfabric/web dev      # open the printed Vite URL
 ```
 
-Requires Node 22+, pnpm 9+, and a working `claude` login (M0 uses your current
-`~/.claude` account; multi-account arrives in M2). See [docs/ROADMAP.md](docs/ROADMAP.md).
+Requires Node 22+, [pnpm](https://pnpm.io) 9+, [Bun](https://bun.sh) 1.3+ (the server runs
+and tests on Bun; installs and the web toolchain stay on Node/pnpm), and a working `claude`
+login (M0 uses your current `~/.claude` account; multi-account arrives in M2). See
+[docs/ROADMAP.md](docs/ROADMAP.md) and
+[docs/decisions/0001-bun-runtime-keep-vite.md](docs/decisions/0001-bun-runtime-keep-vite.md).
 
 ## Security
 
@@ -91,7 +94,8 @@ Russian originals: [VISION.ru.md](docs/VISION.ru.md) · [ROADMAP.ru.md](docs/ROA
 
 ## Planned stack
 
-TypeScript · Node 22+ · pnpm workspaces · Fastify + WebSocket · better-sqlite3 · zod ·
+TypeScript · pnpm workspaces · Bun (server runtime, test runner and `bun:sqlite`) · Node 22+
+(web toolchain) · Fastify + WebSocket · zod ·
 [`@anthropic-ai/claude-agent-sdk`](https://code.claude.com/docs/en/agent-sdk/overview) ·
 React 19 + Vite · react-three-fiber + drei (Three.js) · zustand · dockerode.
 

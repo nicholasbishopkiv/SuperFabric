@@ -1,0 +1,84 @@
+import { MapControls } from "@react-three/drei";
+import { Canvas, useThree } from "@react-three/fiber";
+import { useEffect } from "react";
+import { useFabric, useHasMotion } from "../store";
+import { Buildings } from "./Buildings";
+import { CameraFraming } from "./CameraFraming";
+import { Conveyors } from "./Conveyor";
+import { Floor } from "./Floor";
+import { FactoryLights } from "./lighting";
+import { Packages } from "./Packages";
+import { RoomDrag } from "./RoomDrag";
+import { ISO_CAMERA_POSITION, ISO_ZOOM, ISO_ZOOM_MAX, ISO_ZOOM_MIN } from "./layout";
+import { LIGHT } from "./palette";
+
+/**
+ * The factory floor as an isometric plan view: an orthographic camera on the [24, 20, 24] diagonal
+ * looking at the origin, with pan and zoom but deliberately no rotation — the operator reads a floor
+ * plan, they do not fly a camera.
+ *
+ * The frameloop contract: `"demand"` while nothing moves, `"always"` only while `hasMotion` is true.
+ * An idle factory must not burn a GPU, and a working one must animate; those are the only two states.
+ */
+export function FactoryScene() {
+  const hasMotion = useHasMotion();
+  const selectRoom = useFabric((s) => s.selectRoom);
+
+  return (
+    <Canvas
+      // "variance" is a VSM shadow map: blurred in the map, so the edges spread with distance from
+      // the caster. See `lighting.tsx` for why this is not drei's <SoftShadows>.
+      shadows="variance"
+      frameloop={hasMotion ? "always" : "demand"}
+      // A press that hit no building is a press on the floor, and that deselects. Buildings
+      // `stopPropagation` on pointer-down, so this never fires for one of them.
+      onPointerMissed={() => selectRoom(null)}
+      orthographic
+      // near is negative on purpose: an orthographic camera looking down a diagonal would otherwise
+      // clip the geometry standing between it and the origin.
+      camera={{ position: [...ISO_CAMERA_POSITION], zoom: ISO_ZOOM, near: -200, far: 600 }}
+      onCreated={({ camera }) => camera.lookAt(0, 0, 0)}
+      style={{ position: "fixed", inset: 0, background: LIGHT.backdrop }}
+    >
+      <FactoryLights />
+      <Floor />
+      <Conveyors />
+      <Buildings />
+      <Packages />
+      <MapControls
+        makeDefault
+        enableRotate={false}
+        minZoom={ISO_ZOOM_MIN}
+        maxZoom={ISO_ZOOM_MAX}
+      />
+      {/* After MapControls, so `makeDefault` has already registered the controls both of these
+          need: the drag has to silence them, and the framing has to notice the operator using them. */}
+      <RoomDrag />
+      <CameraFraming />
+      <RedrawOnStoreChange />
+    </Canvas>
+  );
+}
+
+/**
+ * `frameloop="demand"` renders only when something asks it to. React state changes that alter the
+ * scene do ask (r3f invalidates on commit), but drei's `<Html>` positions and the occlusion test are
+ * updated inside the render loop — so an explicit `invalidate()` after a store change is what stops a
+ * new building's label from appearing one interaction late.
+ */
+function RedrawOnStoreChange() {
+  const invalidate = useThree((s) => s.invalidate);
+  const rooms = useFabric((s) => s.rooms);
+  const sessions = useFabric((s) => s.sessions);
+  const selectedRoomId = useFabric((s) => s.selectedRoomId);
+  // `packages` matters in both directions: one frame to draw a new box at the start of its belt, and
+  // one more after the last one is reaped to erase it — by then `hasMotion` is false again and the
+  // loop is back on demand, so that final frame has to be asked for.
+  const packages = useFabric((s) => s.packages);
+
+  useEffect(() => {
+    invalidate();
+  }, [invalidate, rooms, sessions, selectedRoomId, packages]);
+
+  return null;
+}

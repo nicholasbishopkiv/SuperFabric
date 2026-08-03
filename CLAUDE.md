@@ -49,9 +49,17 @@ mode is fixed per `query()`, so the session's executor is restarted, resuming fr
 
 ## Stack
 
-pnpm workspaces · TypeScript · Node 22+ · Fastify + ws · better-sqlite3 (WAL) ·
-`@anthropic-ai/claude-agent-sdk` · zod 4 · React 19 + Vite · react-three-fiber + drei ·
-zustand · dockerode (M4).
+pnpm workspaces (installs are always `pnpm`) · TypeScript · **Bun 1.3+ runs, tests and
+stores for the server** (`bun src/index.ts`, `bun test`, `bun:sqlite` in WAL) · Fastify + ws ·
+`@anthropic-ai/claude-agent-sdk` · zod 4 · **React 19 + Vite + vitest for the web** ·
+react-three-fiber + drei · zustand · dockerode (M4). Node 22+ is still required — the web
+toolchain and pnpm run on it.
+
+Why two runtimes: `docs/decisions/0001-bun-runtime-keep-vite.md`. In short, Bun deletes the
+native-module build step (`better-sqlite3`) and the `tsx`/`tsc && node dist` workarounds, while
+Vite/vitest stay because vitest is Vite-native and the web bundle is small. Do not switch
+installs to `bun install`, and do not introduce a second test runner inside a package: the
+server package is `bun test`, `packages/shared` and `packages/web` are vitest.
 
 **Dependency license policy**: third-party libraries must be MIT/Apache-2.0/BSD/ISC —
 no copyleft (GPL/AGPL/SSPL). One deliberate exception: Anthropic's own
@@ -75,25 +83,48 @@ block, rooms, roles library v1**.
 ## Running it
 
 ```bash
-pnpm install
-pnpm -F @superfabric/server dev   # Fastify + ws on 127.0.0.1:4620 (tsx watch)
+pnpm install                      # pnpm, not bun install
+pnpm -F @superfabric/server dev   # Fastify + ws on 127.0.0.1:4620 (bun --watch, no build step)
 pnpm -F @superfabric/web dev      # Vite dev server, proxies /ws to the server
-pnpm test                         # whole workspace
+pnpm test                         # whole workspace (bun test for the server, vitest for the rest)
+pnpm build                        # tsc everywhere + the web bundle; type-checks the server
 SUPERFABRIC_LIVE_TEST=1 pnpm -F @superfabric/server test claudeExecutor.live  # real quota
 ```
 
+`bun test` does not type-check, so `pnpm -F @superfabric/server build` (plain `tsc`) is what
+catches type errors in the server — run it, not just the tests.
+
 Server state lives in `.fabrica/fabrica.db` (override the directory with
 `SUPERFABRIC_DATA`); port via `PORT`.
+
+### Bun gotchas worth knowing before you write server code
+
+- **A missing row is `null`, not `undefined`.** `bun:sqlite`'s `stmt.get()` returns `null`
+  when nothing matched (`better-sqlite3` returned `undefined`). Test row presence with
+  `== null` / `!= null`, and type the cast `as Row | null`. Public helpers that return "not
+  found" (e.g. `RoomManager.getRoom`) keep speaking `undefined`, so only the code touching a
+  statement directly has to care.
+- **There is no `db.pragma()`.** Read with `db.query("PRAGMA user_version").get()` (a one-row
+  result object), write with `db.exec("PRAGMA journal_mode = WAL")`.
+- **`bun:test`'s `vi` shim has no `vi.waitFor`** — use `test/_waitFor.ts`.
+- **Bun's `ws` compatibility shim drops the client `origin` option** and never emits
+  `unexpected-response`. Anything that must send an `Origin` uses Bun's native `WebSocket`
+  with `{ headers: { Origin } }`, and anything that must see the handshake's HTTP status
+  writes the upgrade request by hand (see `test/wsOrigin.test.ts`).
 
 ## Layout
 
 - `packages/shared` — zod protocol shared by server and web (`SessionEvent`,
   `ClientMessage`, `ServerMessage`).
-- `packages/server` — `db.ts` (schema + `PRAGMA user_version` migrations) · `origin.ts` (WebSocket
+- `packages/server` — `db.ts` (schema + `PRAGMA user_version` migrations; **the only file that
+  names the SQLite driver** — everything else takes its `Db` type, so a driver swap stays a
+  one-file change) · `origin.ts` (WebSocket
   origin allow-list) · `eventStore.ts` (append-only log + subscriptions)
   · `executor.ts` (provider seam) · `executors/claudeCode.ts` (Agent SDK, streaming input)
   · `executors/fake.ts` (scripted, for tests) · `sessionManager.ts` (sessions, approvals,
   resume/stopAll) · `wsHub.ts` (replay-then-tail) · `index.ts` (wiring only) ·
   `notes/agent-sdk-api.md` (verified SDK API reference — trust it over memory).
+  Its tests run under `bun test` (`test/_waitFor.ts` replaces `vi.waitFor`); `packages/shared`
+  and `packages/web` stay on vitest.
 - `packages/web` — `store.ts` (zustand, dedupes replays) · `wsClient.ts` (reconnect +
   resubscribe from `lastSeq`) · `App.tsx` (M0 console; M1 replaces it with the 3D floor).

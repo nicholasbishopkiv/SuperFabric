@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "bun:test";
 import { FakeExecutor } from "../src/executors/fake.js";
 import type { SessionEvent } from "@superfabric/shared";
 

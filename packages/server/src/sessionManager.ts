@@ -3,12 +3,26 @@ import { statSync } from "node:fs";
 import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
-import { AutonomyMode, DEFAULT_AUTONOMY, type SessionInfo } from "@superfabric/shared";
+import type { RoomManager } from "./roomManager.js";
+import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
 
 /** A tool call waiting on an operator decision, bound to the session that asked. */
 interface PendingApproval {
   sessionId: string;
   resolve: (behavior: "allow" | "deny") => void;
+}
+
+/**
+ * What a new agent needs. An options object rather than positional arguments because `roomId` and
+ * `cwd` answer the same question — where the agent works — and a caller must be able to give either
+ * without knowing about the other.
+ */
+export interface CreateSessionOptions {
+  /** Working directory. Ignored when `roomId` is given: a room's folder is its agents' cwd. */
+  cwd?: string;
+  /** The room to work in. Its folder becomes the cwd. Unknown ids are rejected. */
+  roomId?: string;
+  autonomy?: AutonomyMode;
 }
 
 export class SessionManager {
@@ -23,25 +37,58 @@ export class SessionManager {
   private stopping = false;
   private readonly stmts;
 
-  constructor(private db: Db, private store: EventStore, private executor: Executor) {
+  constructor(private db: Db, private store: EventStore, private executor: Executor, private rooms: RoomManager) {
     this.stmts = {
-      insertSession: db.prepare("INSERT INTO sessions (id, cwd, autonomy) VALUES (?, ?, ?)"),
+      insertSession: db.prepare("INSERT INTO sessions (id, cwd, autonomy, room_id) VALUES (?, ?, ?, ?)"),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
       activeSessions: db.prepare("SELECT id, cwd, claude_session_id, autonomy FROM sessions WHERE state = 'active'"),
       markError: db.prepare("UPDATE sessions SET state = 'error' WHERE id = ? AND state = 'active'"),
       session: db.prepare("SELECT id, cwd, claude_session_id, autonomy FROM sessions WHERE id = ?"),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
+      // `status` and `blocked` are derived from the log by correlated subqueries rather than a
+      // second round of queries per row, for the same reason — the 3D floor asks for this list on
+      // every status tick, so it has to stay one statement.
       listSessions: db.prepare(`
         SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
-               s.autonomy AS autonomy, COALESCE(MAX(e.seq), 0) AS last_seq
+               s.autonomy AS autonomy, s.room_id AS room_id, COALESCE(MAX(e.seq), 0) AS last_seq,
+               -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
+               (SELECT json_extract(st.payload, '$.status')
+                  FROM events st
+                  WHERE st.session_id = s.id AND st.type = 'session_status'
+                  ORDER BY st.seq DESC LIMIT 1) AS status,
+               -- an approval_request with no approval_resolved carrying the same approvalId
+               EXISTS (SELECT 1
+                  FROM events req
+                  WHERE req.session_id = s.id AND req.type = 'approval_request'
+                    AND NOT EXISTS (SELECT 1
+                      FROM events res
+                      WHERE res.session_id = s.id AND res.type = 'approval_resolved'
+                        AND json_extract(res.payload, '$.approvalId')
+                            = json_extract(req.payload, '$.approvalId'))) AS blocked
         FROM sessions s LEFT JOIN events e ON e.session_id = s.id
         GROUP BY s.id ORDER BY s.created_at
       `),
     };
   }
 
-  createSession(cwd: string, autonomy: AutonomyMode = DEFAULT_AUTONOMY): string {
+  /**
+   * Start an agent. In a room, the room's folder is the cwd — that is what "room = folder" means for
+   * the agent working there — so an unknown `roomId` is refused rather than quietly falling back to
+   * some other directory.
+   */
+  createSession(opts: CreateSessionOptions = {}): string {
+    const autonomy = opts.autonomy ?? DEFAULT_AUTONOMY;
+    let roomId: string | null = null;
+    let cwd = opts.cwd ?? process.cwd();
+
+    if (opts.roomId !== undefined) {
+      const room = this.rooms.getRoom(opts.roomId);
+      if (room === undefined) throw new Error(`unknown room ${opts.roomId}`);
+      roomId = room.id;
+      cwd = room.path;
+    }
+
     // `cwd` comes straight off the wire. An unchecked value is persisted forever and makes the
     // executor fail obscurely on this boot and every boot after it, so validate it here.
     let isDir = false;
@@ -50,7 +97,7 @@ export class SessionManager {
     if (!isDir) throw new Error(`cwd is not a directory: ${cwd}`);
 
     const id = randomUUID();
-    this.stmts.insertSession.run(id, cwd, autonomy);
+    this.stmts.insertSession.run(id, cwd, autonomy, roomId);
     this.startExecutor(id, cwd, null, autonomy);
     return id;
   }
@@ -66,8 +113,8 @@ export class SessionManager {
    * fails, the next boot starts the agent in the mode the operator asked for.
    */
   async setAutonomy(id: string, autonomy: AutonomyMode): Promise<void> {
-    const row = this.stmts.session.get(id) as SessionRow | undefined;
-    if (row === undefined) throw new Error(`unknown session ${id}`);
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
     this.stmts.setAutonomy.run(autonomy, id);
 
     const handle = this.handles.get(id);
@@ -219,13 +266,17 @@ export class SessionManager {
   listSessions(): SessionInfo[] {
     return (this.stmts.listSessions.all() as {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
-      autonomy: string; last_seq: number;
+      autonomy: string; room_id: string | null; last_seq: number;
+      status: string | null; blocked: number;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
       claudeSessionId: r.claude_session_id,
       lastSeq: r.last_seq,
       autonomy: asAutonomy(r.autonomy),
+      roomId: r.room_id,
+      status: asStatus(r.status),
+      blocked: r.blocked === 1,
     }));
   }
 }
@@ -246,4 +297,15 @@ interface SessionRow {
 function asAutonomy(value: string): AutonomyMode {
   const parsed = AutonomyMode.safeParse(value);
   return parsed.success ? parsed.data : DEFAULT_AUTONOMY;
+}
+
+/**
+ * A session with no `session_status` in its log has never reported anything, so it is `idle` — not
+ * an error and not a missing value the client has to special-case. An unrecognised stored status
+ * (hand-edited row, or a status this build predates) folds to `idle` for the same reason.
+ */
+function asStatus(value: string | null): SessionStatus {
+  if (value === null) return "idle";
+  const parsed = SessionStatus.safeParse(value);
+  return parsed.success ? parsed.data : "idle";
 }

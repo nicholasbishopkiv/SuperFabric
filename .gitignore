@@ -5,8 +5,10 @@ build/
 .env
 .env.*
 !.env.example
-.fabrica/*.db
-.fabrica/*.db-*
+# Server state. A pattern containing a slash is anchored to this file's directory, so
+# `.fabrica/*.db` alone would miss `packages/server/.fabrica/` — the data dir a `dev` run
+# actually creates. Ignore the directory itself, at any depth.
+.fabrica/
 .DS_Store
 coverage/
 .turbo/
