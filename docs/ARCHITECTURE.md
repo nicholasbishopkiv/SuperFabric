@@ -97,6 +97,13 @@ Node 22+, TypeScript, Fastify. Owns everything stateful.
   one-click attachment of the bundle; presets are plain files (`roles/*.yaml` in the
   Fabrica repo + user overrides in `.fabrica/roles/`), customizable and shareable.
   Skills/plugins install into the room's `.claude/` so the repo stays self-contained.
+- **Per-agent autonomy** — alongside the role bundle, every session carries an `autonomy` field
+  (`attended` | `auto` | `bypass`, persisted in `sessions.autonomy` and re-applied on resume) that
+  maps to the Agent SDK's `permissionMode` inside the executor. `auto` is the default: the CLI's
+  classifier decides, and only escalated calls raise an approval card. `bypass` gates nothing and
+  is a deliberate per-agent opt-in — the M4 container sandbox (below) is the precondition for using
+  it routinely, since it is exactly the `--dangerously-skip-permissions` posture that only becomes
+  safe inside a sandboxed room.
 
 ### 2.2 Web (`packages/web`)
 React 19 + Vite + **react-three-fiber (Three.js) + drei** (all MIT) + zustand.

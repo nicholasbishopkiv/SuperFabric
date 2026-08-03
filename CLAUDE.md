@@ -24,6 +24,28 @@ and a subscription limit monitor with auto-pause/resume.
 - The server is a local privileged tool: bind 127.0.0.1 only, allow-list browser `Origin`s on
   the WebSocket handshake (`src/origin.ts`), and never trust a client-supplied session id for
   anything the log records (see `SessionManager.approve`).
+- Autonomy is **per session**, persisted in `sessions.autonomy`, and re-applied on resume: a
+  `bypass` agent comes back as `bypass`, an `attended` one as `attended`. A session's SDK
+  permission mode is always set explicitly, so the operator's own Claude Code default can never
+  decide what a factory agent may do.
+
+## Autonomy (per-agent permission mode)
+
+Three modes, in our own vocabulary (`AutonomyMode` in `packages/shared/src/protocol.ts`):
+
+| Mode | Meaning | SDK `permissionMode` |
+|---|---|---|
+| `attended` | every gated tool call raises an approval card | `"default"` |
+| `auto` | **default** — the CLI's classifier decides; cards become rare, not impossible | `"auto"` |
+| `bypass` | nothing is gated at all; explicit per-agent opt-in | `"bypassPermissions"` |
+
+The wire protocol never speaks SDK: the mapping lives in the executor
+(`sdkPermissionMode()` in `src/executors/claudeCode.ts`), so an SDK rename touches one table.
+`canUseTool` stays wired in every mode, so the attended mode and any classifier-escalated call
+still reach the operator. `bypass` is only genuinely safe once sessions are sandboxed (M4).
+`create_session` carries an optional `autonomy`; `set_autonomy` toggles a live agent (the SDK's
+mode is fixed per `query()`, so the session's executor is restarted, resuming from the stored
+`claude_session_id`).
 
 ## Stack
 

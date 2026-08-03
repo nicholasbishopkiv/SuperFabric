@@ -70,6 +70,12 @@ the server as a local privileged tool:
 - **There is no authentication.** Anyone who can run code on the machine — or on any host you
   add to `SUPERFABRIC_ALLOWED_ORIGINS` — can drive your agents and approve their tool calls.
   Don't run SuperFabric on a shared host, and don't expose the port through a tunnel.
+- **Agents default to `auto` autonomy**: Claude Code's own classifier decides on each gated tool
+  call, so an approval card is the exception rather than the rule. Switch an agent to `attended`
+  and every gated action asks you first. `bypass` disables gating entirely — the agent runs any
+  command without asking — and is a deliberate per-agent opt-in, appropriate only for a room you
+  are willing to treat as disposable until container sandboxing lands (M4). Autonomy is stored
+  per session and survives a server restart.
 
 ## Documentation
 
