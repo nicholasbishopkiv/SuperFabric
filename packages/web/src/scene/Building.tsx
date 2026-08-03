@@ -155,7 +155,11 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
             font: "600 13px system-ui, sans-serif",
             color: LABEL_COLOR,
             background: "rgba(255,255,255,0.88)",
-            border: `1px solid ${selected ? SELECT_COLOR : "#c3c9ce"}`,
+            // Four sides rather than `border` plus `borderLeft`: React warns (correctly) that mixing
+            // a shorthand with one of its longhands re-renders unpredictably.
+            borderTop: `1px solid ${selected ? SELECT_COLOR : "#c3c9ce"}`,
+            borderRight: `1px solid ${selected ? SELECT_COLOR : "#c3c9ce"}`,
+            borderBottom: `1px solid ${selected ? SELECT_COLOR : "#c3c9ce"}`,
             // The department's own colour, as a stripe rather than as a wash: readable next to the
             // name without turning the label into a coloured chip.
             borderLeft: `4px solid ${isProject ? PROJECT.wall : accent.deep}`,
