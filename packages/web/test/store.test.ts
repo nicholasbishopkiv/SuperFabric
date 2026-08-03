@@ -5,7 +5,10 @@ const apply = (msg: Parameters<ReturnType<typeof useFabric.getState>["apply"]>[0
   useFabric.getState().apply(msg);
 
 beforeEach(() => {
-  useFabric.setState({ ...initialFabricState, events: {}, lastSeq: {}, sessions: [] });
+  useFabric.setState({
+    ...initialFabricState,
+    events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [],
+  });
 });
 
 describe("event store", () => {
@@ -52,6 +55,58 @@ describe("event store", () => {
     expect(useFabric.getState().lastError).toBeNull();
     apply({ kind: "error", message: "bad message" });
     expect(useFabric.getState().lastError).toBe("bad message");
+  });
+
+  it("does not flag a resync while the tail stays contiguous", () => {
+    for (const seq of [1, 2, 3]) {
+      apply({ kind: "event", sessionId: "s", seq, event: { type: "agent_text", text: `#${seq}` } });
+    }
+    const { needsResync, contiguousSeq, lastSeq } = useFabric.getState();
+    expect(needsResync["s"]).toBe(false);
+    expect(contiguousSeq["s"]).toBe(3);
+    expect(lastSeq["s"]).toBe(3);
+  });
+
+  it("flags a resync when the tail skips a seq, and keeps the event", () => {
+    apply({ kind: "event", sessionId: "s", seq: 1, event: { type: "agent_text", text: "a" } });
+    apply({ kind: "event", sessionId: "s", seq: 3, event: { type: "agent_text", text: "c" } });
+
+    const { needsResync, contiguousSeq, lastSeq, events } = useFabric.getState();
+    expect(needsResync["s"]).toBe(true);
+    // the resubscribe must ask from the last hole-free seq, not from the highest one applied
+    expect(contiguousSeq["s"]).toBe(1);
+    expect(lastSeq["s"]).toBe(3);
+    expect(events["s"].map((r) => r.seq)).toEqual([1, 3]);
+  });
+
+  it("clears the resync flag once the gap is filled, in seq order", () => {
+    apply({ kind: "event", sessionId: "s", seq: 1, event: { type: "agent_text", text: "a" } });
+    apply({ kind: "event", sessionId: "s", seq: 4, event: { type: "agent_text", text: "d" } });
+    expect(useFabric.getState().needsResync["s"]).toBe(true);
+
+    // the replay the client asks for, arriving after the event that exposed the gap
+    apply({ kind: "event", sessionId: "s", seq: 2, event: { type: "agent_text", text: "b" } });
+    expect(useFabric.getState().needsResync["s"]).toBe(true);
+    apply({ kind: "event", sessionId: "s", seq: 3, event: { type: "agent_text", text: "c" } });
+
+    const { needsResync, contiguousSeq, events } = useFabric.getState();
+    expect(needsResync["s"]).toBe(false);
+    expect(contiguousSeq["s"]).toBe(4);
+    expect(events["s"].map((r) => r.seq)).toEqual([1, 2, 3, 4]);
+    expect(events["s"].map((r) => (r.event as { text: string }).text)).toEqual(["a", "b", "c", "d"]);
+  });
+
+  it("does not re-insert an event that already filled a gap", () => {
+    apply({ kind: "event", sessionId: "s", seq: 1, event: { type: "agent_text", text: "a" } });
+    apply({ kind: "event", sessionId: "s", seq: 3, event: { type: "agent_text", text: "c" } });
+    apply({ kind: "event", sessionId: "s", seq: 3, event: { type: "agent_text", text: "c" } });
+    expect(useFabric.getState().events["s"].map((r) => r.seq)).toEqual([1, 3]);
+  });
+
+  it("tracks gaps per session", () => {
+    apply({ kind: "event", sessionId: "a", seq: 1, event: { type: "agent_text", text: "a1" } });
+    apply({ kind: "event", sessionId: "b", seq: 2, event: { type: "agent_text", text: "b2" } });
+    expect(useFabric.getState().needsResync).toEqual({ a: false, b: true });
   });
 
   it("leaves unrelated state untouched when an event is deduped", () => {
