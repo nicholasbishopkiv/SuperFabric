@@ -1,6 +1,6 @@
 # Fabrica — Design Spec
 
-Date: 2026-08-03 · Status: **awaiting user approval** · Scope: whole product, with M0 as the first implementable sub-project.
+Date: 2026-08-03 · Status: **approved** (user approved 2026-08-03, open questions delegated to the lead agent and resolved below) · Scope: whole product, with M0 as the first implementable sub-project.
 
 ## 1. Problem
 
@@ -60,6 +60,11 @@ Product surfaces on top of the core:
 - **Role library**: shipped presets (`roles/*.yaml`, user overrides in
   `.fabrica/roles/`) bundling role prompt + recommended skills/superpowers +
   plugins/MCP + tool profile + model; one-click attach when creating an agent.
+- **Chronicle (decision memory)**: ADR-style records in `docs/decisions/*.md` mirrored
+  into a SQLite FTS5 index together with the full prompt/event history; agents record
+  via `factory_record_decision` and consult via `factory_search_history` before
+  reworking anything — the project's "why it's built this way" is permanent and
+  queryable.
 
 Core invariants:
 - **Event log is the source of truth**; WebSocket is a lossy tail with
@@ -85,6 +90,7 @@ sessions(id, agent_id, claude_session_id, state{active|paused|done}, started_at)
 events(session_id, seq, ts, type, payload)          -- append-only
 messages(id, from_room, to_room, kind, body, task_id, delivered_at)
 tasks(id, room_id, title, status{open|in_progress|blocked|review|done}, assignee_agent_id, blocked_on_message_id)
+decisions(id, ts, room_id, agent_id, task_id, title, context, decision, alternatives, links)  -- + FTS5 index; mirrored to docs/decisions/*.md
 usage_snapshots(account_id, ts, window{5h|7d|7d_opus|7d_sonnet}, utilization, resets_at)
 ```
 
@@ -111,19 +117,24 @@ Milestones M0–M5 as in docs/ROADMAP.md; each gets its own implementation plan.
 plan to write: **M0 — core session runner** (monorepo scaffold, SessionManager,
 event log + WS replay, minimal chat UI with approval cards, resume-after-restart).
 
-## 6. Open questions (defaults chosen, flag if wrong)
+## 6. Resolved decisions (were open questions; resolution delegated by the user)
 
-1. **Room↔account binding** — default: account is set per room (all agents in a room
-   share it), overridable per agent.
-2. **Orchestrator model** — default: Opus on the least-loaded account, re-evaluated by
-   the scheduler.
-3. **Git strategy per room** — default v1: rooms are folders in one repo on one shared
-   branch; worktrees/branch-per-room deferred (revisit at M3 when parallel writes bite).
+1. **Room↔account binding** — account is chosen when creating a room (all its agents
+   share it), overridable per agent. Accounts are registered via the UI "Add session"
+   button: an embedded terminal (xterm.js ↔ node-pty over WS) runs `claude` against a
+   fresh `CLAUDE_CONFIG_DIR`; the user logs in as usual; the server detects
+   `.credentials.json` and registers the account.
+2. **Orchestrator model** — Opus on the least-loaded account, re-evaluated by the
+   scheduler.
+3. **Git strategy per room** — v1: rooms are folders in one repo on one shared branch;
+   worktrees/branch-per-room revisited at M3 if parallel writes bite.
 4. **Autonomy default** — attended mode (approval cards) until M4 sandboxing, then
    per-room autonomous mode allowed.
-5. **Role presets sourcing** — default: start with ~10 hand-written presets referencing
-   existing public skill packs (superpowers, impeccable, etc.); grow to 50+ and allow
-   user-defined presets in M5. Skills install into the room's `.claude/` for
-   self-containment.
-6. **3D art style** — default: procedural low-poly primitives first (no asset pipeline);
-   glTF assets and agent characters arrive incrementally (M5).
+5. **Role presets sourcing** — ~10 hand-written presets referencing existing public
+   skill packs (superpowers, impeccable, etc.); grow to 50+ and user-defined presets in
+   M5. Skills install into the room's `.claude/` for self-containment.
+6. **3D art style** — procedural low-poly primitives first (no asset pipeline); glTF
+   assets and agent characters arrive incrementally (M5).
+7. **Multi-provider executors** — core talks to agents via an `Executor` interface from
+   M0; v1 implements `ClaudeCodeExecutor` only; Codex/ChatGPT agents, Antigravity
+   (Gemini) and others plug in post-v1.

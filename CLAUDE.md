@@ -1,33 +1,40 @@
-# Fabrica — контекст для агентов
+# SuperFabric — agent context
 
-Self-hosted визуальный оркестратор мульти-аккаунтных Claude Code агентов: 3D-фабрика в
-браузере (react-three-fiber), комнаты-отделы = папки проекта, агенты = сессии Claude
-Code (TS Agent SDK, streaming-input), MCP-шина между отделами, оркестратор, монитор
-лимитов подписок с авто-паузой/resume.
+Self-hosted visual orchestrator for multi-account Claude Code agent teams: a 3D factory
+in the browser (react-three-fiber), rooms-as-folders, agents = Claude Code sessions
+(TS Agent SDK, streaming input), an MCP bus between departments, an orchestrator agent,
+and a subscription limit monitor with auto-pause/resume.
 
-## Перед любой работой прочитай
+## Read before any work
 
-1. `docs/superpowers/specs/2026-08-03-fabrica-design.md` — канонический дизайн (EN).
-2. `docs/ARCHITECTURE.md` — компоненты и потоки (EN).
-3. `docs/ROADMAP.md` — на каком этапе (M0–M5) мы находимся.
-4. `docs/RESEARCH.md` — факты о Claude Code / лимитах / prior art, чтобы не переоткрывать.
+1. `docs/superpowers/specs/2026-08-03-fabrica-design.md` — canonical design spec.
+2. `docs/ARCHITECTURE.md` — components and flows.
+3. `docs/ROADMAP.md` — which milestone (M0–M5) we are on.
+4. `docs/RESEARCH.md` — facts about Claude Code / limits / prior art; don't rediscover.
 
-## Ключевые инварианты (не нарушать)
+## Invariants (do not violate)
 
-- Event-log в SQLite — источник правды; WebSocket — lossy tail с replay по `afterSeq`.
-- Комната = папка; без Фабрики проект остаётся обычным репозиторием.
-- Один `CLAUDE_CONFIG_DIR` = один аккаунт; никогда не шарить между аккаунтами.
-- Доставка сообщений агентам — push (инжект turn'а в input stream), не polling.
-- Никакого пулинга/ротации аккаунтов для обхода лимитов (ToS-линия) — только
-  мониторинг, пауза и resume своих аккаунтов.
+- The SQLite event log is the source of truth; WebSocket is a lossy tail with
+  `afterSeq` replay.
+- Room = folder; without SuperFabric the project remains an ordinary repository.
+- One `CLAUDE_CONFIG_DIR` = one account; never share across accounts.
+- Message delivery to agents is push (inject a turn into the input stream), not polling.
+- No account pooling/rotation to evade limits (hard ToS line) — only monitoring, pause,
+  and resume of the user's own accounts.
 
-## Стек
+## Stack
 
 pnpm workspaces · TypeScript · Node 22+ · Fastify + ws · better-sqlite3 (WAL) ·
 `@anthropic-ai/claude-agent-sdk` · React 19 + Vite · react-three-fiber + drei · zustand ·
-dockerode (M4). Лицензионная политика зависимостей: MIT/Apache only (не тянуть AGPL).
+dockerode (M4). Dependency license policy: MIT/Apache only (no AGPL).
 
-## Статус
+## Conventions
 
-Стадия дизайна: спека ждёт ревью пользователя. Код не начинать до утверждения спеки и
-написания плана реализации M0.
+- Code, comments, commits, docs — English. Russian doc originals are `*.ru.md`.
+- Spec-first: substantive design changes update the spec/architecture docs in the same
+  PR as the code.
+
+## Status
+
+Design approved 2026-08-03. Current milestone: **M0 — core session runner** (plan in
+`docs/superpowers/plans/`, when present).

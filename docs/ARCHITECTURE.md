@@ -62,12 +62,34 @@ Node 22+, TypeScript, Fastify. Owns everything stateful.
   an adapter with JSONL-estimation fallback (ccusage-style).
 - **AccountManager** — registry of accounts. Each account = a dedicated
   `CLAUDE_CONFIG_DIR` (one volume/dir per account; never share across accounts, refresh
-  tokens rewrite in place). Login flow: spawn a hidden `claude /login` PTY against the
-  profile dir, surface the OAuth URL in the UI, watch for `.credentials.json`
-  (AgentsRoom/Maestro pattern). Fallback: `claude setup-token` → long-lived
-  `CLAUDE_CODE_OAUTH_TOKEN`.
+  tokens rewrite in place). **Login flow ("Add session" button)**: the UI opens an
+  embedded terminal (xterm.js in the browser ↔ node-pty over the WS) running `claude`
+  against a fresh profile dir; the user completes login exactly as in a normal
+  terminal; the server watches for `.credentials.json` and registers the account.
+  Fallback: `claude setup-token` → long-lived `CLAUDE_CODE_OAUTH_TOKEN`. When creating
+  a room or agent, the user picks which registered account (session pool) it runs
+  under.
+- **Executor abstraction** — SessionManager talks to agents through an `Executor`
+  interface (start/steer/interrupt/resume/events), not to the Agent SDK directly.
+  v1 ships `ClaudeCodeExecutor` only; the interface exists from M0 so that post-v1
+  executors (Codex / ChatGPT agents, Antigravity / Gemini, etc.) plug in without
+  reworking the core — different providers for different tasks. (Pattern proven by
+  Vibe Kanban's executor profiles.)
 - **Onboarder** — special short-lived session that interviews the user (via UI chat) and
   writes CLAUDE.md / README / room docs for a fresh project.
+- **Chronicle** — the project's decision memory: a persistent, queryable record of
+  *why* things were done one way and not another. Two layers:
+  1. **Decision records as files** — `docs/decisions/NNNN-<slug>.md` (ADR-style: title,
+     context, decision, alternatives rejected + why, links to tasks/files/commits).
+     Repo-native: readable and greppable by any agent (or human) even without
+     SuperFabric running.
+  2. **SQLite index with FTS5** — `decisions` table + full-text search over decisions
+     *and* the prompt/event history (every prompt and agent turn already persists in
+     the event log; Chronicle makes it searchable).
+  Agents interact via bus tools: `factory_record_decision(...)` (role prompts instruct
+  agents to record at meaningful choice points; the orchestrator records direction
+  decisions) and `factory_search_history(query)` (consult before reworking anything).
+  The UI shows a chronicle timeline and per-room decision lists.
 - **RoleLibrary** — catalog of role presets shipping with Fabrica (architect, designer,
   backend dev, QA, DevOps, tech writer, …). A preset bundles: role system-prompt append,
   recommended skills (e.g. superpowers, impeccable for UI roles), plugins/MCP servers,

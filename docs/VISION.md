@@ -1,39 +1,95 @@
-# Фабрика — видение продукта
+# SuperFabric — Product Vision
 
-## Улучшенная постановка (refined brief)
+> 🇷🇺 Русский оригинал: [VISION.ru.md](VISION.ru.md)
 
-> **Фабрика** — self-hosted браузерное приложение для управления разработкой одного программного проекта силами команды Claude Code-агентов, распределённых по нескольким подписочным аккаунтам.
+## Refined brief
+
+> **SuperFabric** is a self-hosted browser app for running the development of one
+> software project with a team of Claude Code agents spread across several subscription
+> accounts.
 >
-> UI — **живая 3D-фабрика** (изометрическая WebGL-сцена): в центре — **главное здание проекта** (живое представление CLAUDE.md, README и продуктовых документов; если их нет, агент-онбордер интервьюирует пользователя прямо в браузере и создаёт их). Вокруг — **цеха-отделы**: зоны ответственности (backend, frontend, devops, chat-service, payment-service…). Между зданиями — **конвейерные дорожки**, по которым едут коробки-сообщения; позже в цехах появятся маленькие анимированные агенты. Поверх 3D-сцены — 2D-слой с панелями: **taskpanel**, метры лимитов, карточки аппрувов, чаты. Комната = подпапка проекта + её документация + один или несколько **агентов** (сессий Claude Code) со своей моделью, скиллами, MCP-серверами и правами.
+> The UI is a **living 3D factory** (isometric WebGL scene): at the center stands the
+> **main project building** — a live representation of CLAUDE.md, README, and product
+> documents; if they don't exist, an onboarding agent interviews the user right in the
+> browser and creates them. Around it are **workshop rooms** — areas of responsibility
+> (backend, frontend, devops, chat-service, payment-service…). Between the buildings run
+> **conveyor belts** carrying package-messages; later, small animated agent characters
+> appear inside the workshops. Above the 3D scene floats a 2D layer of panels: the
+> **task panel**, limit meters, approval cards, chats. A room = a project subfolder +
+> its documentation + one or more **agents** (Claude Code sessions), each with its own
+> model, skills, MCP servers, and permissions.
 >
-> Агенты создаются из **библиотеки ролей**: десятки готовых пресетов (архитектор, дизайнер, backend-разработчик, QA, DevOps, техписатель…), где роль = системный промт + рекомендованные скиллы/superpowers + плагины и MCP + рекомендованная модель. Выбрал роль — Фабрика сама предложила прикрепить готовый набор; не нужно разбираться в скиллах и конфигах. Пресеты можно кастомизировать и сохранять свои.
+> Agents are created from a **roles library**: dozens of ready presets (architect,
+> designer, backend developer, QA, DevOps, tech writer…), where a role = a system prompt
+> + recommended skills/superpowers + plugins and MCP servers + a recommended model. Pick
+> a role and SuperFabric offers to attach the whole bundle — no need to understand
+> skills and configs. Presets are customizable and shareable.
 >
-> Отделы обмениваются задачами и вопросами через **MCP-шину фабрики** (комната чата просит у комнаты оплат вебхуки для пушей — и получает ответ, когда работа сделана). **Оркестратор** — старший агент в «главном здании»: распределяет работу, снимает блокеры, принимает технические решения о направлении проекта, к нему обращаются младшие агенты за ресерчем и решениями.
+> Departments exchange tasks and questions through the **factory MCP bus** (the chat
+> room asks the payments room for push-notification webhooks — and receives the answer
+> when the work is done). The **orchestrator** is the senior agent in the headquarters
+> building: it distributes work, clears blockers, makes technical direction decisions,
+> and junior agents come to it for research and rulings.
 >
-> Пользователь видит всё: открытые таски, кто над чем работает, кто idle, кто ждёт блокер, анимированные потоки сообщений между комнатами — и может написать напрямую любому агенту. **Монитор лимитов** показывает по каждой подписке точную картину 5-часовых и недельных окон (включая пер-модельные), предупреждает агентов о приближении к лимиту, ставит их на паузу и автоматически возобновляет сессии с того же места после сброса. Сессии переживают рестарты: всё состояние кэшируется и восстанавливается.
+> Accounts are added right from the UI: the **"Add session"** button opens an embedded
+> terminal where the user logs into a Claude account; every new room or agent is then
+> bound to one of the registered accounts. Claude Code is the first supported engine;
+> the core is built against an **executor abstraction**, so other agents (Codex /
+> ChatGPT agents, Antigravity, …) plug in later — different strengths for different
+> tasks.
+>
+> The factory keeps a **chronicle**: every prompt, every decision, and its reasoning is
+> preserved — the stream of thought of how the product evolved. Any agent (or the user)
+> can search it and learn *why* something was built one way and not another, and what
+> to change where, before touching anything.
+>
+> The user sees everything: open tasks, who works on what, who is idle, who waits on a
+> blocker, animated message flows between rooms — and can message any agent directly.
+> The **limit monitor** shows, per subscription, the exact picture of 5-hour and weekly
+> windows (including per-model buckets), warns agents when a limit approaches, pauses
+> them, and automatically resumes sessions from the same spot after reset. Sessions
+> survive restarts: all state is cached and restored.
 
-## Ключевые принципы
+## Principles
 
-1. **Self-hosted и локальный.** Никакого облака-посредника. Код, credentials и транскрипты не покидают машину пользователя.
-2. **Свои аккаунты — своя ответственность.** Фабрика управляет аккаунтами, в которые пользователь залогинился сам. Мы не «предлагаем логин claude.ai» третьим лицам и не пулим чужие аккаунты (см. риски в RESEARCH.md).
-3. **Файловая система — источник правды.** Комната = папка. Документация отдела, его агенты и скиллы лежат в его папке. Фабрику можно выключить — проект остаётся обычным репозиторием, с которым работает обычный Claude Code.
-4. **Прозрачность важнее автономии.** Каждый шаг агента виден и останавливаем. Аппрувы опасных действий приходят карточками в UI.
-5. **Деградируй изящно.** Упёрлись в лимит — работа ставится на паузу с таймером, а не падает. Упал сервер — сессии восстанавливаются через resume.
+1. **Self-hosted and local.** No cloud middleman. Code, credentials, and transcripts
+   never leave the user's machine.
+2. **Your accounts — your responsibility.** SuperFabric manages accounts the user
+   logged into personally. We do not "offer claude.ai login" to third parties and we do
+   not pool other people's accounts (see risks in RESEARCH.md).
+3. **The filesystem is the source of truth.** A room is a folder. A department's docs,
+   agents, and skills live in its folder. Turn SuperFabric off — the project remains an
+   ordinary repository that plain Claude Code can work with.
+4. **Transparency over autonomy.** Every agent step is visible and stoppable. Approvals
+   for dangerous actions arrive as cards in the UI.
+5. **Degrade gracefully.** Hit a limit — work pauses with a countdown, it doesn't
+   crash. Server died — sessions recover via resume.
 
-## Чем Фабрика НЕ является
+## What SuperFabric is NOT
 
-- Не облачный сервис и не мультитенантный SaaS.
-- Не обёртка над API-ключами (целимся именно в подписки; API-ключ — опциональный fallback).
-- Не generic-раннер «любой агент в облаке» — эту нишу закрыл сам Anthropic (Claude Code on the web, Agent Teams). Наша ниша: **self-hosted контроль + мульти-аккаунтная видимость + пространственный UX**, которых нет ни у кого.
+- Not a cloud service and not a multi-tenant SaaS.
+- Not a wrapper over API keys (we target subscriptions; API key is an optional
+  fallback).
+- Not a generic "any agent in the cloud" runner — Anthropic itself closed that niche
+  (Claude Code on the web, Agent Teams). Our niche: **self-hosted control +
+  multi-account visibility + spatial UX** that no one else has.
 
-## Персона и сценарий
+## Persona and scenario
 
-Соло-разработчик / техлид с 2–3 подписками Claude Max ведёт средний проект (5–10 сервисов). Утром открывает Фабрику: ночью backend-отдел закрыл 4 таски, notification-отдел ждёт ответа от payment-отдела, аккаунт №2 упрётся в недельный лимит в четверг. Он отвечает на два аппрува, пишет оркестратору «сегодня приоритет — интеграция платежей», и идёт пить кофе, поглядывая на цех.
+A solo developer / tech lead with 2–3 Claude Max subscriptions runs a mid-size project
+(5–10 services). In the morning they open SuperFabric: overnight the backend room closed
+4 tasks, the notification room waits on an answer from payments, account #2 will hit its
+weekly limit on Thursday. They answer two approval cards, tell the orchestrator "today's
+priority is the payments integration", and go make coffee, glancing at the factory
+floor.
 
-## Критерии успеха v1
+## v1 success criteria
 
-- [ ] 3 аккаунта × 3+ параллельных агента работают над одним проектом ≥ 8 часов без ручного вмешательства.
-- [ ] Ни одна сессия не теряется при рестарте сервера или контейнера.
-- [ ] Лимиты по каждому аккаунту показываются с точностью официального `/usage`; агенты автоматически паузятся и возобновляются.
-- [ ] Сообщение из комнаты A в комнату B доставляется < 5 сек, и это видно на canvas.
-- [ ] Новый проект онбордится (создание CLAUDE.md/README интервью-агентом) за один сеанс.
+- [ ] 3 accounts × 3+ parallel agents work on one project for ≥ 8 hours without manual
+      intervention.
+- [ ] No session is lost on a server or container restart.
+- [ ] Per-account limits match the official `/usage` numbers; agents pause and resume
+      automatically.
+- [ ] A message from room A reaches room B in < 5 seconds, visibly on the canvas.
+- [ ] A fresh project gets onboarded (CLAUDE.md/README created by the interview agent)
+      in a single session.

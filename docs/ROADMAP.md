@@ -1,67 +1,90 @@
-# Фабрика — роадмап (декомпозиция)
+# SuperFabric — Roadmap
 
-Проект слишком большой для одной спецификации, поэтому разбит на этапы. Каждый этап —
-самостоятельный под-проект со своим циклом «спека → план → реализация» и **работающим
-результатом в конце**. Порядок выбран так, чтобы риски снимались раньше всего.
+> 🇷🇺 Русский оригинал: [ROADMAP.ru.md](ROADMAP.ru.md)
 
-## M0 — Ядро: одна сессия под управлением сервера (1-й под-проект)
+The project is too large for a single spec, so it is split into milestones. Each
+milestone is a self-contained sub-project with its own "spec → plan → implementation"
+cycle and a **working result at the end**. The order is chosen to burn down the biggest
+risks first.
 
-Снимает главный технический риск: управляемая долгоживущая сессия.
+## M0 — Core: one server-managed session (first sub-project)
 
-- pnpm-монорепо: `server`, `web`, `shared`.
-- SessionManager на Agent SDK (streaming-input): старт, стрим событий, interrupt, resume после рестарта сервера.
-- SQLite event-log + WebSocket replay-then-tail.
-- Минимальный web-UI: один чат с агентом, карточки аппрувов (`canUseTool`).
-- Один аккаунт (текущий `~/.claude`).
+Removes the main technical risk: a steerable long-lived session.
 
-**Готово, когда**: сессию можно вести из браузера, убить сервер и продолжить с того же места.
+- pnpm monorepo: `server`, `web`, `shared`.
+- SessionManager on the Agent SDK (streaming input): start, event streaming, interrupt,
+  resume after a server restart.
+- SQLite event log + WebSocket replay-then-tail.
+- Minimal web UI: a chat with one agent, approval cards (`canUseTool`).
+- Single account (the current `~/.claude`).
 
-## M1 — Цех: 3D-фабрика, проект-блок, комнаты
+**Done when**: a session can be driven from the browser, the server killed, and the
+session continued from the same spot.
 
-- 3D-сцена (react-three-fiber, изометрическая камера, low-poly): главное здание =
-  проект (по клику — CLAUDE.md/README), создание комнат-цехов → папок, конвейерные
-  дорожки между зданиями.
-- 2D-оверлей: **taskpanel** (ручное создание тасков, пока с ручным выбором отдела),
-  панель комнаты (charter, выбор модели/скиллов/MCP per-агент), статусы
-  working/idle/blocked на зданиях.
-- **Библиотека ролей v1**: ~10 стартовых пресетов (архитектор, backend, frontend,
-  дизайнер, QA, DevOps…) — роль = промт + скиллы/superpowers + плагины/MCP + модель;
-  назначение в один клик, файловый формат `roles/*.yaml` (расширение до 50+ ролей и
-  пользовательских пресетов — в M5).
-- Агент-онбордер для пустого проекта (интервью → документы).
-- Layout сцены сохраняется в `.fabrica/layout.json`.
+## M1 — The floor: 3D factory, project block, rooms
 
-## M2 — Мульти-аккаунт и монитор лимитов
+- 3D scene (react-three-fiber, isometric camera, low-poly): the main building = the
+  project (click → CLAUDE.md/README), creating workshop rooms → folders, conveyor paths
+  between buildings.
+- 2D overlay: **task panel** (manual task creation, department picked manually for
+  now), room panel (charter, per-agent model/skills/MCP), working/idle/blocked statuses
+  on the buildings.
+- **Roles library v1**: ~10 starter presets (architect, backend, frontend, designer,
+  QA, DevOps…) — role = prompt + skills/superpowers + plugins/MCP + model; one-click
+  assignment, file format `roles/*.yaml` (growing to 50+ roles and user presets in M5).
+- Onboarding agent for an empty project (interview → documents).
+- Scene layout persisted to `.fabrica/layout.json`.
 
-- AccountManager: профили через `CLAUDE_CONFIG_DIR`, login-flow из UI (hidden PTY), привязка комнат/агентов к аккаунтам.
-- LimitMonitor: поллинг OAuth usage endpoint по каждому аккаунту, метры 5h/weekly/per-model в UI, перехват 429.
-- Scheduler: предупреждение агентам на 80%, пауза на 95%, авто-resume по `resets_at`.
+## M2 — Multi-account and the limit monitor
 
-**Готово, когда**: 2+ аккаунта работают параллельно, пауза/возобновление по лимитам — без участия человека.
+- AccountManager: profiles via `CLAUDE_CONFIG_DIR`; **"Add session" button** opening an
+  embedded terminal (xterm.js ↔ node-pty) where the user logs in; binding rooms/agents
+  to a chosen account at creation time.
+- LimitMonitor: polling the OAuth usage endpoint per account, 5h/weekly/per-model
+  meters in the UI, catching 429s.
+- Scheduler: warn agents at 80%, pause at 95%, auto-resume at `resets_at`.
 
-## M3 — Шина фабрики и оркестратор
+**Done when**: 2+ accounts run in parallel; limit pause/resume needs no human.
 
-- Factory Bus: in-process MCP-инструменты (`factory_send`, `factory_inbox`, `factory_report_status`, `factory_task_update`, `factory_ask_orchestrator`), push-доставка инжектом turn'а.
-- TaskStore + канбан-панель + бейджи тасков на комнатах.
-- Оркестратор: выделенная сессия (Opus) с обзором всех комнат, распределением задач, снятием блокеров; консоль оркестратора в UI.
-- **Авто-роутинг тасков**: таск из taskpanel без выбранного отдела уходит оркестратору — тот анализирует, назначает отдел и ответственного, отправляет в работу.
-- Коробки-сообщения едут по конвейерам между цехами (анимация вдоль сплайнов).
+## M3 — Factory bus and the orchestrator
 
-## M4 — Контейнеризация
+- Factory Bus: in-process MCP tools (`factory_send`, `factory_inbox`,
+  `factory_report_status`, `factory_task_update`, `factory_ask_orchestrator`),
+  push delivery by injecting a turn.
+- TaskStore + kanban panel + task badges on rooms.
+- Orchestrator: dedicated session (Opus) with an overview of all rooms, task
+  distribution, blocker resolution; orchestrator console in the UI.
+- **Task auto-routing**: a task from the task panel with no department chosen goes to
+  the orchestrator — it analyzes, assigns room and assignee, and dispatches.
+- **Chronicle v1**: `factory_record_decision` + `factory_search_history` tools,
+  ADR files in `docs/decisions/`, FTS5 search over decisions + prompt/event history,
+  chronicle timeline in the UI.
+- Package meshes travel the conveyors between workshops (spline animation).
 
-- Образ `agent-runner` (Node + SDK + claude), dockerode-менеджмент.
-- Один контейнер на комнату; mount профиля аккаунта и workspace; egress-firewall по референсу Anthropic; лимиты ресурсов.
-- `--dangerously-skip-permissions` внутри песочницы + правила автоаппрува per-room.
+## M4 — Containerization
 
-## M5 — Полировка и «живая фабрика»
+- `agent-runner` image (Node + SDK + claude), dockerode management.
+- One container per room; account profile and workspace mounts; egress firewall per
+  Anthropic's reference; resource limits.
+- `--dangerously-skip-permissions` inside the sandbox + per-room auto-approval rules.
 
-- Маленькие анимированные агенты-человечки в цехах (glTF-персонажи, отражают активность реальных сессий), living-factory детали (дым, свет, движение).
-- Прямой чат с любым агентом из UI (уже частично в M0), нотификации (желателен push на телефон), история/поиск по событиям.
-- Метрики: burn-rate по аккаунтам, стоимость-эквивалент (ccusage-математика) для аналитики.
-- Экспорт/импорт фабрики, мульти-проектность (несколько заводов).
+## M5 — Polish and the "living factory"
 
-## Вне скоупа v1
+- Small animated agent characters in the workshops (glTF, reflecting real session
+  activity), living-factory details (smoke, lights, movement).
+- Direct chat with any agent from the UI (partially in M0 already), notifications
+  (phone push desirable), event history/search.
+- Roles library expansion (50+ presets, user-defined presets).
+- Metrics: per-account burn rate, cost-equivalent analytics (ccusage math).
+- Factory export/import, multi-project support (several factories).
 
-- Другие агенты-исполнители (Codex, Gemini CLI) — заложена абстракция executor, но не реализуем.
-- Мультитенантность, облачный деплой, командный доступ.
-- Автоматическая ротация аккаунтов ради обхода лимитов — сознательно НЕ делаем (ToS-риск); только пауза/resume своих аккаунтов.
+## Planned after v1
+
+- **Multi-provider executors**: Codex / ChatGPT agents, Antigravity (Gemini), and
+  others behind the `Executor` interface (which exists from M0) — assign different
+  providers/strengths to different tasks and rooms.
+
+## Out of scope for v1
+- Multi-tenancy, cloud deployment, team access.
+- Automatic account rotation to dodge limits — deliberately NOT doing this (ToS risk);
+  only pause/resume of your own accounts.
