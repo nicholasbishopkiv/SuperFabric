@@ -40,6 +40,22 @@ const MIGRATIONS: readonly string[] = [
   `
     ALTER TABLE sessions ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'auto';
   `,
+  // 3 — M1a rooms. A room is a folder under the project root; the row is its identity on the
+  // factory floor (position) and the name is the folder segment, hence UNIQUE. `sessions.room_id`
+  // is deliberately nullable and without a foreign key: M0 sessions have no room, and a session's
+  // history must not be destroyed by whatever happens to a room row.
+  `
+    CREATE TABLE IF NOT EXISTS rooms (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      path TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'room',   -- project | room
+      pos_x REAL NOT NULL DEFAULT 0,
+      pos_z REAL NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    ALTER TABLE sessions ADD COLUMN room_id TEXT;
+  `,
 ];
 
 /** Schema version a freshly opened database is brought up to. */

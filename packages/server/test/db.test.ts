@@ -117,4 +117,65 @@ describe("db", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // ---- migration 3: rooms ----
+
+  it("creates the rooms table with a unique name and origin-defaulted position", () => {
+    const db = openDb(":memory:");
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[];
+    expect(tables.map(t => t.name)).toContain("rooms");
+
+    db.prepare("INSERT INTO rooms (id, name, path) VALUES (?, ?, ?)").run("r1", "backend", "/p/backend");
+    expect(db.prepare("SELECT kind, pos_x, pos_z FROM rooms WHERE id = 'r1'").get())
+      .toEqual({ kind: "room", pos_x: 0, pos_z: 0 });
+    // one folder, one room: the name is the folder segment, so it cannot repeat
+    expect(() => db.prepare("INSERT INTO rooms (id, name, path) VALUES (?, ?, ?)").run("r2", "backend", "/other"))
+      .toThrow(/UNIQUE/);
+  });
+
+  it("upgrades a user_version = 2 database to rooms + sessions.room_id, keeping its rows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-v2-"));
+    try {
+      const path = join(dir, "v2.db");
+      // A database exactly as migration 2 left it.
+      const v2 = new Database(path);
+      v2.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, claude_session_id TEXT,
+          state TEXT NOT NULL DEFAULT 'active', cwd TEXT NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          autonomy TEXT NOT NULL DEFAULT 'auto'
+        );
+        CREATE TABLE events (
+          session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          ts INTEGER NOT NULL DEFAULT (unixepoch()),
+          type TEXT NOT NULL, payload TEXT NOT NULL,
+          PRIMARY KEY (session_id, seq)
+        );
+      `);
+      v2.pragma("user_version = 2");
+      v2.prepare("INSERT INTO sessions (id, cwd, autonomy) VALUES (?, ?, ?)").run("m0", "/m0/cwd", "bypass");
+      v2.prepare("INSERT INTO events (session_id, seq, type, payload) VALUES (?, ?, ?, ?)")
+        .run("m0", 1, "agent_text", JSON.stringify({ type: "agent_text", text: "from M0" }));
+      v2.close();
+
+      const db = openDb(path);
+      expect(db.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(3);
+
+      // the M0 session survived intact, and is roomless
+      expect(db.prepare("SELECT cwd, autonomy, room_id FROM sessions WHERE id = 'm0'").get())
+        .toEqual({ cwd: "/m0/cwd", autonomy: "bypass", room_id: null });
+      expect((db.prepare("SELECT payload FROM events WHERE session_id='m0' AND seq=1").get() as { payload: string }).payload)
+        .toContain("from M0");
+      // and rooms are now available to fill
+      db.prepare("INSERT INTO rooms (id, name, path, kind) VALUES (?, ?, ?, ?)")
+        .run("r1", "backend", "/m0/backend", "room");
+      db.prepare("UPDATE sessions SET room_id = ? WHERE id = 'm0'").run("r1");
+      expect(db.prepare("SELECT room_id FROM sessions WHERE id = 'm0'").get()).toEqual({ room_id: "r1" });
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
