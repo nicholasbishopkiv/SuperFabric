@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, MessageInfo, MessageKind, RoomInfo, ServerMessage,
-  SessionEvent, SessionStatus, TaskInfo, TaskStatus,
+  AutonomyMode, ClientMessage, DEFAULT_AUTONOMY, MessageInfo, MessageKind, ProjectInfo, RoomInfo,
+  ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
 } from "../src/protocol.js";
 
 /** Every field `SessionInfo` requires, so a case can vary exactly the one it is about. */
@@ -242,6 +242,73 @@ describe("protocol", () => {
       const m = ServerMessage.parse({ kind: "messages", messages: [MESSAGE_INFO] });
       expect(m).toMatchObject({ kind: "messages", messages: [{ deliveredAt: null }] });
       expect(() => ServerMessage.parse({ kind: "messages" })).toThrow();
+    });
+  });
+
+  // ---- M1b: projects and settable room folders ----
+
+  describe("projects", () => {
+    const PROJECT_INFO = {
+      id: "p1", name: "My Project", root: "/home/op/code/my-project", lastOpenedAt: null,
+    } as const;
+
+    it("parses a project and keeps lastOpenedAt nullable but required", () => {
+      expect(ProjectInfo.parse(PROJECT_INFO).lastOpenedAt).toBeNull();
+      expect(ProjectInfo.parse({ ...PROJECT_INFO, lastOpenedAt: 42 }).lastOpenedAt).toBe(42);
+      const { lastOpenedAt: _omitted, ...missing } = PROJECT_INFO;
+      expect(() => ProjectInfo.parse(missing)).toThrow();
+    });
+
+    it("lets a project be named anything a folder can be called, unlike a room", () => {
+      // A room name is a folder *segment* and is folded into a slug; a project name is a label.
+      expect(ProjectInfo.parse({ ...PROJECT_INFO, name: "My Project" }).name).toBe("My Project");
+      expect(() => ProjectInfo.parse({ ...PROJECT_INFO, name: "" })).toThrow();
+      expect(() => ProjectInfo.parse({ ...PROJECT_INFO, name: "n".repeat(121) })).toThrow();
+      expect(() => ProjectInfo.parse({ ...PROJECT_INFO, root: "" })).toThrow();
+    });
+
+    it("parses the project client messages", () => {
+      expect(ClientMessage.parse({ kind: "list_projects" }).kind).toBe("list_projects");
+      expect(ClientMessage.parse({ kind: "create_project", root: "/tmp/x" }))
+        .toEqual({ kind: "create_project", root: "/tmp/x" });
+      expect(ClientMessage.parse({ kind: "create_project", root: "/tmp/x", name: "X" }))
+        .toMatchObject({ name: "X" });
+      expect(ClientMessage.parse({ kind: "open_project", projectId: "p1" }))
+        .toEqual({ kind: "open_project", projectId: "p1" });
+
+      expect(() => ClientMessage.parse({ kind: "create_project" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "create_project", root: "" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "open_project" })).toThrow();
+    });
+
+    it("carries the active project alongside the list, because it is per-socket", () => {
+      const m = ServerMessage.parse({
+        kind: "projects", projects: [PROJECT_INFO], activeProjectId: "p1",
+      });
+      expect(m).toMatchObject({ kind: "projects", activeProjectId: "p1" });
+      // a list with no active id would leave a tab unable to say which floor it is showing
+      expect(() => ServerMessage.parse({ kind: "projects", projects: [PROJECT_INFO] })).toThrow();
+      expect(() => ServerMessage.parse({ kind: "projects", activeProjectId: "p1" })).toThrow();
+    });
+  });
+
+  describe("room folders", () => {
+    it("accepts create_room with and without an explicit path", () => {
+      expect(ClientMessage.parse({ kind: "create_room", name: "backend" }))
+        .toEqual({ kind: "create_room", name: "backend" });
+      expect(ClientMessage.parse({ kind: "create_room", name: "backend", path: "/srv/other-repo" }))
+        .toMatchObject({ path: "/srv/other-repo" });
+      expect(() => ClientMessage.parse({ kind: "create_room", name: "backend", path: "" })).toThrow();
+      // the name is still a folder segment even when the folder is chosen explicitly
+      expect(() => ClientMessage.parse({ kind: "create_room", name: "Backend", path: "/srv/x" })).toThrow();
+    });
+
+    it("parses set_room_path and requires both ends of it", () => {
+      expect(ClientMessage.parse({ kind: "set_room_path", roomId: "r1", path: "/srv/other" }))
+        .toEqual({ kind: "set_room_path", roomId: "r1", path: "/srv/other" });
+      expect(() => ClientMessage.parse({ kind: "set_room_path", roomId: "r1" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "set_room_path", path: "/srv/other" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "set_room_path", roomId: "r1", path: "" })).toThrow();
     });
   });
 });

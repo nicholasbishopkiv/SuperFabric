@@ -40,6 +40,28 @@ export const SessionEvent = z.discriminatedUnion("type", [
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
+// ---- M1b: projects ----
+
+/**
+ * One factory floor. A project is a root folder plus everything scoped to it — rooms, agents, tasks
+ * and bus traffic — so one SuperFabric serves several of them at once and switching is a scope
+ * change rather than a restart.
+ *
+ * `name` is deliberately *not* a `RoomName`: a project root is whatever repository folder the
+ * operator picked, and folding "My Project" into a slug would rename the thing they are looking at.
+ * The room named after the root (the central building) still gets a folded, protocol-valid label —
+ * that is a room, and a room name is a folder segment.
+ */
+export const ProjectInfo = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(120),
+  /** Absolute path of the project root. Unique across the server: one folder is one factory. */
+  root: z.string().min(1),
+  /** When a socket last switched to it; null until someone has. */
+  lastOpenedAt: z.number().int().nullable(),
+});
+export type ProjectInfo = z.infer<typeof ProjectInfo>;
+
 // ---- rooms ----
 
 /**
@@ -129,9 +151,31 @@ export const ClientMessage = z.discriminatedUnion("kind", [
   }),
   z.object({ kind: z.literal("set_autonomy"), sessionId: z.string(), autonomy: AutonomyMode }),
   z.object({ kind: z.literal("list_sessions") }),
-  z.object({ kind: z.literal("create_room"), name: RoomName }),
+  /**
+   * `path` is the room's working folder. Omitted, the room is `<project root>/<name>` and must stay
+   * inside the root; given, it is used as-is and may point anywhere — a department is allowed to
+   * live in a separate repository. See `RoomManager.createRoom`.
+   */
+  z.object({ kind: z.literal("create_room"), name: RoomName, path: z.string().min(1).optional() }),
   z.object({ kind: z.literal("move_room"), roomId: z.string(), position: ScenePosition }),
+  /**
+   * Re-point a room at another folder. Nothing is moved on disk and agents already running keep the
+   * `cwd` their SDK session was started with; only new agents get the new folder.
+   */
+  z.object({ kind: z.literal("set_room_path"), roomId: z.string(), path: z.string().min(1) }),
   z.object({ kind: z.literal("list_rooms") }),
+  // Projects. `open_project` is per-socket: it changes what *this* tab is looking at, and the
+  // server answers with that project's rooms, sessions, tasks and messages. Another tab watching
+  // another factory is unaffected — which is the whole point of the active project being a
+  // property of the socket rather than of the server.
+  z.object({ kind: z.literal("list_projects") }),
+  z.object({
+    kind: z.literal("create_project"),
+    /** Absolute path of an existing directory. The server refuses anything else. */
+    root: z.string().min(1),
+    name: z.string().min(1).max(120).optional(),
+  }),
+  z.object({ kind: z.literal("open_project"), projectId: z.string() }),
   // Tasks. `roomId` omitted on create means unassigned, which is the intended path: the
   // orchestrator routes it (M3b). On update, `null` is how the operator *clears* an assignment —
   // omitted means "leave it alone", so the two have to be distinguishable on the wire.
@@ -194,6 +238,17 @@ export const ServerMessage = z.discriminatedUnion("kind", [
    * a message nobody has picked up yet looks different from one in flight.
    */
   z.object({ kind: z.literal("messages"), messages: z.array(MessageInfo) }),
+  /**
+   * Every project on this server, plus the one *this socket* is looking at. The active id travels
+   * with the list because it is per-socket state: two tabs get the same projects and different
+   * active ids, and a client that had to remember which `open_project` it sent last would get it
+   * wrong the moment the server changed it (a fresh tab lands on the last-opened project).
+   */
+  z.object({
+    kind: z.literal("projects"),
+    projects: z.array(ProjectInfo),
+    activeProjectId: z.string(),
+  }),
   z.object({ kind: z.literal("error"), message: z.string() }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;
