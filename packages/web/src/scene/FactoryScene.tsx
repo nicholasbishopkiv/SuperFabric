@@ -3,7 +3,9 @@ import { Canvas, useThree } from "@react-three/fiber";
 import { useEffect } from "react";
 import { useFabric, useHasMotion } from "../store";
 import { Buildings } from "./Buildings";
+import { Conveyors } from "./Conveyor";
 import { Floor } from "./Floor";
+import { Packages } from "./Packages";
 import { ISO_CAMERA_POSITION, ISO_ZOOM, ISO_ZOOM_MAX, ISO_ZOOM_MIN } from "./layout";
 
 /**
@@ -44,7 +46,9 @@ export function FactoryScene() {
         shadow-camera-far={200}
       />
       <Floor />
+      <Conveyors />
       <Buildings />
+      <Packages />
       <MapControls
         makeDefault
         enableRotate={false}
@@ -67,10 +71,14 @@ function RedrawOnStoreChange() {
   const rooms = useFabric((s) => s.rooms);
   const sessions = useFabric((s) => s.sessions);
   const selectedRoomId = useFabric((s) => s.selectedRoomId);
+  // `packages` matters in both directions: one frame to draw a new box at the start of its belt, and
+  // one more after the last one is reaped to erase it — by then `hasMotion` is false again and the
+  // loop is back on demand, so that final frame has to be asked for.
+  const packages = useFabric((s) => s.packages);
 
   useEffect(() => {
     invalidate();
-  }, [invalidate, rooms, sessions, selectedRoomId]);
+  }, [invalidate, rooms, sessions, selectedRoomId, packages]);
 
   return null;
 }

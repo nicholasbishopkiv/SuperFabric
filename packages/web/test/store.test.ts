@@ -9,7 +9,7 @@ beforeEach(() => {
   useFabric.setState({
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
-    selectedRoomId: null, roomStatus: {},
+    selectedRoomId: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
   });
 });
 
@@ -390,25 +390,147 @@ describe("liveAgentCount", () => {
   });
 });
 
+describe("conveyors", () => {
+  const project = room({ id: "p", name: "fabrica", path: "/p", kind: "project", position: { x: 0, z: 0 } });
+  const key = (c: { from: string; to: string }) => [c.from, c.to].sort().join("|");
+  const belts = () => useFabric.getState().conveyors.map(key).sort();
+
+  it("has no belts on an empty floor", () => {
+    expect(useFabric.getState().conveyors).toEqual([]);
+  });
+
+  it("joins every workshop to the project building", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+    expect(belts()).toEqual(["p|r1", "p|r2"]);
+  });
+
+  it("does not connect the project building to itself", () => {
+    apply({ kind: "rooms", rooms: [project] });
+    expect(useFabric.getState().conveyors).toEqual([]);
+  });
+
+  it("adds a belt for a pair of rooms that exchanged a package", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+    useFabric.getState().sendPackage("r1", "r2", 50);
+    expect(belts()).toEqual(["p|r1", "p|r2", "r1|r2"]);
+  });
+
+  it("does not double up a belt that already exists", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }) ] });
+    useFabric.getState().sendPackage("p", "r1", 50);
+    useFabric.getState().sendPackage("r1", "p", 50);
+    expect(belts()).toEqual(["p|r1"]);
+  });
+
+  it("counts a pair as one belt however the package was addressed", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+    useFabric.getState().sendPackage("r1", "r2", 50);
+    useFabric.getState().sendPackage("r2", "r1", 50);
+    expect(belts()).toEqual(["p|r1", "p|r2", "r1|r2"]);
+  });
+
+  it("keeps a belt after its package has been reaped — the channel exists now", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+    useFabric.getState().sendPackage("r1", "r2", 50);
+    useFabric.getState().reapPackages(Date.now() + 1000);
+    expect(useFabric.getState().packages).toEqual([]);
+    expect(belts()).toContain("r1|r2");
+  });
+
+  it("keeps the belt list referentially stable when nothing about it changed", () => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" })] });
+    const before = useFabric.getState().conveyors;
+
+    apply({ kind: "sessions", sessions: [session({ roomId: "r1", status: "working" })] });
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1", agentCount: 1 })] });
+    useFabric.getState().sendPackage("p", "r1", 50);
+
+    expect(useFabric.getState().conveyors).toBe(before);
+  });
+});
+
+describe("packages", () => {
+  const project = room({ id: "p", name: "fabrica", path: "/p", kind: "project", position: { x: 0, z: 0 } });
+
+  beforeEach(() => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+  });
+
+  it("sends a package between the two rooms it was addressed to", () => {
+    const before = Date.now();
+    useFabric.getState().sendPackage("r1", "r2", 1234);
+
+    const [pkg, ...rest] = useFabric.getState().packages;
+    expect(rest).toEqual([]);
+    expect(pkg.from).toBe("r1");
+    expect(pkg.to).toBe("r2");
+    expect(pkg.durationMs).toBe(1234);
+    expect(pkg.startedAt).toBeGreaterThanOrEqual(before);
+    expect(pkg.id).not.toBe("");
+  });
+
+  it("gives every package its own id, even two sent in the same millisecond", () => {
+    useFabric.getState().sendPackage("r1", "r2", 50);
+    useFabric.getState().sendPackage("r1", "r2", 50);
+    const [a, b] = useFabric.getState().packages;
+    expect(a.id).not.toBe(b.id);
+  });
+
+  it("refuses to send a package from a room to itself", () => {
+    useFabric.getState().sendPackage("r1", "r1");
+    expect(useFabric.getState().packages).toEqual([]);
+  });
+
+  it("reaps a package whose travel time has elapsed and keeps the ones still flying", () => {
+    const now = Date.now();
+    useFabric.getState().sendPackage("r1", "r2", 100);
+    useFabric.getState().sendPackage("p", "r1", 10_000);
+
+    useFabric.getState().reapPackages(now + 200);
+
+    expect(useFabric.getState().packages.map((p) => [p.from, p.to])).toEqual([["p", "r1"]]);
+  });
+
+  it("leaves the list alone when nothing has landed", () => {
+    useFabric.getState().sendPackage("r1", "r2", 10_000);
+    const before = useFabric.getState().packages;
+    useFabric.getState().reapPackages(Date.now());
+    expect(useFabric.getState().packages).toBe(before);
+  });
+});
+
 describe("hasMotion", () => {
+  const still = { sessions: [], packages: [] };
+
   it("is false for an empty factory", () => {
-    expect(hasMotion({ sessions: [] })).toBe(false);
+    expect(hasMotion(still)).toBe(false);
   });
 
   it("is false while every agent is idle, paused, done or errored", () => {
     for (const status of ["idle", "paused", "done", "error"] as const) {
-      expect(hasMotion({ sessions: [session({ status })] })).toBe(false);
+      expect(hasMotion({ ...still, sessions: [session({ status })] })).toBe(false);
     }
   });
 
   it("is true while any agent is working", () => {
-    expect(hasMotion({ sessions: [session({ status: "idle" }), session({ id: "s2", status: "working" })] }))
-      .toBe(true);
+    expect(hasMotion({
+      ...still,
+      sessions: [session({ status: "idle" }), session({ id: "s2", status: "working" })],
+    })).toBe(true);
   });
 
   it("is false for an agent that is only 'starting'", () => {
     // A Claude Code session that has been spawned but never prompted reports `starting` forever;
     // counting it would leave the canvas on frameloop="always" for the rest of the session.
-    expect(hasMotion({ sessions: [session({ status: "starting" })] })).toBe(false);
+    expect(hasMotion({ ...still, sessions: [session({ status: "starting" })] })).toBe(false);
+  });
+
+  it("is true while a package is in flight, and false again once it is reaped", () => {
+    apply({ kind: "rooms", rooms: [room({ id: "p", kind: "project", position: { x: 0, z: 0 } }), room({ id: "r1" })] });
+    useFabric.getState().sendPackage("p", "r1", 100);
+    expect(hasMotion(useFabric.getState())).toBe(true);
+
+    useFabric.getState().reapPackages(Date.now() + 200);
+    expect(hasMotion(useFabric.getState())).toBe(false);
   });
 });

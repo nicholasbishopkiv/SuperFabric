@@ -23,6 +23,30 @@ export type FactoryStatus = "idle" | "working" | "blocked" | "error";
 /** Precedence: a room shows the most demanding state any of its agents is in. */
 const STATUS_RANK: Record<FactoryStatus, number> = { idle: 0, working: 1, blocked: 2, error: 3 };
 
+/** A belt between two buildings. Undirected: one pair of rooms is one belt, drawn once. */
+export interface Conveyor {
+  from: string;
+  to: string;
+}
+
+/** A box travelling a belt right now. `startedAt` is a wall clock, so the scene needs no tick state. */
+export interface PackageInFlight {
+  id: string;
+  from: string;
+  to: string;
+  startedAt: number;
+  durationMs: number;
+}
+
+/** How long a package takes to cross a belt, unless the caller says otherwise. */
+export const DEFAULT_PACKAGE_MS = 2_400;
+
+/** Ids only have to be unique within a tab's lifetime; a counter is enough and is deterministic. */
+let packageSeq = 0;
+
+/** Undirected key for a pair of rooms. */
+const pairKey = (a: string, b: string): string => (a < b ? `${a}|${b}` : `${b}|${a}`);
+
 export interface FabricState {
   sessions: SessionInfo[];
   /** The factory floor: the project building first, then one workshop per room. */
@@ -43,6 +67,19 @@ export interface FabricState {
    * result. Every room on the floor has an entry, so an empty room is explicitly `idle`.
    */
   roomStatus: Record<string, FactoryStatus>;
+  /**
+   * The belts on the floor: every workshop is joined to the project building, plus any pair of rooms
+   * that has exchanged a package. Derived, so the scene stays declarative and just draws the list.
+   */
+  conveyors: Conveyor[];
+  /** Packages travelling a belt right now. Empty is the normal state. */
+  packages: PackageInFlight[];
+  /**
+   * Pair key -> the room pair, for every pair that has ever exchanged a package. A belt outlives the
+   * package that justified it: the channel between two rooms is a fact about the factory, and having
+   * it appear and vanish with every box would make the floor flicker.
+   */
+  packagedPairs: Record<string, Conveyor>;
   /** sessionId -> events in seq order */
   events: Record<string, EventRow[]>;
   /** sessionId -> highest seq applied (may sit above a gap) */
@@ -59,6 +96,14 @@ export interface FabricState {
   apply(msg: ServerMessage): void;
   setConnected(connected: boolean): void;
   selectRoom(roomId: string | null): void;
+  /**
+   * Put a package on the belt between two rooms. **This is the seam the M3 factory bus plugs into**:
+   * when a real inter-room message exists, the bus calls this and nothing else on the client changes.
+   * Until then the console drawer's manual control is the only caller.
+   */
+  sendPackage(from: string, to: string, durationMs?: number): void;
+  /** Drop packages that have arrived. Called from the render loop and by a per-package timer. */
+  reapPackages(now?: number): void;
 }
 
 /** Everything except the actions — exported so tests can reset between cases. */
@@ -68,6 +113,9 @@ export const initialFabricState = {
   roomIds: [] as string[],
   selectedRoomId: null as string | null,
   roomStatus: {} as Record<string, FactoryStatus>,
+  conveyors: [] as Conveyor[],
+  packages: [] as PackageInFlight[],
+  packagedPairs: {} as Record<string, Conveyor>,
   events: {} as Record<string, EventRow[]>,
   lastSeq: {} as Record<string, number>,
   contiguousSeq: {} as Record<string, number>,
@@ -148,6 +196,48 @@ function nextRoomStatus(
 }
 
 /**
+ * Every belt on the floor: the project building to each workshop (the factory's spine — every room
+ * answers to the project), plus each room pair that has exchanged a package. A pair is listed once,
+ * whichever way round the package went.
+ */
+export function conveyorList(
+  rooms: readonly RoomInfo[],
+  packagedPairs: Record<string, Conveyor>,
+): Conveyor[] {
+  const known = new Set<string>();
+  const belts: Conveyor[] = [];
+  const project = rooms.find((r) => r.kind === "project");
+
+  if (project !== undefined) {
+    for (const r of rooms) {
+      if (r.id === project.id) continue;
+      known.add(pairKey(project.id, r.id));
+      belts.push({ from: project.id, to: r.id });
+    }
+  }
+  const onFloor = new Set(rooms.map((r) => r.id));
+  for (const [key, pair] of Object.entries(packagedPairs)) {
+    // A pair whose room has since been removed has no belt to draw.
+    if (known.has(key) || !onFloor.has(pair.from) || !onFloor.has(pair.to)) continue;
+    known.add(key);
+    belts.push(pair);
+  }
+  return belts;
+}
+
+/** Keeps the previous belt list when it is unchanged, so panning never rebuilds a tube geometry. */
+function nextConveyors(
+  previous: Conveyor[],
+  rooms: readonly RoomInfo[],
+  packagedPairs: Record<string, Conveyor>,
+): Conveyor[] {
+  const belts = conveyorList(rooms, packagedPairs);
+  const unchanged = belts.length === previous.length
+    && belts.every((b, i) => b.from === previous[i].from && b.to === previous[i].to);
+  return unchanged ? previous : belts;
+}
+
+/**
  * The server sends the whole room list on every change, so applying it naively would hand every
  * building a brand-new object and re-render the entire floor because one room moved. Unchanged rows
  * keep their previous identity; an unchanged list is not applied at all.
@@ -169,6 +259,7 @@ function applyRooms(s: FabricState, incoming: RoomInfo[]): Partial<FabricState> 
     // A room that is gone cannot stay selected, or the panel would describe nothing.
     selectedRoomId: s.selectedRoomId !== null && !ids.includes(s.selectedRoomId) ? null : s.selectedRoomId,
     roomStatus: nextRoomStatus(s.roomStatus, rooms, s.sessions),
+    conveyors: nextConveyors(s.conveyors, rooms, s.packagedPairs),
   };
 }
 
@@ -187,7 +278,7 @@ function applySessions(s: FabricState, incoming: SessionInfo[]): Partial<FabricS
   return { sessions, roomStatus: nextRoomStatus(s.roomStatus, s.rooms, sessions) };
 }
 
-export const useFabric = create<FabricState>((set) => ({
+export const useFabric = create<FabricState>((set, get) => ({
   ...initialFabricState,
 
   apply: (msg) =>
@@ -226,6 +317,35 @@ export const useFabric = create<FabricState>((set) => ({
   setConnected: (connected) => set({ connected }),
 
   selectRoom: (roomId) => set({ selectedRoomId: roomId }),
+
+  sendPackage: (from, to, durationMs = DEFAULT_PACKAGE_MS) => {
+    if (from === to) return;
+    set((s) => {
+      const key = pairKey(from, to);
+      const packagedPairs = s.packagedPairs[key] !== undefined
+        ? s.packagedPairs
+        : { ...s.packagedPairs, [key]: { from, to } };
+      return {
+        packages: [
+          ...s.packages,
+          { id: `pkg-${++packageSeq}`, from, to, startedAt: Date.now(), durationMs },
+        ],
+        packagedPairs,
+        conveyors: packagedPairs === s.packagedPairs
+          ? s.conveyors
+          : nextConveyors(s.conveyors, s.rooms, packagedPairs),
+      };
+    });
+    // The scene reaps the frame a package lands, but a backgrounded tab renders no frames at all —
+    // and a package that is never reaped leaves `hasMotion` true forever. Belt and braces.
+    setTimeout(() => get().reapPackages(), durationMs + 80);
+  },
+
+  reapPackages: (now = Date.now()) =>
+    set((s) => {
+      const packages = s.packages.filter((p) => now - p.startedAt < p.durationMs);
+      return packages.length === s.packages.length ? s : { packages };
+    }),
 }));
 
 // ---- per-object selectors ----
@@ -272,8 +392,8 @@ export const useRoomStatus = (roomId: string): FactoryStatus =>
  * its first turn completes — so a freshly created agent nobody has prompted yet stays `starting`
  * indefinitely, and counting it would pin the frameloop to `"always"` for the rest of the session.
  */
-export function hasMotion(state: Pick<FabricState, "sessions">): boolean {
-  return state.sessions.some((s) => s.status === "working");
+export function hasMotion(state: Pick<FabricState, "sessions" | "packages">): boolean {
+  return state.packages.length > 0 || state.sessions.some((s) => s.status === "working");
 }
 
 export const useHasMotion = (): boolean => useFabric(hasMotion);

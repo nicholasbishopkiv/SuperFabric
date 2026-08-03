@@ -58,6 +58,53 @@ function BypassWarning() {
 }
 
 /**
+ * **Placeholder for the M3 factory bus.** There is no inter-room messaging yet, so nothing on the
+ * floor would ever put a package on a belt and the whole channel would be untestable. This control
+ * calls the exact store action the bus will call (`sendPackage(from, to)`) and nothing else, so when
+ * M3 lands the client side is already finished: delete this panel, call the action from a bus message.
+ */
+function PackageSender() {
+  const rooms = useFabric((s) => s.rooms);
+  const sendPackage = useFabric((s) => s.sendPackage);
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+
+  if (rooms.length < 2) {
+    return (
+      <div style={{ color: C.dim, marginBottom: 12 }}>
+        Factory bus (M3 placeholder) — needs two rooms on the floor.
+      </div>
+    );
+  }
+
+  // Default to the project building and the first workshop: the belt that always exists.
+  const source = from !== "" && rooms.some((r) => r.id === from) ? from : rooms[0].id;
+  const target = to !== "" && rooms.some((r) => r.id === to) ? to : rooms[1].id;
+
+  const options = rooms.map((r) => (
+    <option key={r.id} value={r.id}>
+      {r.name}
+    </option>
+  ));
+
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginBottom: 12 }}>
+      <span style={{ color: C.dim }}>Factory bus (M3 placeholder):</span>
+      <select aria-label="Package from" value={source} onChange={(e) => setFrom(e.target.value)} style={{ font: "inherit" }}>
+        {options}
+      </select>
+      <span style={{ color: C.dim }}>→</span>
+      <select aria-label="Package to" value={target} onChange={(e) => setTo(e.target.value)} style={{ font: "inherit" }}>
+        {options}
+      </select>
+      <button onClick={() => sendPackage(source, target)} disabled={source === target}>
+        Send a package
+      </button>
+    </div>
+  );
+}
+
+/**
  * The M0 console, moved verbatim out of `App.tsx` and demoted to an overlay: the 3D floor is the
  * primary surface now, and this is the drawer you open to talk to one agent. Its behavior is
  * unchanged — same session list, same autonomy control, same transcript, same approval cards — only
@@ -201,6 +248,8 @@ export function ConsoleDrawer() {
           </div>
         )}
       </div>
+
+      <PackageSender />
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginBottom: 12 }}>
         <span style={{ color: C.dim }}>Autonomy of this agent:</span>
