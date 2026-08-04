@@ -124,7 +124,134 @@ const MIGRATIONS: readonly Migration[] = [
     ALTER TABLE sessions ADD COLUMN is_orchestrator INTEGER NOT NULL DEFAULT 0;
     CREATE INDEX IF NOT EXISTS sessions_orchestrator ON sessions (project_id, is_orchestrator);
   `,
+  // 8 — M3b, the Chronicle: decisions, and one FTS5 index over them and over what was actually said.
+  migrateChronicle,
 ];
+
+/**
+ * The event types worth indexing, and the JSON path each keeps its text at.
+ *
+ * **Not every event.** The log holds every `agent_text`, every `tool_use` input and every
+ * `tool_result` output; a file an agent read is in there verbatim, and indexing all of it would
+ * roughly double the largest table in the file to make "the contents of package.json" searchable as
+ * if someone had said it. So the Chronicle indexes what *carries meaning* — what an agent said
+ * (`agent_text`), what it was asked (`user_prompt`), and the one-line status an agent reports about
+ * itself (`session_status.detail`) — and leaves the mechanical bulk out. A `tool_result` is evidence,
+ * not reasoning; the ADR file is where the reasoning goes.
+ *
+ * One expression, used by the trigger and by the backfill (which read the same column under
+ * different qualifiers), so the predicate cannot end up being two things.
+ */
+const CHRONICLE_EVENT_TYPES = "('agent_text', 'user_prompt', 'session_status')";
+const chronicleEventText = (row: string): string =>
+  `COALESCE(json_extract(${row}.payload, '$.text'), json_extract(${row}.payload, '$.detail'), '')`;
+
+/**
+ * Migration 8: the Chronicle — an ADR row per decision, plus one FTS5 index spanning decisions *and*
+ * the event log's meaningful text, so a single query answers "why is this the way it is?" from both
+ * the reasoning that was written down and what was actually said at the time.
+ *
+ * A function rather than SQL because the trigger bodies and the backfill share generated predicates,
+ * and because the backfill has to run inside the same transaction as the schema it fills.
+ *
+ * **Repo-native first.** The row is an *index entry*: the artefact is the markdown file
+ * `<project>/docs/decisions/NNNN-<slug>.md` that `Chronicle.record` writes, and a grep in a checkout
+ * with no SuperFabric running has to find the reasoning. Nothing here is the source of truth for a
+ * decision; `decisions.path` records which file is.
+ *
+ * **Kept in sync by triggers, not by explicit inserts.** The FTS table is an index over two tables,
+ * and putting the sync in SQL next to them means every write path is indexed by construction — the
+ * one in `EventStore.append` today, the backfill below, and whatever writes next. Both sources are
+ * append-only (the event log by design; a decision is the record of a moment and is never edited),
+ * so AFTER INSERT is the entire contract: there is no UPDATE or DELETE path for the index to drift
+ * through. The cost is that a write happens outside TypeScript's sight, which is what the tests in
+ * `chronicle.test.ts` (an ordinary `EventStore.append` becomes searchable) exist to hold down.
+ */
+function migrateChronicle(db: Db): void {
+  db.exec(`
+    -- No foreign keys, for the same reason 'events' has none: a decision must outlive the room,
+    -- session or task it names. The reasoning is the thing worth keeping longest.
+    CREATE TABLE IF NOT EXISTS decisions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      room_id TEXT,
+      agent_id TEXT,
+      task_id TEXT,
+      -- The ADR's number and the file it was written to. Not decoration: without them the row
+      -- cannot point at the artefact it indexes, and search could only quote it, never open it.
+      number INTEGER NOT NULL,
+      path TEXT NOT NULL,
+      title TEXT NOT NULL,
+      context TEXT NOT NULL DEFAULT '',
+      decision TEXT NOT NULL,
+      alternatives TEXT NOT NULL DEFAULT '',
+      links TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS decisions_project ON decisions (project_id, created_at);
+
+    -- One index, two sources, discriminated by 'kind'. A separate table per source would mean every
+    -- search is a UNION whose two halves rank on different scales — and the whole point is that one
+    -- query searches decisions and what was said.
+    --
+    -- UNINDEXED columns are stored and retrievable but contribute no tokens, so scoping a search to
+    -- one factory does not also make the word "project" match every row in it.
+    CREATE VIRTUAL TABLE IF NOT EXISTS chronicle_fts USING fts5(
+      title,
+      body,
+      kind UNINDEXED,
+      ref UNINDEXED,            -- decision id, or the session id an event belongs to
+      seq UNINDEXED,            -- event seq; 0 for a decision
+      project_id UNINDEXED,
+      room_id UNINDEXED,
+      created_at UNINDEXED,
+      tokenize = 'porter unicode61'
+    );
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
+      INSERT INTO chronicle_fts (title, body, kind, ref, seq, project_id, room_id, created_at)
+      VALUES (
+        new.title,
+        new.context || char(10) || new.decision || char(10) || new.alternatives || char(10) || new.links,
+        'decision', new.id, 0, new.project_id, new.room_id, new.created_at
+      );
+    END;
+  `);
+
+  // The session's project and room are copied in at insert time rather than joined at query time:
+  // the log outlives the session row it describes, and a search that lost its scope the day someone
+  // deleted a session would be a search that quietly stops finding things.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS events_ai AFTER INSERT ON events
+    WHEN new.type IN ${CHRONICLE_EVENT_TYPES}
+     AND ${chronicleEventText("new")} <> ''
+    BEGIN
+      INSERT INTO chronicle_fts (title, body, kind, ref, seq, project_id, room_id, created_at)
+      VALUES (
+        new.type,
+        ${chronicleEventText("new")},
+        'event', new.session_id, new.seq,
+        (SELECT project_id FROM sessions WHERE id = new.session_id),
+        (SELECT room_id FROM sessions WHERE id = new.session_id),
+        new.ts
+      );
+    END;
+  `);
+
+  // Backfill, so an upgrade does not produce a chronicle that begins today. Everything an operator's
+  // factory has already said stays findable; the same predicate as the trigger, so the index has one
+  // definition of "meaningful" rather than two that can disagree.
+  db.exec(`
+    INSERT INTO chronicle_fts (title, body, kind, ref, seq, project_id, room_id, created_at)
+    SELECT e.type, ${chronicleEventText("e")},
+           'event', e.session_id, e.seq, s.project_id, s.room_id, e.ts
+    FROM events e LEFT JOIN sessions s ON s.id = e.session_id
+    WHERE e.type IN ${CHRONICLE_EVENT_TYPES}
+      AND ${chronicleEventText("e")} <> ''
+  `);
+}
 
 /**
  * Migration 5: `projects`, a `project_id` on everything scoped to one, and a backfill.

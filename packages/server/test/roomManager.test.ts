@@ -130,6 +130,11 @@ describe("RoomManager", () => {
         expect(charter).toMatch(/arrive as ordinary turns/);
         // …so the one instruction that saves tokens on every turn is explicit.
         expect(charter).toMatch(/Do not poll/);
+        // And the chronicle: search before reworking, record what you decide.
+        expect(charter).toContain("mcp__factory__factory_search_history");
+        expect(charter).toContain("mcp__factory__factory_record_decision");
+        expect(charter).toMatch(/Search before you rework/i);
+        expect(charter).toContain("docs/decisions/");
       });
     });
 

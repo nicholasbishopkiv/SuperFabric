@@ -52,6 +52,19 @@ folders of this project, and you can talk to them:
   ordinary bus message.
 - Do not poll. \`mcp__factory__factory_inbox\` is for re-reading traffic you already have, never for
   checking whether any arrived — it arrives on its own.
+
+## The chronicle
+
+- **Search before you rework anything.** \`mcp__factory__factory_search_history(query)\` searches this
+  project's recorded decisions *and* what agents have actually said. Run it before you replace,
+  reverse or argue with something that already exists: the reason it is that way is usually written
+  down, and rediscovering it costs more than reading it.
+- **Record what you decide.** When a choice shapes how this project is built — an interface another
+  room relies on, a technology, a convention — write it down with
+  \`mcp__factory__factory_record_decision(title, context, decision, alternatives?, links?)\`. It
+  becomes an ADR file in \`docs/decisions/\`, which is a file in this repository and is there for
+  whoever works on it next, with or without SuperFabric running. Record the reasoning, not just the
+  outcome.
 `;
 }
 

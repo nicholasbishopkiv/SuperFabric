@@ -3,6 +3,7 @@ import path from "node:path";
 import Fastify from "fastify";
 import { WebSocketServer, type WebSocket } from "ws";
 import { registerAttachmentRoutes } from "./attachmentRoutes.js";
+import { Chronicle } from "./chronicle.js";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
 import { FactoryBus } from "./factoryBus.js";
@@ -28,6 +29,9 @@ const store = new EventStore(db);
 const projects = new ProjectManager(db, projectRoot);
 const rooms = new RoomManager(db, projects);
 const tasks = new TaskStore(db, projects);
+// The Chronicle writes into the operator's own repository (docs/decisions/), so it needs the project
+// roots and nothing else — the FTS index over it and over the event log is kept in step by triggers.
+const chronicle = new Chronicle(db, projects);
 // The bus and the session runner need each other: the bus delivers *through* the runner, and the
 // runner hands every agent the bus as tools and flushes the bus at each turn boundary. The bus takes
 // callbacks rather than the runner itself, so the dependency stays one-way in the module graph — and
@@ -49,7 +53,7 @@ const router = new TaskRouter({
   orchestratorFor: (projectId) => mgr.orchestratorFor(projectId),
   roomAgents: (roomId) => mgr.roomAgents(roomId),
 });
-mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, { bus, tasks, router });
+mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, { bus, tasks, router, chronicle });
 const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router });
 
 const bootProject = projects.defaultProject();

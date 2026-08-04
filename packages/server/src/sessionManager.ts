@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { FACTORY_MCP_SERVER_NAME, busTools } from "./busTools.js";
+import type { Chronicle } from "./chronicle.js";
 import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
@@ -57,6 +58,8 @@ export interface SessionManagerOptions {
   tasks?: TaskStore;
   /** Task routing. Only the orchestrator's tool set uses it; absent is a valid M3a-shaped server. */
   router?: TaskRouter;
+  /** The Chronicle. Absent => no agent gets the decision tools; see `BusToolsDeps.chronicle`. */
+  chronicle?: Chronicle;
 }
 
 export class SessionManager {
@@ -302,7 +305,9 @@ export class SessionManager {
         // ordinary agent's tool list simply does not contain the routing tools. (Calling one anyway
         // is still refused inside the handler — see `busTools`.)
         isOrchestrator,
+        sessionId,
         ...(this.opts.router !== undefined ? { router: this.opts.router } : {}),
+        ...(this.opts.chronicle !== undefined ? { chronicle: this.opts.chronicle } : {}),
         // factory_report_status is a line in this session's own log: the operator reads the agent's
         // own words next to everything else it did, rather than in a separate channel.
         reportStatus: (summary) => {

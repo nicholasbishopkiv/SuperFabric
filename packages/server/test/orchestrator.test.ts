@@ -188,6 +188,12 @@ describe("the orchestrator", () => {
       expect(ORCHESTRATOR_SYSTEM_PROMPT).toContain("mcp__factory__factory_record_decision");
     });
 
+    it("tells it to record direction decisions and to search before reworking anything", () => {
+      expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/search before reworking/i);
+      expect(ORCHESTRATOR_SYSTEM_PROMPT).toContain("mcp__factory__factory_search_history");
+      expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/record the reasoning/i);
+    });
+
     it("stays short enough to be read once", () => {
       expect(ORCHESTRATOR_SYSTEM_PROMPT.length).toBeLessThan(3000);
     });
