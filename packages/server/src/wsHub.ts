@@ -1,8 +1,11 @@
-import { ClientMessage, type ServerMessage } from "@superfabric/shared";
+import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@superfabric/shared";
+import type { Chronicle } from "./chronicle.js";
 import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
+import { ensureOrchestrator } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
 import type { RoomManager } from "./roomManager.js";
+import type { TaskRouter } from "./router.js";
 import type { SessionManager } from "./sessionManager.js";
 import type { TaskStore } from "./taskStore.js";
 
@@ -26,6 +29,17 @@ export interface WsHubOptions {
   tasks?: TaskStore;
   /** The factory bus. Absent => no `messages` broadcasts (there is no traffic to report). */
   bus?: FactoryBus;
+  /**
+   * Task routing. Absent => an unassigned task is simply left unassigned and `route_task` is refused
+   * with an error, which is the same shape as a server with no board.
+   */
+  router?: TaskRouter;
+  /**
+   * The chronicle. Absent => `search_chronicle` is refused with an error rather than answered with
+   * an empty list: "this server records no decisions" and "nobody has decided anything" are
+   * different facts, and a surface that showed the second for the first would be lying.
+   */
+  chronicle?: Chronicle;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -50,6 +64,8 @@ export class WsHub {
   private readonly broadcastDebounceMs: number;
   private readonly tasks: TaskStore | undefined;
   private readonly bus: FactoryBus | undefined;
+  private readonly router: TaskRouter | undefined;
+  private readonly chronicle: Chronicle | undefined;
 
   constructor(
     private store: EventStore,
@@ -61,6 +77,8 @@ export class WsHub {
     this.broadcastDebounceMs = opts.sessionsDebounceMs ?? BROADCAST_DEBOUNCE_MS;
     this.tasks = opts.tasks;
     this.bus = opts.bus;
+    this.router = opts.router;
+    this.chronicle = opts.chronicle;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -196,6 +214,29 @@ export class WsHub {
         case "list_sessions":
           this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions(this.activeProject(sock)) });
           break;
+        // The factory's senior agent. Idempotent, so the UI can call it from a button without first
+        // asking whether one exists; the answer is the same fresh `sessions` list either way, and the
+        // socket is subscribed to it so the operator can watch it work. It stands in the project room,
+        // so the central building's agent count changes too.
+        case "ensure_orchestrator": {
+          const projectId = this.activeProject(sock);
+          const { sessionId, created } = ensureOrchestrator(
+            { sessions: this.mgr, rooms: this.rooms }, projectId,
+          );
+          if (created) {
+            this.broadcastSessions();
+            this.broadcastRooms();
+            this.safeSend(sock, {
+              kind: "notice",
+              message: "the orchestrator is on the floor, in the project room — give it a task with "
+                + "no room and it will route it",
+            });
+          } else {
+            this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions(projectId) });
+          }
+          this.subscribe(sock, sessionId, 0);
+          break;
+        }
         // Rooms: each case answers with the whole room list rather than a delta, so a client can
         // rebuild the floor from one message and never has to merge. A failure (duplicate name,
         // unknown id) throws into the catch below and is reported as an error instead.
@@ -255,12 +296,31 @@ export class WsHub {
         // changes (see the constructor), which is the only way the board also stays right for the
         // changes that never come through this hub. An unknown task or an assignee from the wrong
         // room throws into the catch below and is reported to the socket that asked.
-        case "create_task":
-          this.taskStore().create({
+        case "create_task": {
+          const task = this.taskStore().create({
             title: msg.title, detail: msg.detail, roomId: msg.roomId,
             projectId: this.activeProject(sock),
           });
+          // A card with no room is the intended path, and this is where routing starts: the
+          // orchestrator is sent a message describing it and the floor. With no orchestrator nothing
+          // is sent and nothing changes — the task stays visibly unassigned, which is the truth.
+          if (task.roomId === null && this.router !== undefined) this.router.requestRouting(task.id);
           break;
+        }
+        // The board's "route it": ask again, for a card that was created before this factory had an
+        // orchestrator or whose question went unanswered. Never assigns anything itself.
+        case "route_task": {
+          const router = this.taskRouter();
+          const sent = router.requestRouting(msg.taskId);
+          this.safeSend(sock, sent === undefined
+            ? {
+              kind: "notice",
+              message: "this factory has no orchestrator yet, so the task stays unassigned — create "
+                + "one and route it again",
+            }
+            : { kind: "notice", message: "the orchestrator has been asked where this task belongs" });
+          break;
+        }
         case "update_task":
           this.taskStore().update(msg.taskId, {
             ...(msg.status !== undefined ? { status: msg.status } : {}),
@@ -276,6 +336,21 @@ export class WsHub {
         case "list_messages":
           this.safeSend(sock, { kind: "messages", messages: this.busStore().list(this.activeProject(sock)) });
           break;
+        // The chronicle, as the operator's own copy of `factory_search_history`: the same index, the
+        // same hits, answered to the socket that asked. An empty query is "show me what has been
+        // decided here", which is the question someone opening the surface actually has.
+        case "search_chronicle": {
+          const chronicle = this.chronicleStore();
+          const projectId = this.activeProject(sock);
+          const limit = msg.limit ?? CHRONICLE_SEARCH_LIMIT;
+          const hits = msg.query.trim() === ""
+            ? chronicle.recentHits(projectId, limit)
+            : chronicle.search(projectId, msg.query, limit);
+          // The query travels back with its answer so a client can drop the results of a search it
+          // has already moved on from — see `chronicle` in the protocol.
+          this.safeSend(sock, { kind: "chronicle", query: msg.query, hits });
+          break;
+        }
       }
     } catch (err) {
       this.safeSend(sock, { kind: "error", message: String(err) });
@@ -397,10 +472,22 @@ export class WsHub {
     }
   }
 
+  /** Likewise for the router: a factory with no routing says so rather than swallowing the request. */
+  private taskRouter(): TaskRouter {
+    if (this.router === undefined) throw new Error("this server has no task router");
+    return this.router;
+  }
+
   /** A task request on a server with no task board is a routing error, not a silent no-op. */
   private taskStore(): TaskStore {
     if (this.tasks === undefined) throw new Error("this server has no task board");
     return this.tasks;
+  }
+
+  /** Likewise for the chronicle: no index is not the same answer as an empty index. */
+  private chronicleStore(): Chronicle {
+    if (this.chronicle === undefined) throw new Error("this server has no chronicle");
+    return this.chronicle;
   }
 
   /** Likewise for the bus: "no factory bus here" is an answer, an empty list would be a lie. */

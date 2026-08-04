@@ -161,6 +161,17 @@ export class TaskStore {
     return (this.stmts.list.all(projectId) as TaskRow[]).map(toTaskInfo);
   }
 
+  /**
+   * Which factory a card belongs to, or `undefined` for an unknown task. The twin of
+   * `RoomManager.projectOf`, and for the same reason: routing has a task id and needs the floor it
+   * stands on, without carrying a project through its own call chain.
+   */
+  projectOf(taskId: string): string | undefined {
+    // `== null`, not `=== undefined`: "no such row" is `null` for the driver db.ts uses.
+    const row = this.stmts.taskProject.get(taskId) as { project_id: string | null } | null;
+    return row == null || row.project_id === null ? undefined : row.project_id;
+  }
+
   /** `undefined` for an unknown id — the absent-row shape the rest of the package speaks. */
   get(taskId: string): TaskInfo | undefined {
     // `== null`, not `=== undefined`: "no such row" is `null` for the driver db.ts uses.

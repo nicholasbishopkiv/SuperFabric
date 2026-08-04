@@ -216,6 +216,40 @@ export type SavedAttachment = z.infer<typeof SavedAttachment>;
 export const AttachmentUploadResult = z.object({ saved: z.array(SavedAttachment) });
 export type AttachmentUploadResult = z.infer<typeof AttachmentUploadResult>;
 
+// ---- M3b: the chronicle ----
+
+/**
+ * One hit from the project's chronicle: enough to act on without opening anything.
+ *
+ * The chronicle spans two sources at once — the decisions someone wrote down, and what agents
+ * actually said at the time — and a hit says which it is, because they carry different authority. A
+ * `decision` is reasoning that was committed to a file in the repository (`path`); an `event` is a
+ * line from a session's log, which is evidence rather than a ruling.
+ *
+ * The shape is the server's `Chronicle.search` result, declared here so the two cannot drift: the
+ * server imports this type rather than describing the same fields a second time.
+ */
+export const ChronicleHit = z.object({
+  kind: z.enum(["decision", "event"]),
+  /** The decision's title, or the event's type. */
+  title: z.string(),
+  /** The matching part of the body, with an ellipsis where it was cut. */
+  snippet: z.string(),
+  /** Unix **seconds** — the resolution the chronicle's own timestamps have. */
+  createdAt: z.number().int(),
+  /** Decision id, or the session id whose log this came from. */
+  ref: z.string(),
+  /** Event seq within that session's log; 0 for a decision. */
+  seq: z.number().int(),
+  roomId: z.string().nullable(),
+  /** Absolute path of the ADR file, for a decision. `null` for an event, which has no file. */
+  path: z.string().nullable(),
+});
+export type ChronicleHit = z.infer<typeof ChronicleHit>;
+
+/** How many hits a chronicle search answers with when the client does not say. */
+export const CHRONICLE_SEARCH_LIMIT = 10;
+
 // ---- client -> server ----
 export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("subscribe"), sessionId: z.string(), afterSeq: z.number().int().nonnegative() }),
@@ -239,6 +273,16 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    */
   z.object({ kind: z.literal("set_model"), sessionId: z.string(), model: ModelId.nullable() }),
   z.object({ kind: z.literal("list_sessions") }),
+  /**
+   * Give this factory its orchestrator, or hand back the one it already has.
+   *
+   * Idempotent by design and deliberately argument-free: the orchestrator's room (the project room),
+   * its role prompt and its tool surface are the server's to decide, not a client's — an operator
+   * hand-building a session and hoping it lands in the right room with the right append is exactly
+   * the failure this message exists to prevent. Answered with the fresh `sessions` list, in which
+   * exactly one entry carries `isOrchestrator`.
+   */
+  z.object({ kind: z.literal("ensure_orchestrator") }),
   /**
    * `path` is the room's working folder. Omitted, the room is `<project root>/<name>` and must stay
    * inside the root; given, it is used as-is and may point anywhere — a department is allowed to
@@ -280,6 +324,16 @@ export const ClientMessage = z.discriminatedUnion("kind", [
     roomId: z.string().nullable().optional(),
     agentId: z.string().nullable().optional(),
   }),
+  /**
+   * Ask the orchestrator where an unassigned task belongs — the board's "route it" affordance, and
+   * the same round trip `create_task` starts on its own for a card created with no room.
+   *
+   * Explicit rather than implicit because routing is a *model* decision that may be slow or wrong:
+   * an operator who has since created the orchestrator, or who wants the question asked again, needs
+   * a way to say so. Nothing is assigned by this message — it sends a question, and the task stays
+   * visibly unassigned until the orchestrator answers.
+   */
+  z.object({ kind: z.literal("route_task"), taskId: z.string() }),
   z.object({ kind: z.literal("list_tasks") }),
   /**
    * The bus's recent traffic. A client needs this on connect for two reasons: a message still
@@ -288,6 +342,23 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * queue until something changes, or replays an hour of history as packages on the belt.
    */
   z.object({ kind: z.literal("list_messages") }),
+  /**
+   * Search this project's chronicle — the same index `factory_search_history` gives agents.
+   *
+   * A **query**, answered to the asking socket alone: two operators searching different words in two
+   * tabs must not overwrite each other's results, and nobody else's screen should change because
+   * someone typed in a search box.
+   *
+   * An empty query is not an error and not "match everything": it asks for the newest recorded
+   * decisions, so opening the surface shows what this factory has decided rather than an empty box.
+   * Anything an agent could type is accepted verbatim — FTS5 operators are neutralised server-side
+   * (`ftsQuery`), so a stray quote is a search, not a syntax error.
+   */
+  z.object({
+    kind: z.literal("search_chronicle"),
+    query: z.string().max(500).default(""),
+    limit: z.number().int().min(1).max(50).optional(),
+  }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -308,6 +379,13 @@ export const SessionInfo = z.object({
   model: z.string().nullable(),
   /** The room this agent works in, or null for a roomless session (every M0 session). */
   roomId: z.string().nullable(),
+  /**
+   * This agent is the factory's orchestrator: the senior agent that routes work, unblocks rooms and
+   * decides direction. It is an ordinary session in every other respect — same runtime, same event
+   * log, same room (the project room) — so this is a flag on `SessionInfo` rather than a separate
+   * kind of thing the client has to model. At most one per project.
+   */
+  isOrchestrator: z.boolean(),
   /**
    * Derived from the session's own event log: the latest `session_status`, or `idle` when it has
    * none. The 3D floor needs the *current* status of every agent, and subscribing to every session
@@ -357,5 +435,19 @@ export const ServerMessage = z.discriminatedUnion("kind", [
    * event log instead.
    */
   z.object({ kind: z.literal("notice"), message: z.string() }),
+  /**
+   * The answer to one `search_chronicle`, **carrying the query it answers**.
+   *
+   * The echo is load-bearing: a search box sends a request per keystroke-ish and the answers come
+   * back over a socket in no guaranteed order, so a client that stored whatever arrived last would
+   * show the results for a word the operator has already finished deleting. With the query on the
+   * frame, an answer that is not the question currently being asked is simply dropped.
+   */
+  z.object({
+    kind: z.literal("chronicle"),
+    /** The query as asked. Empty means "the newest decisions", which is what an empty box shows. */
+    query: z.string(),
+    hits: z.array(ChronicleHit),
+  }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;

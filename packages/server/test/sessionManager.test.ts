@@ -712,6 +712,7 @@ describe("SessionManager", () => {
         expect(Object.keys(opts.mcpServers ?? {})).toEqual(["factory"]);
         expect(toolsOf(opts)).toEqual([
           "factory_send", "factory_inbox", "factory_task_update", "factory_report_status",
+          "factory_ask_orchestrator",
         ]);
       });
     });

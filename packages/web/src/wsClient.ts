@@ -90,6 +90,16 @@ export function createProject(root: string, name?: string): void {
   send({ kind: "create_project", root, ...(name !== undefined && name !== "" ? { name } : {}) });
 }
 
+/**
+ * Ask the chronicle a question. Two steps that must not come apart: the store records *which*
+ * question is outstanding, and the socket carries it — the answer is checked against the first, so a
+ * send that skipped it would produce hits the store then throws away as stale.
+ */
+export function searchChronicle(query: string): void {
+  useFabric.getState().askChronicle(query);
+  send({ kind: "search_chronicle", query });
+}
+
 export function subscribe(sessionId: string): void {
   subscribed.add(sessionId);
   const { contiguousSeq } = useFabric.getState();

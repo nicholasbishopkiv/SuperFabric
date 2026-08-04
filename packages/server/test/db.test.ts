@@ -490,6 +490,203 @@ describe("db", () => {
     }
   });
 
+  // ---- migration 7: the orchestrator flag ----
+
+  it("adds sessions.is_orchestrator, defaulting every existing agent to 'ordinary'", () => {
+    const db = openDb(":memory:");
+    const cols = db.prepare("SELECT name, \"notnull\", dflt_value FROM pragma_table_info('sessions')")
+      .all() as { name: string; notnull: number; dflt_value: string | null }[];
+    const flag = cols.find(c => c.name === "is_orchestrator");
+    expect(flag).toBeDefined();
+    expect(flag!.notnull).toBe(1);
+    expect(flag!.dflt_value).toBe("0");
+    // an insert that says nothing about the role creates an ordinary agent
+    db.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("s1", "/tmp");
+    expect(db.prepare("SELECT is_orchestrator FROM sessions WHERE id = 's1'").get())
+      .toEqual({ is_orchestrator: 0 });
+  });
+
+  it("indexes 'does this factory have an orchestrator', which routing asks per task", () => {
+    const db = openDb(":memory:");
+    const indexes = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='sessions'")
+      .all() as { name: string }[]).map(i => i.name);
+    expect(indexes).toContain("sessions_orchestrator");
+    const plan = db.prepare(
+      "EXPLAIN QUERY PLAN SELECT id FROM sessions WHERE project_id = ? AND is_orchestrator = 1",
+    ).all("p1") as { detail: string }[];
+    expect(plan.map(p => p.detail).join(" ")).toMatch(/sessions_orchestrator|sessions_project/);
+  });
+
+  it("upgrades a user_version = 6 database, leaving every agent an ordinary one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-v6-"));
+    try {
+      const path = join(dir, "v6.db");
+      // A database exactly as migration 6 left it.
+      const v6 = new Database(path);
+      v6.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, claude_session_id TEXT,
+          state TEXT NOT NULL DEFAULT 'active', cwd TEXT NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          autonomy TEXT NOT NULL DEFAULT 'auto', room_id TEXT, project_id TEXT, model TEXT
+        );
+        CREATE TABLE events (
+          session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          ts INTEGER NOT NULL DEFAULT (unixepoch()),
+          type TEXT NOT NULL, payload TEXT NOT NULL,
+          PRIMARY KEY (session_id, seq)
+        );
+        CREATE TABLE projects (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()), last_opened_at INTEGER
+        );
+        CREATE TABLE rooms (
+          id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'room',
+          pos_x REAL NOT NULL DEFAULT 0, pos_z REAL NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()), UNIQUE (project_id, name)
+        );
+      `);
+      v6.exec("PRAGMA user_version = 6");
+      v6.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
+      v6.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
+        .run("r1", "p1", "payments", "/code/shop/payments");
+      v6.prepare("INSERT INTO sessions (id, cwd, autonomy, room_id, project_id, model) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("s1", "/code/shop/payments", "bypass", "r1", "p1", "claude-haiku-4-5");
+      v6.close();
+
+      const db = openDb(path);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(7);
+      // The existing agent is untouched, and it is not promoted: a factory that had no orchestrator
+      // before this column must still have none, rather than acquiring one by accident.
+      expect(db.prepare("SELECT autonomy, room_id, project_id, model, is_orchestrator FROM sessions WHERE id = 's1'").get())
+        .toEqual({ autonomy: "bypass", room_id: "r1", project_id: "p1", model: "claude-haiku-4-5", is_orchestrator: 0 });
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the orchestrator flag across a reopen, which is what resume re-applies", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-orchestrator-"));
+    try {
+      const path = join(dir, "test.db");
+      const first = openDb(path);
+      first.prepare("INSERT INTO sessions (id, cwd, is_orchestrator) VALUES (?, ?, 1)").run("s1", "/tmp");
+      first.close();
+      const second = openDb(path);
+      expect(second.prepare("SELECT is_orchestrator FROM sessions WHERE id = 's1'").get())
+        .toEqual({ is_orchestrator: 1 });
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ---- migration 8: the Chronicle ----
+
+  it("creates decisions and an FTS5 index over it", () => {
+    const db = openDb(":memory:");
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as
+      { name: string }[]).map(t => t.name);
+    expect(tables).toEqual(expect.arrayContaining(["decisions", "chronicle_fts"]));
+    // fts5 specifically — a silent fallback to a plain table would change the feature's shape
+    expect((db.prepare("SELECT sql FROM sqlite_master WHERE name = 'chronicle_fts'").get() as { sql: string }).sql)
+      .toMatch(/USING fts5/i);
+    expect((db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='decisions'")
+      .all() as { name: string }[]).map(i => i.name)).toContain("decisions_project");
+  });
+
+  it("indexes a decision and an event's text through triggers, not through application code", () => {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
+    db.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
+      .run("r1", "p1", "payments", "/code/shop/payments");
+    db.prepare("INSERT INTO sessions (id, cwd, room_id, project_id) VALUES (?, ?, ?, ?)")
+      .run("s1", "/code/shop/payments", "r1", "p1");
+
+    db.prepare(`
+      INSERT INTO decisions (id, project_id, room_id, number, path, title, context, decision)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("d1", "p1", "r1", 1, "/code/shop/docs/decisions/0001-x.md", "Retries", "idempotency key", "payments owns it");
+    db.prepare("INSERT INTO events (session_id, seq, type, payload) VALUES (?, ?, ?, ?)")
+      .run("s1", 1, "agent_text", JSON.stringify({ type: "agent_text", text: "the webhook uses hmac" }));
+    // the bulk the index deliberately skips
+    db.prepare("INSERT INTO events (session_id, seq, type, payload) VALUES (?, ?, ?, ?)")
+      .run("s1", 2, "tool_result", JSON.stringify({ type: "tool_result", toolName: "Read", output: "capybara" }));
+
+    const search = (q: string) =>
+      db.prepare("SELECT kind, ref, project_id, room_id FROM chronicle_fts WHERE chronicle_fts MATCH ?").all(q);
+    expect(search('"idempotency"')).toEqual([{ kind: "decision", ref: "d1", project_id: "p1", room_id: "r1" }]);
+    expect(search('"hmac"')).toEqual([{ kind: "event", ref: "s1", project_id: "p1", room_id: "r1" }]);
+    expect(search('"capybara"')).toEqual([]);
+  });
+
+  it("upgrades a user_version = 7 database and backfills the chronicle from its event log", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-v7-"));
+    try {
+      const path = join(dir, "v7.db");
+      // A database exactly as migration 7 left it, with a factory already in it.
+      const v7 = new Database(path);
+      v7.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, claude_session_id TEXT,
+          state TEXT NOT NULL DEFAULT 'active', cwd TEXT NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          autonomy TEXT NOT NULL DEFAULT 'auto', room_id TEXT, project_id TEXT, model TEXT,
+          is_orchestrator INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE events (
+          session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          ts INTEGER NOT NULL DEFAULT (unixepoch()),
+          type TEXT NOT NULL, payload TEXT NOT NULL,
+          PRIMARY KEY (session_id, seq)
+        );
+        CREATE TABLE projects (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()), last_opened_at INTEGER
+        );
+        CREATE TABLE rooms (
+          id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'room',
+          pos_x REAL NOT NULL DEFAULT 0, pos_z REAL NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()), UNIQUE (project_id, name)
+        );
+      `);
+      v7.exec("PRAGMA user_version = 7");
+      v7.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
+      v7.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
+        .run("r1", "p1", "payments", "/code/shop/payments");
+      v7.prepare("INSERT INTO sessions (id, cwd, room_id, project_id, is_orchestrator) VALUES (?, ?, ?, ?, 1)")
+        .run("s1", "/code/shop/payments", "r1", "p1");
+      v7.prepare("INSERT INTO events (session_id, seq, type, payload) VALUES (?, ?, ?, ?)")
+        .run("s1", 1, "agent_text", JSON.stringify({ type: "agent_text", text: "we chose hmac-sha256" }));
+      v7.prepare("INSERT INTO events (session_id, seq, type, payload) VALUES (?, ?, ?, ?)")
+        .run("s1", 2, "tool_result", JSON.stringify({ type: "tool_result", toolName: "Read", output: "capybara" }));
+      v7.close();
+
+      const db = openDb(path);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(8);
+
+      // the existing factory is untouched, orchestrator flag and all
+      expect(db.prepare("SELECT room_id, project_id, is_orchestrator FROM sessions WHERE id = 's1'").get())
+        .toEqual({ room_id: "r1", project_id: "p1", is_orchestrator: 1 });
+      expect((db.prepare("SELECT COUNT(*) c FROM events").get() as { c: number }).c).toBe(2);
+
+      // …and its history is searchable, so the chronicle does not begin on the day of the upgrade
+      const hits = db.prepare("SELECT kind, ref, project_id FROM chronicle_fts WHERE chronicle_fts MATCH ?")
+        .all('"hmac"') as { kind: string; ref: string; project_id: string }[];
+      expect(hits).toEqual([{ kind: "event", ref: "s1", project_id: "p1" }]);
+      // the mechanical bulk is still left out of the backfill, on the same predicate as the trigger
+      expect(db.prepare("SELECT ref FROM chronicle_fts WHERE chronicle_fts MATCH ?").all('"capybara"')).toEqual([]);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("indexes the project scope of every list the operator looks at", () => {
     const db = openDb(":memory:");
     const indexes = (table: string) =>

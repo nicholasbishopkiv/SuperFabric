@@ -209,9 +209,14 @@ export class ClaudeCodeExecutor implements Executor {
     // than guessed at, because an id the CLI does not know is a 404 mid-turn.
     const model = opts.model ?? this.defaults.model;
     if (model) options.model = model;
-    if (this.defaults.appendSystemPrompt) {
+    // Per-session role wins over the process-wide default, exactly as `model` and `autonomy` do: the
+    // orchestrator's charter must not be diluted by whatever the server was started with, and a
+    // session that declares no role still gets the default. Never concatenated — two appends
+    // disagreeing about what an agent is would be worse than either alone.
+    const appendSystemPrompt = opts.appendSystemPrompt ?? this.defaults.appendSystemPrompt;
+    if (appendSystemPrompt) {
       // There is no `appendSystemPrompt` option; appending lives inside the preset object form.
-      options.systemPrompt = { type: "preset", preset: "claude_code", append: this.defaults.appendSystemPrompt };
+      options.systemPrompt = { type: "preset", preset: "claude_code", append: appendSystemPrompt };
     }
     if (this.defaults.configDir) {
       // Options.env REPLACES the subprocess environment (it does not merge), so process.env

@@ -2,8 +2,10 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { McpSdkServerConfigWithInstance, SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { MessageKind, TaskStatus, type MessageInfo } from "@superfabric/shared";
 import { z } from "zod";
+import type { Chronicle } from "./chronicle.js";
 import type { FactoryBus } from "./factoryBus.js";
 import type { RoomManager } from "./roomManager.js";
+import type { TaskRouter } from "./router.js";
 import type { TaskStore } from "./taskStore.js";
 
 /**
@@ -24,6 +26,27 @@ export interface BusToolsDeps {
   roomId: string;
   /** Append a human-readable status line to the calling session's log. */
   reportStatus: (summary: string) => void;
+  /**
+   * This tool set belongs to the factory's orchestrator, so it carries the orchestrator-only tools
+   * as well as the room tools. Comes from the session row (like `roomId`), never from tool input.
+   */
+  isOrchestrator?: boolean;
+  /**
+   * Task routing. Absent => the orchestrator's own tools report that this server has no router,
+   * rather than being silently missing from a tool list that says it is the orchestrator's.
+   */
+  router?: TaskRouter;
+  /**
+   * The Chronicle. Absent => `factory_record_decision` and `factory_search_history` are not in this
+   * session's tool set at all: a tool that cannot write the ADR file it promises is worse than no
+   * tool, because an agent will believe it recorded something.
+   */
+  chronicle?: Chronicle;
+  /**
+   * The calling session, recorded as the author of a decision. Like `roomId`, it comes from the
+   * session that owns this tool set and never from tool input.
+   */
+  sessionId?: string;
 }
 
 /** How many delivered messages `factory_inbox` shows alongside the queue. */
@@ -166,7 +189,211 @@ export function busToolDefinitions(deps: BusToolsDeps): SdkMcpToolDefinition<any
     },
   );
 
-  return [send, inbox, taskUpdate, reportStatusTool];
+  const askOrchestrator = factoryTool(
+    "factory_ask_orchestrator",
+    "Ask the factory's orchestrator — the senior agent in the project room — for a ruling: where "
+      + "something belongs, which of two ways to go, or anything blocking you that is above your "
+      + "room's remit. It answers as an ordinary bus message, so the answer arrives as a turn here. "
+      + "Naming a task blocks that task until the answer comes back.",
+    {
+      question: z.string().min(1).max(8000)
+        .describe("What you need decided. Be specific and self-contained: it cannot see your conversation."),
+      task_id: z.string().optional()
+        .describe("The task this is about, if any. Naming it blocks that task on the question."),
+    },
+    (args) => {
+      const projectId = rooms.projectOf(roomId);
+      if (projectId === undefined) throw new Error(`unknown room ${roomId}`);
+      const projectRoom = rooms.listRooms(projectId).find((r) => r.kind === "project");
+      if (projectRoom === undefined) throw new Error("this factory has no project room to ask");
+      if (projectRoom.id === roomId) {
+        throw new Error("you are in the project room — the orchestrator is here, not somewhere to ask");
+      }
+
+      // An ordinary bus message, sent exactly as `factory_send` would send it. There is no
+      // privileged channel to the orchestrator on purpose: the traffic has to be visible on the
+      // floor and in the log like everyone else's, and the orchestrator answers with `factory_send`
+      // like anyone else.
+      const msg = bus.send({
+        fromRoomId: roomId,
+        toRoomId: projectRoom.id,
+        kind: "request",
+        body: args.question,
+        taskId: args.task_id ?? null,
+      });
+      if (args.task_id !== undefined) linkTask(tasks, args.task_id, msg);
+
+      // Honest about a factory with no senior agent: the question is a durable row either way, and
+      // it will be delivered the moment one exists — but nobody is going to answer it today.
+      const unmanned = deps.router !== undefined && !deps.router.hasOrchestrator(projectId)
+        ? " This factory has no orchestrator yet, so nothing will answer until one is created;"
+          + " the question is queued in the project room until then."
+        : "";
+      return `Question ${msg.id} sent to the project room.${unmanned}`;
+    },
+  );
+
+  const roomTools = [
+    send, inbox, taskUpdate, reportStatusTool, askOrchestrator,
+    ...(deps.chronicle !== undefined ? chronicleToolDefinitions(deps, deps.chronicle) : []),
+  ];
+  // The tool surface is per session: an ordinary agent's list simply does not contain these. The
+  // handlers refuse anyway (see `orchestratorToolDefinitions`) — a tool that is only kept out of
+  // reach by not being offered is not gated, it is merely unadvertised.
+  return deps.isOrchestrator === true ? [...roomTools, ...orchestratorToolDefinitions(deps)] : roomTools;
+}
+
+/**
+ * The Chronicle as tools: write down why, and find out why before changing something.
+ *
+ * Every agent gets both, not just the orchestrator. A decision made inside a room is exactly the
+ * kind that gets lost — the orchestrator was never told, so it cannot record it, and the next agent
+ * in that folder has no way to learn it short of asking whoever is gone.
+ */
+export function chronicleToolDefinitions(
+  deps: BusToolsDeps,
+  chronicle: Chronicle,
+): SdkMcpToolDefinition<any>[] {
+  const { rooms, roomId } = deps;
+  const projectOf = (): string => {
+    const projectId = rooms.projectOf(roomId);
+    if (projectId === undefined) throw new Error(`unknown room ${roomId}`);
+    return projectId;
+  };
+
+  const recordDecision = factoryTool(
+    "factory_record_decision",
+    "Write down a decision that shapes how this project is built — an interface, a technology, a "
+      + "convention, a plan that supersedes another — as an ADR file in the repository's "
+      + "docs/decisions/. Record the reasoning, not just the outcome: the next agent reads this to "
+      + "find out WHY before changing it. Search first with factory_search_history.",
+    {
+      title: z.string().min(1).max(200)
+        .describe("One line naming the decision, e.g. 'Retries live in the payments room'."),
+      context: z.string().max(8000)
+        .describe("What made this a question: the constraint, the disagreement, what was true at the time."),
+      decision: z.string().min(1).max(8000)
+        .describe("What was decided, stated so someone can act on it without reading the context."),
+      alternatives: z.string().max(8000).optional()
+        .describe("What else was considered and why it was not chosen. This is what stops it being re-litigated."),
+      links: z.array(z.string().max(500)).max(20).optional()
+        .describe("Files, tasks, messages or URLs this decision rests on."),
+    },
+    (args) => {
+      const record = chronicle.record({
+        projectId: projectOf(),
+        // The room and the author come from the session that owns this tool set, never from `args`.
+        roomId,
+        agentId: deps.sessionId ?? null,
+        title: args.title,
+        context: args.context,
+        decision: args.decision,
+        ...(args.alternatives !== undefined ? { alternatives: args.alternatives } : {}),
+        ...(args.links !== undefined ? { links: args.links } : {}),
+      });
+      return `Decision recorded as ${record.path}. It is a file in the repository, so it is there `
+        + "for anyone who works on this next, with or without SuperFabric running.";
+    },
+  );
+
+  const searchHistory = factoryTool(
+    "factory_search_history",
+    "Search this project's chronicle: recorded decisions AND what agents have actually said in "
+      + "their sessions. Use it before reworking, replacing or arguing with anything that already "
+      + "exists — the reason it is that way is usually written down somewhere in here.",
+    {
+      query: z.string().min(1).max(500)
+        .describe("Words to look for. All of them must appear; punctuation and operators are ignored."),
+      limit: z.number().int().min(1).max(50).optional()
+        .describe("How many results, newest first. Default 10."),
+    },
+    (args) => {
+      const hits = chronicle.search(projectOf(), args.query, args.limit ?? 10);
+      if (hits.length === 0) {
+        return `Nothing in this project's chronicle matches ${JSON.stringify(args.query)}. `
+          + "Nobody has written this down — which may itself be worth recording once you decide.";
+      }
+      const lines = hits.map((h) => {
+        const when = new Date(h.createdAt * 1000).toISOString().slice(0, 10);
+        const where = h.roomId === null ? "no room" : rooms.getRoom(h.roomId)?.name ?? h.roomId;
+        const who = h.kind === "decision" ? `decision, ${where}` : `said in ${where}, session ${h.ref}`;
+        const source = h.path === null ? "" : `\n  ${h.path}`;
+        return `- [${when}] ${h.title} (${who})\n  ${h.snippet}${source}`;
+      });
+      return [`${hits.length} result(s), newest first:`, ...lines].join("\n");
+    },
+  );
+
+  return [recordDecision, searchHistory];
+}
+
+/**
+ * The tools only the factory's orchestrator gets: moving a task to a room, and seeing the floor it
+ * is choosing between.
+ *
+ * Exported separately from `busToolDefinitions` so the gate can be tested for what it is. They are
+ * **absent** from an ordinary agent's tool set *and* **refused** by their own handlers, and the two
+ * are different protections: the first is what the model sees, the second is what happens if
+ * anything ever calls one anyway.
+ */
+export function orchestratorToolDefinitions(deps: BusToolsDeps): SdkMcpToolDefinition<any>[] {
+  const { rooms, roomId } = deps;
+
+  /** The one authority check these tools have, and it reads the session's row, never tool input. */
+  const requireOrchestrator = (): TaskRouter => {
+    if (deps.isOrchestrator !== true) {
+      throw new Error(
+        "factory_assign_task and factory_list_rooms belong to this factory's orchestrator; "
+        + "this agent is not it. Use factory_ask_orchestrator to have it decide instead.",
+      );
+    }
+    if (deps.router === undefined) throw new Error("this server has no task router");
+    return deps.router;
+  };
+
+  const assignTask = factoryTool(
+    "factory_assign_task",
+    "Route a task to the room that should own it, and tell that room. Use this to answer a routing "
+      + "request: it moves the card on the board and delivers the assignment as a turn in the "
+      + "receiving room. Orchestrator only.",
+    {
+      task_id: z.string().describe("Id of the task, as given in the routing request or on the board."),
+      room: z.string().describe("Name of the room that should own it, as shown on the factory floor."),
+      agent_id: z.string().optional()
+        .describe("A specific agent in that room, when it has more than one. Omitted, the room owns it."),
+    },
+    (args) => {
+      const router = requireOrchestrator();
+      const { task, notified } = router.assign({
+        taskId: args.task_id,
+        roomName: args.room,
+        agentId: args.agent_id,
+        // The sending room is this tool set's room — the session's — never anything from `args`.
+        fromRoomId: roomId,
+      });
+      const who = task.agentId === null ? `the ${args.room} room` : `agent ${task.agentId} in ${args.room}`;
+      const state = notified.deliveredAt === null
+        ? "it is busy, so the notification arrives at its next turn boundary"
+        : "it has been told";
+      return `Task ${task.id} now belongs to ${who} (${state}).`;
+    },
+  );
+
+  const listRooms = factoryTool(
+    "factory_list_rooms",
+    "The factory floor: every room of this project, what it is for (the first line of its charter), "
+      + "how many agents it has and whether any are running. Use it before routing work you are not "
+      + "sure about. Orchestrator only.",
+    {},
+    () => {
+      const router = requireOrchestrator();
+      const projectId = rooms.projectOf(roomId);
+      if (projectId === undefined) throw new Error(`unknown room ${roomId}`);
+      return router.describeFloor(projectId);
+    },
+  );
+
+  return [assignTask, listRooms];
 }
 
 /**
@@ -182,8 +409,8 @@ export function busTools(deps: BusToolsDeps): McpSdkServerConfigWithInstance {
       + "project. Messages you send arrive as turns in their sessions, and messages they send arrive "
       + "as turns in yours — nobody polls.",
     tools: busToolDefinitions(deps),
-    // These four are the factory's own wiring: an agent that cannot see them cannot answer another
-    // room at all, so they must never be deferred behind tool search.
+    // These are the factory's own wiring: an agent that cannot see them cannot answer another room
+    // at all, so they must never be deferred behind tool search.
     alwaysLoad: true,
   });
 }

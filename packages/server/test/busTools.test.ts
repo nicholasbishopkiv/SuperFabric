@@ -65,10 +65,12 @@ function resultOf(res: Awaited<ReturnType<SdkMcpToolDefinition["handler"]>>): { 
 }
 
 describe("busTools", () => {
-  it("exposes exactly the four factory tools", async () => {
+  it("exposes exactly the room tool set, and none of the orchestrator's", async () => {
     await withTools(({ defs }) => {
-      expect(defs.map((d) => d.name))
-        .toEqual(["factory_send", "factory_inbox", "factory_task_update", "factory_report_status"]);
+      expect(defs.map((d) => d.name)).toEqual([
+        "factory_send", "factory_inbox", "factory_task_update", "factory_report_status",
+        "factory_ask_orchestrator",
+      ]);
       for (const d of defs) expect(d.description.length).toBeGreaterThan(20);
     });
   });

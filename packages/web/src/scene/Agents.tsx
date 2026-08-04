@@ -13,7 +13,7 @@ import {
 import type { FactoryStatus } from "../store";
 import { agentStatus, useRoomAgents } from "../store";
 import { agentFacing, agentSlots } from "./layout";
-import { BYPASS_COLOR, STATUS_COLOR } from "./palette";
+import { BYPASS_COLOR, DETAIL, FLOOR, PROJECT, STATUS_COLOR } from "./palette";
 
 /**
  * A worker, in seven boxes and two spheres.
@@ -54,6 +54,33 @@ const BRIM_GEOMETRY = new BoxGeometry(0.36, 0.045, 0.34);
 const RING_GEOMETRY = new RingGeometry(0.3, 0.42, 20);
 const SPIKE_GEOMETRY = new ConeGeometry(0.1, 0.24, 8);
 
+/**
+ * The orchestrator's marker: a standard on a mast, above everyone else's heads.
+ *
+ * **Shape, not a new colour.** The floor's colour vocabulary is spoken for — the four statuses,
+ * bypass magenta, selection cyan — and adding a seventh meaning to it would cost more than it buys:
+ * an operator who has to learn one more hue reads the four that matter more slowly. So the senior
+ * agent is told apart by silhouette (the only figure with a standard) in colours the scene already
+ * owns: the mast is the same grey metal as a roof vent, and the flag is `FLOOR.paint`, the bone
+ * white of the painted markings on the slab, which is deliberately not safety yellow and means
+ * nothing anywhere else.
+ *
+ * It is *carried*, at the figure's side rather than floating over its head: a pole rising from hand
+ * height past the helmet, with the flag near its top. That keeps it attached to the body it belongs
+ * to (a marker with a gap under it reads as a separate object), widens the silhouette — which is
+ * what makes it legible at low zoom — and leaves the space directly above the head free, so a
+ * bypass spike and a standard never grow through each other.
+ */
+const MAST_GEOMETRY = new BoxGeometry(0.05, 0.95, 0.05);
+const STANDARD_GEOMETRY = new BoxGeometry(0.34, 0.22, 0.03);
+/** Beside the right arm (`±0.27`), clear of the bypass spike, which stands at x = 0. */
+const MAST_X = 0.32;
+const MAST_FOOT_Y = LEG_HEIGHT + 0.5;
+const MAST_CENTRE_Y = MAST_FOOT_Y + 0.475;
+/** The flag flies from the top of the pole, hanging off it on one side. */
+const STANDARD_Y = MAST_FOOT_Y + 0.79;
+const STANDARD_X = MAST_X + 0.18;
+
 /** The vest, and the only place an agent's status appears on its body. */
 const VEST_MATERIALS: Record<FactoryStatus, MeshStandardMaterial> = {
   idle: new MeshStandardMaterial({ color: STATUS_COLOR.idle, roughness: 0.7 }),
@@ -66,8 +93,24 @@ const TROUSER_MATERIAL = new MeshStandardMaterial({ color: "#3d4550", roughness:
 const SLEEVE_MATERIAL = new MeshStandardMaterial({ color: "#4b5460", roughness: 0.8 });
 const SKIN_MATERIAL = new MeshStandardMaterial({ color: "#e3c6a8", roughness: 0.85 });
 const HELMET_MATERIAL = new MeshStandardMaterial({ color: "#eef0ee", roughness: 0.45 });
+/**
+ * The orchestrator's hat, in the project block's own eaves colour: it works in the central building
+ * and wears headquarters' slate rather than a workshop's white. A second, quieter cue than the
+ * standard — legible up close, where the standard is legible from across the floor.
+ */
+const ORCHESTRATOR_HELMET_MATERIAL = new MeshStandardMaterial({
+  color: PROJECT.ridge,
+  roughness: 0.45,
+});
 /** Unlit on purpose: the ungated marker must be equally obvious on a shaded side of the floor. */
 const BYPASS_MATERIAL = new MeshBasicMaterial({ color: BYPASS_COLOR });
+/**
+ * The pole and the flag, both unlit for the same reason the bypass marker is: a marker that goes
+ * dark on the shaded side of a building is a marker you have to hunt for. The pole is the scene's
+ * grey plant metal, the flag the bone white of the painted markings on the slab.
+ */
+const MAST_MATERIAL = new MeshBasicMaterial({ color: DETAIL.vent });
+const STANDARD_MATERIAL = new MeshBasicMaterial({ color: FLOOR.paint });
 
 /** Steps per second while working. Slow — this is a figure at a workbench, not a sprinter. */
 const BOB_HZ = 1.5;
@@ -94,12 +137,15 @@ const AgentFigure = memo(function AgentFigure({
   id,
   status,
   bypass,
+  orchestrator,
   x,
   z,
 }: {
   id: string;
   status: FactoryStatus;
   bypass: boolean;
+  /** This is the factory's senior agent. See `MAST_GEOMETRY` for why it is a shape and not a hue. */
+  orchestrator: boolean;
   x: number;
   z: number;
 }) {
@@ -139,6 +185,7 @@ const AgentFigure = memo(function AgentFigure({
   }, [working, x, z]);
 
   const vest = VEST_MATERIALS[status];
+  const helmet = orchestrator ? ORCHESTRATOR_HELMET_MATERIAL : HELMET_MATERIAL;
 
   return (
     <group ref={ref} position={[x, 0, z]}>
@@ -161,8 +208,25 @@ const AgentFigure = memo(function AgentFigure({
         </group>
 
         <mesh geometry={HEAD_GEOMETRY} material={SKIN_MATERIAL} position-y={HEAD_Y} />
-        <mesh geometry={HELMET_GEOMETRY} material={HELMET_MATERIAL} position-y={HEAD_Y - 0.02} />
-        <mesh geometry={BRIM_GEOMETRY} material={HELMET_MATERIAL} position-y={HEAD_Y - 0.02} />
+        <mesh geometry={HELMET_GEOMETRY} material={helmet} position-y={HEAD_Y - 0.02} />
+        <mesh geometry={BRIM_GEOMETRY} material={helmet} position-y={HEAD_Y - 0.02} />
+
+        {/* The standard is inside the facing group, so it turns with the figure and shows its face
+            to the camera rather than its edge. */}
+        {orchestrator && (
+          <>
+            <mesh
+              geometry={MAST_GEOMETRY}
+              material={MAST_MATERIAL}
+              position={[MAST_X, MAST_CENTRE_Y, 0]}
+            />
+            <mesh
+              geometry={STANDARD_GEOMETRY}
+              material={STANDARD_MATERIAL}
+              position={[STANDARD_X, STANDARD_Y, 0]}
+            />
+          </>
+        )}
       </group>
 
       {bypass && (
@@ -202,6 +266,7 @@ export const Agents = memo(function Agents({
           id={agent.id}
           status={agentStatus(agent)}
           bypass={agent.autonomy === "bypass"}
+          orchestrator={agent.isOrchestrator}
           x={slots[i][0]}
           z={slots[i][1]}
         />

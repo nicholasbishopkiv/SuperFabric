@@ -3,10 +3,12 @@ import { waitFor } from "./_waitFor.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { Chronicle } from "../src/chronicle.js";
 import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
 import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
+import { TaskRouter } from "../src/router.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
 import { FactoryBus } from "../src/factoryBus.js";
@@ -29,6 +31,8 @@ function makeHub(opts: {
   sessionsDebounceMs?: number;
   /** false builds an M0-shaped hub with no task board and no bus. */
   stores?: boolean;
+  /** Fixed clock for the chronicle, so a recorded decision's date is assertable. */
+  now?: () => number;
 } = {}) {
   const db = openDb(":memory:");
   const store = new EventStore(db);
@@ -36,10 +40,16 @@ function makeHub(opts: {
   const projects = new ProjectManager(db, opts.root ?? tmpdir());
   const rooms = new RoomManager(db, projects);
   const tasks = new TaskStore(db, projects);
+  const chronicle = new Chronicle(db, projects, opts.now ?? (() => 1_800_000_000));
   const mgr = new SessionManager(db, store, exec, rooms, projects, { tasks });
   const bus = new FactoryBus({
     db, rooms, projects,
     deliver: (sessionId, text) => mgr.prompt(sessionId, text),
+    roomAgents: (roomId) => mgr.roomAgents(roomId),
+  });
+  const router = new TaskRouter({
+    bus, tasks, rooms,
+    orchestratorFor: (projectId) => mgr.orchestratorFor(projectId),
     roomAgents: (roomId) => mgr.roomAgents(roomId),
   });
   const withStores = opts.stores !== false;
@@ -47,10 +57,12 @@ function makeHub(opts: {
     sessionsDebounceMs: opts.sessionsDebounceMs,
     tasks: withStores ? tasks : undefined,
     bus: withStores ? bus : undefined,
+    router: withStores ? router : undefined,
+    chronicle: withStores ? chronicle : undefined,
   });
   const { sock, sent } = fakeSocket();
   if (opts.attach !== false) hub.attach(sock);
-  return { db, store, exec, projects, rooms, tasks, bus, mgr, hub, sock, sent };
+  return { db, store, exec, projects, rooms, tasks, chronicle, bus, router, mgr, hub, sock, sent };
 }
 
 /** The hub's private socket -> watermark table; asserted directly, it is the thing I1 broke. */
@@ -278,6 +290,324 @@ describe("WsHub", () => {
       hub.handleMessage(sock, JSON.stringify({ kind: "set_model", sessionId: id, model: "" }));
       expect(sent.some(m => m.kind === "error" && m.message === "bad message")).toBe(true);
       expect(mgr.listSessions()[0].model).toBeNull();
+    });
+  });
+
+  // ---- M3b: the orchestrator over the wire ----
+
+  describe("ensure_orchestrator", () => {
+    /** A hub whose project room stands on a throwaway root, removed afterwards. */
+    function withRoot<T>(fn: (ctx: ReturnType<typeof makeHub> & { root: string }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-orchestrator-"));
+      const ctx = makeHub({ root });
+      ctx.rooms.ensureProjectRoom();
+      try {
+        return fn({ ...ctx, root });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    const lastSessions = (sent: any[]) => sent.filter(m => m.kind === "sessions").at(-1)?.sessions as any[];
+
+    it("creates the orchestrator in the project room and reports it on the session list", () => {
+      withRoot(({ hub, rooms, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+
+        const projectRoom = rooms.listRooms().find(r => r.kind === "project")!;
+        const sessions = lastSessions(sent);
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]).toMatchObject({ isOrchestrator: true, roomId: projectRoom.id });
+        // the central building's agent count changed, so the floor is refreshed too
+        expect(sent.filter(m => m.kind === "rooms").at(-1)!.rooms.find((r: any) => r.kind === "project"))
+          .toMatchObject({ agentCount: 1 });
+        // and the operator is told what it is for
+        expect(sent.some(m => m.kind === "notice" && /orchestrator/.test(m.message))).toBe(true);
+      });
+    });
+
+    it("subscribes the asking socket to it, so the operator can watch it work", () => {
+      withRoot(({ hub, mgr, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        const id = mgr.listSessions().find(s => s.isOrchestrator)!.id;
+        expect(subsFor(hub).get(sock)!.has(id)).toBe(true);
+        expect(sent.some(m => m.kind === "event" && m.sessionId === id)).toBe(true);
+      });
+    });
+
+    it("is idempotent over the wire: a second call creates nothing and still answers", () => {
+      withRoot(({ hub, mgr, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        const first = mgr.listSessions().find(s => s.isOrchestrator)!.id;
+        sent.length = 0;
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+        expect(mgr.listSessions().filter(s => s.isOrchestrator).map(s => s.id)).toEqual([first]);
+        expect(lastSessions(sent).filter((s: any) => s.isOrchestrator)).toHaveLength(1);
+      });
+    });
+
+    it("gives each factory its own, and never the other floor's", () => {
+      const a = mkdtempSync(join(tmpdir(), "superfabric-hub-orch-a-"));
+      const b = mkdtempSync(join(tmpdir(), "superfabric-hub-orch-b-"));
+      try {
+        const { hub, rooms, projects, mgr, sock, sent } = makeHub({ root: a });
+        rooms.ensureProjectRoom();
+        const other = projects.create({ root: b });
+        rooms.ensureProjectRoom(other.id);
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        const mine = mgr.listSessions().find(s => s.isOrchestrator)!.id;
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "open_project", projectId: other.id }));
+        sent.length = 0;
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+
+        const theirs = mgr.listSessions(other.id).find(s => s.isOrchestrator)!.id;
+        expect(theirs).not.toBe(mine);
+        // the answer this socket got holds its own floor's agent and nobody else's
+        expect(lastSessions(sent).map((s: any) => s.id)).toEqual([theirs]);
+        expect(mgr.listSessions().map(s => s.id)).toEqual([mine]);
+      } finally {
+        rmSync(a, { recursive: true, force: true });
+        rmSync(b, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("routing an unassigned task", () => {
+    /** A hub with a project room, one workshop and a throwaway root. */
+    function withFloor<T>(fn: (ctx: ReturnType<typeof makeHub> & {
+      backend: ReturnType<RoomManager["createRoom"]>;
+    }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-routing-"));
+      const ctx = makeHub({ root });
+      ctx.rooms.ensureProjectRoom();
+      const backend = ctx.rooms.createRoom("backend");
+      try {
+        return fn({ ...ctx, backend });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    it("create_task with no room asks the orchestrator", () => {
+      withFloor(({ hub, rooms, bus, tasks, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_task", title: "Charge cards" }));
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+
+        const projectRoom = rooms.listRooms().find(r => r.kind === "project")!;
+        const asked = bus.list();
+        expect(asked).toHaveLength(1);
+        expect(asked[0]).toMatchObject({ toRoomId: projectRoom.id, kind: "request" });
+        // and nothing has been assigned — the orchestrator has not answered yet
+        expect(tasks.list()[0]!.roomId).toBeNull();
+      });
+    });
+
+    it("create_task with a room routes nothing: it is already placed", () => {
+      withFloor(({ hub, bus, backend, sock }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        hub.handleMessage(sock, JSON.stringify({
+          kind: "create_task", title: "Charge cards", roomId: backend.id,
+        }));
+        expect(bus.list()).toEqual([]);
+      });
+    });
+
+    it("with no orchestrator, create_task sends nothing and reports no error", () => {
+      withFloor(({ hub, bus, tasks, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_task", title: "Charge cards" }));
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+        expect(bus.list()).toEqual([]);
+        // the card exists and is visibly unassigned, which is the truth the board already explains
+        expect(tasks.list()[0]).toMatchObject({ title: "Charge cards", roomId: null });
+      });
+    });
+
+    it("route_task asks again, and says so", () => {
+      withFloor(({ hub, tasks, bus, sock, sent }) => {
+        const task = tasks.create({ title: "Charge cards" });
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        hub.handleMessage(sock, JSON.stringify({ kind: "route_task", taskId: task.id }));
+
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+        expect(sent.some(m => m.kind === "notice" && /orchestrator has been asked/.test(m.message))).toBe(true);
+        expect(bus.list()).toHaveLength(1);
+      });
+    });
+
+    it("route_task on a factory with no orchestrator says so instead of inventing a room", () => {
+      withFloor(({ hub, tasks, bus, sock, sent }) => {
+        const task = tasks.create({ title: "Charge cards" });
+        hub.handleMessage(sock, JSON.stringify({ kind: "route_task", taskId: task.id }));
+
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+        expect(sent.some(m => m.kind === "notice" && /no orchestrator yet/.test(m.message))).toBe(true);
+        expect(bus.list()).toEqual([]);
+        expect(tasks.get(task.id)!.roomId).toBeNull();
+      });
+    });
+
+    it("route_task reports an unknown task as an error rather than throwing at the socket", () => {
+      withFloor(({ hub, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "route_task", taskId: "ghost" }));
+        expect(sent.some(m => m.kind === "error" && /unknown task ghost/.test(m.message))).toBe(true);
+      });
+    });
+
+    it("route_task on a server with no router is an error, not a silent no-op", () => {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-norouter-"));
+      try {
+        const { hub, sock, sent } = makeHub({ root, stores: false });
+        hub.handleMessage(sock, JSON.stringify({ kind: "route_task", taskId: "t1" }));
+        expect(sent.some(m => m.kind === "error" && /no task router/.test(m.message))).toBe(true);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("search_chronicle", () => {
+    /**
+     * A hub with a project room and a real repository root to write ADRs into. Promise-aware,
+     * because one case has to let a session's first turn actually happen before it searches for it.
+     */
+    function withChronicle(
+      fn: (ctx: ReturnType<typeof makeHub> & { root: string }) => void | Promise<void>,
+    ): void | Promise<void> {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-chronicle-"));
+      const ctx = makeHub({ root });
+      ctx.rooms.ensureProjectRoom();
+      const done = () => rmSync(root, { recursive: true, force: true });
+      let result: void | Promise<void>;
+      try {
+        result = fn({ ...ctx, root });
+      } catch (err) {
+        done();
+        throw err;
+      }
+      if (result instanceof Promise) return result.finally(done);
+      done();
+      return result;
+    }
+
+    const answer = (sent: any[]) => sent.filter(m => m.kind === "chronicle").at(-1);
+
+    it("answers the asking socket with the hits and the query they answer", () => {
+      withChronicle(({ hub, chronicle, projects, sock, sent }) => {
+        chronicle.record({
+          projectId: projects.defaultProject().id,
+          title: "Retries live in payments",
+          context: "the webhook was retried in two places at once",
+          decision: "payments owns retries",
+        });
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "search_chronicle", query: "webhook" }));
+        const reply = answer(sent)!;
+        expect(reply.query).toBe("webhook");
+        expect(reply.hits).toHaveLength(1);
+        expect(reply.hits[0]).toMatchObject({
+          kind: "decision", title: "Retries live in payments", seq: 0,
+        });
+        // A decision's hit carries the file, because the file is the artefact the row indexes.
+        expect(reply.hits[0].path).toMatch(/docs\/decisions\/0001-retries-live-in-payments\.md$/);
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+      });
+    });
+
+    it("an empty query is the newest decisions, not an empty result", () => {
+      withChronicle(({ hub, chronicle, projects, sock, sent }) => {
+        const projectId = projects.defaultProject().id;
+        chronicle.record({ projectId, title: "First", context: "why", decision: "this" });
+        chronicle.record({ projectId, title: "Second", context: "why again", decision: "that" });
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "search_chronicle" }));
+        const reply = answer(sent)!;
+        expect(reply.query).toBe("");
+        // Newest first, so the surface opens on what was decided most recently.
+        expect(reply.hits.map((h: any) => h.title)).toEqual(["Second", "First"]);
+        expect(reply.hits[0].snippet).toBe("why again");
+      });
+    });
+
+    it("finds what an agent said, not only what was decided", async () => {
+      await withChronicle(async ({ hub, mgr, exec, rooms, sock, sent }) => {
+        const projectRoom = rooms.listRooms().find(r => r.kind === "project")!;
+        const id = mgr.createSession({ roomId: projectRoom.id });
+        mgr.prompt(id, "the idempotency key is the invoice id");
+        await exec.settle();
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "search_chronicle", query: "idempotency" }));
+        const reply = answer(sent)!;
+        // The prompt and the agent's echo of it are both things that were said; neither is a
+        // decision, and neither has a file of its own — the transcript is the record.
+        expect(reply.hits.map((h: any) => h.kind)).toEqual(reply.hits.map(() => "event"));
+        expect(reply.hits.some((h: any) => h.ref === id && h.title === "user_prompt")).toBe(true);
+        expect(reply.hits.every((h: any) => h.path === null)).toBe(true);
+      });
+    });
+
+    it("a match in another factory never reaches this floor", () => {
+      const a = mkdtempSync(join(tmpdir(), "superfabric-hub-chron-a-"));
+      const b = mkdtempSync(join(tmpdir(), "superfabric-hub-chron-b-"));
+      try {
+        const { hub, rooms, projects, chronicle, sock, sent } = makeHub({ root: a });
+        rooms.ensureProjectRoom();
+        const other = projects.create({ root: b });
+        rooms.ensureProjectRoom(other.id);
+        chronicle.record({
+          projectId: other.id, title: "Their ruling", context: "webhook", decision: "theirs",
+        });
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "search_chronicle", query: "webhook" }));
+        expect(answer(sent)!.hits).toEqual([]);
+
+        // …and is found the moment this socket is looking at that factory.
+        hub.handleMessage(sock, JSON.stringify({ kind: "open_project", projectId: other.id }));
+        hub.handleMessage(sock, JSON.stringify({ kind: "search_chronicle", query: "webhook" }));
+        expect(answer(sent)!.hits.map((h: any) => h.title)).toEqual(["Their ruling"]);
+      } finally {
+        rmSync(a, { recursive: true, force: true });
+        rmSync(b, { recursive: true, force: true });
+      }
+    });
+
+    it("answers only the socket that asked", () => {
+      withChronicle(({ hub, chronicle, projects, sock, sent }) => {
+        chronicle.record({
+          projectId: projects.defaultProject().id, title: "Mine", context: "webhook", decision: "x",
+        });
+        const other = fakeSocket();
+        hub.attach(other.sock);
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "search_chronicle", query: "webhook" }));
+        expect(answer(sent)!.hits).toHaveLength(1);
+        expect(other.sent.some(m => m.kind === "chronicle")).toBe(false);
+      });
+    });
+
+    it("a query nothing matches is an empty answer, not an error", () => {
+      withChronicle(({ hub, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "search_chronicle", query: 'the "retry policy' }));
+        expect(answer(sent)).toMatchObject({ hits: [] });
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+      });
+    });
+
+    it("on a server with no chronicle it is an error, not an empty list", () => {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-nochronicle-"));
+      try {
+        const { hub, sock, sent } = makeHub({ root, stores: false });
+        hub.handleMessage(sock, JSON.stringify({ kind: "search_chronicle", query: "webhook" }));
+        expect(sent.some(m => m.kind === "error" && /no chronicle/.test(m.message))).toBe(true);
+        expect(sent.some(m => m.kind === "chronicle")).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     });
   });
 

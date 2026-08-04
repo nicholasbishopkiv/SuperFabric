@@ -60,8 +60,11 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
     (`createSdkMcpServer`) built **per session from that session's room** and passed through
     `ExecutorStartOptions.mcpServers`. Tools: `factory_send(to_room, kind, body, task_id?)`,
     `factory_inbox()`, `factory_task_update(task_id, status?, detail?)`,
-    `factory_report_status(summary)`. `factory_ask_orchestrator` arrives with the orchestrator
-    (M3b). The model sees them namespaced as `mcp__factory__*`.
+    `factory_report_status(summary)`, `factory_ask_orchestrator(question, task_id?)`, plus the
+    Chronicle's `factory_record_decision(...)` and `factory_search_history(query)` (M3b). The
+    orchestrator's session gets two more (`factory_assign_task`, `factory_list_rooms`), so a room
+    agent is offered seven `mcp__factory__*` tools and the orchestrator nine. The model sees them
+    namespaced as `mcp__factory__*`.
   - **The sending room is never read from tool input** — it comes from the session row, so an
     agent cannot send a message *as* another department. A roomless session gets no bus tools.
   - These tools are **not gated**: `canUseTool` allows anything belonging to this session's own
@@ -72,8 +75,19 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   assignee who does not work in the task's room. Agents mutate it through the bus tools and the
   operator through `create_task`/`update_task`; either way the store announces its own changes and
   the hub broadcasts the board, because most changes never pass through the hub. The UI renders a
-  bottom-edge board plus per-room badges. A task with no room is **unassigned**, which is the
-  intended state until the orchestrator (M3b) can route it.
+  bottom-edge board plus per-room badges. A task with no room is **unassigned**; with an
+  orchestrator on the floor the card carries a "route it" affordance and `create_task` starts the
+  round trip on its own, and without one it stays unassigned and says so. Nothing fabricates an
+  assignment.
+- **Orchestrator** (`src/orchestrator.ts`, `src/router.ts`, M3b) — **a session with a role, not a
+  new runtime**: an ordinary session in the project room with `sessions.is_orchestrator = 1`
+  (migration 7), one per project, its own system-prompt append (`ORCHESTRATOR_SYSTEM_PROMPT`) and
+  the two extra tools. `ensure_orchestrator` is the only supported way to make one — a hand-built
+  session in the right room would still be missing the role prompt and the tool surface.
+  **Routing is a bus round trip**: a task with no room becomes a `request` from the project room to
+  itself describing the task and every room's charter summary; the orchestrator answers with
+  `factory_assign_task`, which moves the card and delivers an `info` message to the receiving room.
+  With no orchestrator nothing is sent and nothing changes.
 - **LimitMonitor** — per account: polls `GET https://api.anthropic.com/api/oauth/usage`
   (bearer from that account's `.credentials.json`, `anthropic-beta: oauth-2025-04-20`,
   claude-code User-Agent, ~180s interval). Reads `five_hour`, `seven_day`,
@@ -111,7 +125,14 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   Agents interact via bus tools: `factory_record_decision(...)` (role prompts instruct
   agents to record at meaningful choice points; the orchestrator records direction
   decisions) and `factory_search_history(query)` (consult before reworking anything).
-  The UI shows a chronicle timeline and per-room decision lists.
+  Built in M3b (`src/chronicle.ts`, migration 8). The ADR file is written **before** the row, and
+  its number is claimed by creating the file with `wx` — so two decisions in the same second cost a
+  number rather than a file, and the numbering continues from whatever is already in the folder
+  (a repository whose humans wrote 0001–0003 by hand continues at 0004). The FTS5 index is kept in
+  step by triggers on `decisions` and `events`, not by this class, so every write path is covered
+  by construction — including an `EventStore.append` that has never heard of the Chronicle.
+  The operator searches the same index over the wire (`search_chronicle` → `chronicle`), shown in a
+  popover off the top strip; an empty query answers with the newest decisions.
 - **RoleLibrary** — catalog of role presets shipping with Fabrica (architect, designer,
   backend dev, QA, DevOps, tech writer, …). A preset bundles: role system-prompt append,
   recommended skills (e.g. superpowers, impeccable for UI roles), plugins/MCP servers,
@@ -149,9 +170,16 @@ Two layers, by explicit product decision — the factory must *look like a facto
   Semantic colour is not the overlay's to invent: `hud/tokens.ts` publishes `scene/palette.ts` as
   CSS variables, so a panel and a beacon cannot disagree. Surfaces: **task panel** (manual task
   entry; leaving "department" empty routes the task to the orchestrator, which
-  analyzes it, picks the room and assignee, and dispatches it), limit meters (per
+  analyzes it, picks the room and assignee, and dispatches it), **chronicle search** (a popover in
+  the free top strip, mirroring the project switcher — not a fourth edge panel, because the middle
+  of the screen is the product), limit meters (per
   account: 5h + weekly + per-model, reset timers), approval cards, agent chat drawer,
   orchestrator console. Labels pinned to buildings use drei `<Html>`.
+  The **orchestrator is marked on the floor rather than in a widget of its own**: it is an agent in
+  the project room, so its figure carries a standard, its helmet is the project block's slate, the
+  building's label says "orchestrator" and the room row flags it. The marker is a *shape* — the
+  floor's colour vocabulary (four statuses, bypass magenta, selection cyan) is full, and a seventh
+  meaning would slow down reading the four that matter.
 
 React Flow was the initial 2D recommendation from research; superseded by the 3D
 directive. If a lightweight "schematic mode" is ever wanted, it can be a camera-top-down
@@ -271,10 +299,13 @@ into a package mesh travelling the conveyor, keyed by the message id; an undeliv
 drawn instead as a still crate stacked at the sender's door. A `request` naming a `task_id` sets
 that task `blocked` on the message and a `response` releases it.
 
-**Manual task with auto-routing**: user adds a task in the task panel without picking a
-room → server injects it into the orchestrator session → orchestrator analyzes it, calls
-`factory_task_update` (room, assignee, priority) and `factory_send` to dispatch → a
-package leaves the main building for the chosen workshop.
+**Manual task with auto-routing** (built and run live in M3b): user adds a task in the task panel
+without picking a room (or presses "route it" on an unassigned card) → `TaskRouter` sends the
+project room a `request` describing the task and every room's charter → the orchestrator reads it
+as an injected turn, calls `mcp__factory__factory_assign_task(task_id, room)` → the card moves on
+the board and an `info` message is delivered as a turn in the receiving room → a package leaves the
+main building for that workshop. The card stays visibly unassigned until the orchestrator actually
+answers; routing is a model decision, so nothing pretends it has been made.
 
 **Limit pause/resume**: LimitMonitor sees account B at 96% of 5h window → interrupts B's
 sessions mid-turn-boundary, persists `{session_id, room, pending_inbox}`, UI shows

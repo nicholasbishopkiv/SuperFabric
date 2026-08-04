@@ -1,15 +1,17 @@
 import type { AutonomyMode, SessionInfo } from "@superfabric/shared";
 import { RoomName } from "@superfabric/shared";
-import { BotIcon, FolderIcon, PencilIcon, PlusIcon, WarehouseIcon } from "lucide-react";
+import { BotIcon, FlagIcon, FolderIcon, PencilIcon, PlusIcon, WarehouseIcon } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import type { FactoryStatus } from "../store";
 import {
   agentStatus,
   useFabric,
   useIsSelected,
+  useOrchestrator,
   useRoom,
   useRoomAgentCount,
   useRoomAgents,
+  useRoomHasOrchestrator,
   useRoomIds,
   useRoomlessSessions,
   useRoomStatus,
@@ -58,6 +60,7 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
   const tasks = useRoomTaskCount(roomId);
   const status: FactoryStatus = useRoomStatus(roomId);
   const selected = useIsSelected(roomId);
+  const orchestrator = useRoomHasOrchestrator(roomId);
   const selectRoom = useFabric((s) => s.selectRoom);
 
   if (room === undefined) return null;
@@ -83,6 +86,11 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
           <span className="shrink-0 text-2xs text-fg-faint">project</span>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {/* The same fact the building's label and the figure's standard carry, in the list: this
+              is where the senior agent stands. */}
+          {orchestrator && (
+            <FlagIcon className="size-3 text-accent" aria-label="the orchestrator works here" />
+          )}
           {/* Unfinished tasks owned by this room — the same count the board's cards add up to, so the
               list and the board can never disagree about who owes what. */}
           {tasks > 0 && (
@@ -106,6 +114,59 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
   );
 });
 
+/**
+ * The factory's senior agent, in the project room's detail — where an operator looking at the
+ * central building already is.
+ *
+ * `ensure_orchestrator` is idempotent and argument-free, so this is one button with nothing to get
+ * wrong: it makes one if there is none and hands back the one there is. It lives here rather than on
+ * the board because the orchestrator is an *agent in a room*, not a property of the task list; the
+ * board's job is to say when a task needs it (see `TaskPanel`).
+ */
+function OrchestratorLine({ connected }: { connected: boolean }) {
+  const orchestrator = useOrchestrator();
+
+  if (orchestrator === undefined) {
+    return (
+      <div className="mt-2 rounded-[3px] border border-line/60 bg-panel-sunken/40 px-1.5 py-1.5">
+        <div className="flex items-center gap-1.5">
+          <FlagIcon className="size-3 shrink-0 text-fg-faint" />
+          <span className="text-2xs text-fg-muted">No orchestrator yet.</span>
+          <Button
+            size="xs"
+            variant="accent"
+            className="ml-auto"
+            onClick={() => send({ kind: "ensure_orchestrator" })}
+            disabled={!connected}
+            title="Create the factory's senior agent here, in the project room"
+          >
+            <PlusIcon />
+            orchestrator
+          </Button>
+        </div>
+        <FieldNote className="mt-1">
+          The senior agent: it routes unassigned tasks to rooms, answers{" "}
+          <code className="font-mono">factory_ask_orchestrator</code>, and records why with an ADR.
+          It stands here, in the central building.
+        </FieldNote>
+      </div>
+    );
+  }
+
+  return (
+    <FieldNote className="mt-1.5 flex items-center gap-1.5">
+      <FlagIcon className="size-3 shrink-0 text-accent" />
+      <span>
+        The orchestrator is{" "}
+        <code className="font-mono text-fg-muted" title={orchestrator.id}>
+          {orchestrator.id.slice(0, 8)}
+        </code>{" "}
+        — the figure carrying the standard.
+      </span>
+    </FieldNote>
+  );
+}
+
 /** One agent of the selected room: what it is doing, how much rope it has, and what it runs on. */
 function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolean }) {
   const status = agentStatus(agent);
@@ -118,6 +179,12 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
         {agent.id.slice(0, 8)}
       </code>
       <span className="text-2xs text-fg-muted">{status}</span>
+      {agent.isOrchestrator && (
+        <Badge variant="accent" title="The factory's senior agent: it routes work and records why">
+          <FlagIcon />
+          orchestrator
+        </Badge>
+      )}
       {agent.autonomy === "bypass" && (
         <Badge variant="bypass" title="ungated — nothing this agent does is asked about">
           ungated
@@ -265,10 +332,13 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
       {room.kind === "project" ? (
         // The central building stands for the project root itself, so its folder is the project's —
         // changing it here would let the two disagree. Another factory is another project.
-        <div className="flex items-start gap-1.5">
-          <FolderIcon className="mt-0.5 size-3 shrink-0 text-fg-faint" />
-          <span className="min-w-0 break-all font-mono text-2xs text-fg-muted">{room.path}</span>
-        </div>
+        <>
+          <div className="flex items-start gap-1.5">
+            <FolderIcon className="mt-0.5 size-3 shrink-0 text-fg-faint" />
+            <span className="min-w-0 break-all font-mono text-2xs text-fg-muted">{room.path}</span>
+          </div>
+          <OrchestratorLine connected={connected} />
+        </>
       ) : (
         <RoomFolder roomId={roomId} path={room.path} connected={connected} />
       )}

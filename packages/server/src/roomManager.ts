@@ -46,8 +46,25 @@ folders of this project, and you can talk to them:
 - \`mcp__factory__factory_task_update(task_id, status)\` moves one of your tasks on the factory's
   board; \`mcp__factory__factory_report_status(summary)\` puts one line about what you are doing in
   front of the operator.
+- \`mcp__factory__factory_ask_orchestrator(question, task_id?)\` asks the factory's orchestrator —
+  the senior agent in the project room — for a ruling on anything above this room's remit: where
+  something belongs, which of two ways to go, a task that looks wrong for you. It answers as an
+  ordinary bus message.
 - Do not poll. \`mcp__factory__factory_inbox\` is for re-reading traffic you already have, never for
   checking whether any arrived — it arrives on its own.
+
+## The chronicle
+
+- **Search before you rework anything.** \`mcp__factory__factory_search_history(query)\` searches this
+  project's recorded decisions *and* what agents have actually said. Run it before you replace,
+  reverse or argue with something that already exists: the reason it is that way is usually written
+  down, and rediscovering it costs more than reading it.
+- **Record what you decide.** When a choice shapes how this project is built — an interface another
+  room relies on, a technology, a convention — write it down with
+  \`mcp__factory__factory_record_decision(title, context, decision, alternatives?, links?)\`. It
+  becomes an ADR file in \`docs/decisions/\`, which is a file in this repository and is there for
+  whoever works on it next, with or without SuperFabric running. Record the reasoning, not just the
+  outcome.
 `;
 }
 
