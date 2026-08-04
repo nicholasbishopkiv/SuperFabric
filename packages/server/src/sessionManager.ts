@@ -170,6 +170,19 @@ export class SessionManager {
    * to find.
    */
   private pausePending = new Map<string, { until: number | null; reason: string }>();
+  /**
+   * sessionId -> which executor incarnation is the current one.
+   *
+   * An executor keeps emitting for a moment after we have let go of it — the SDK's `result` message
+   * is immediately followed by an `idle` status, and a pause applied *at* that `result` would then be
+   * overwritten in the log by the `idle` that arrives one line later. The row would say paused and
+   * the transcript would say idle, and the transcript is what the operator reads.
+   *
+   * So every `startExecutor` closes over a generation number, and anything that lets an executor go
+   * (pause, restart, shutdown) bumps it. Events from a superseded incarnation are teardown noise and
+   * are dropped rather than appended.
+   */
+  private generation = new Map<string, number>();
   private readonly stmts;
 
   constructor(
@@ -428,6 +441,7 @@ export class SessionManager {
     detail: string,
   ): Promise<void> {
     this.store.append(id, { type: "session_status", status: "starting", detail });
+    this.supersede(id);
     this.handles.delete(id);
     this.turnInFlight.delete(id);
     this.denyPendingApprovals(id);
@@ -535,8 +549,15 @@ export class SessionManager {
     };
   }
 
+  /** Let go of a session's current executor: anything it says from now on is teardown noise. */
+  private supersede(id: string): void {
+    this.generation.set(id, (this.generation.get(id) ?? 0) + 1);
+  }
+
   private startExecutor(id: string, spec: RunSpec) {
     const { cwd, resume, autonomy, roomId, model, accountId, isOrchestrator } = spec;
+    const generation = (this.generation.get(id) ?? 0) + 1;
+    this.generation.set(id, generation);
     // The account, as the one thing the provider seam understands: a directory. `undefined` (no
     // account, or an account row that has since been deleted) leaves the executor's own default in
     // charge, which is the ambient `~/.claude` — the pre-M2 behaviour, unchanged.
@@ -557,6 +578,9 @@ export class SessionManager {
       },
       {
         onEvent: (event) => {
+          // See `generation`: an executor we have already released must not write over the record of
+          // why we released it.
+          if (this.generation.get(id) !== generation) return;
           this.store.append(id, event);
           // A terminal executor failure must move the session off 'active', otherwise resumeAll()
           // re-spawns a known-broken session on every boot, forever.
@@ -734,6 +758,7 @@ export class SessionManager {
     if (changed === 0) return;
 
     const handle = this.handles.get(id);
+    this.supersede(id);
     this.handles.delete(id);
     this.turnInFlight.delete(id);
     this.pausePending.delete(id);
@@ -792,7 +817,10 @@ export class SessionManager {
    */
   async stopAll(timeoutMs = 5000): Promise<void> {
     this.stopping = true;
-    for (const id of this.handles.keys()) this.denyPendingApprovals(id);
+    for (const id of this.handles.keys()) {
+      this.denyPendingApprovals(id);
+      this.supersede(id);
+    }
     const handles = [...this.handles.values()];
     this.handles.clear();
     this.turnInFlight.clear();

@@ -317,6 +317,11 @@ describe("LimitScheduler: pausing at 95%", () => {
       await Promise.resolve();
       expect(h.mgr.listSessions()[0]!.state).toBe("paused");
       expect(h.executor.stopped(0)).toBe(true);
+      // …and the *log* ends on `paused` too. The executor emits an `idle` status one line after the
+      // `turn_complete` the pause landed on; if that were appended, the row would say paused and the
+      // transcript the operator reads would say idle. See `SessionManager.generation`.
+      expect(h.mgr.listSessions()[0]!.status).toBe("paused");
+      expect(statusDetails(h.store, id).at(-1)).toContain('paused: the account "work" is at its limit');
     } finally {
       h.cleanup();
     }

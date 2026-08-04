@@ -298,7 +298,10 @@ export function pauseReason(
     ? "the provider refused a turn with a rate-limit error"
     : `its ${window?.label ?? "limit"} window is at ${Math.round(window?.utilization ?? 100)}%`;
   const until = usage.limitedUntil ?? window?.resetsAt ?? null;
-  return `paused — the account "${accountLabel}" is at its limit (${cause}); `
+  // No "paused —" prefix: this string is the *detail* of a `session_status`, and the status already
+  // says paused. It is also reused verbatim in the armed message a turn earlier, where the agent is
+  // emphatically not paused yet.
+  return `the account "${accountLabel}" is at its limit (${cause}); `
     + (until === null ? "resuming when the limit lifts" : `resuming at ${when(until)}`);
 }
 

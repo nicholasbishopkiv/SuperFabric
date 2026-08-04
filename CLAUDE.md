@@ -93,6 +93,37 @@ and a subscription limit monitor with auto-pause/resume.
   agent is created (its own choice, else its room's default), so a room's default changing later
   never silently moves someone already working. NULL means the ambient `~/.claude`, which is what
   every pre-M2 session ran on and still does.
+- **A limit reading says how much it is worth.** `AccountUsage.approximate` is not decoration: the
+  primary source is Anthropic's own undocumented `GET /api/oauth/usage` (authoritative, cross-device),
+  the fallback counts tokens in this machine's transcripts (blind to other devices, ignorant of when
+  the real window began, measured against a budget we assumed). Every surface that shows an estimate
+  marks it — hatched bar, badge, `≈`, and the reason in words — and **the scheduler will never pause
+  an agent on one.** A 429 is a different thing: `limitedBy: "rate_limit_error"` is the provider
+  refusing a turn, not a meter reading, and it pauses whatever the meters say. An estimate presented
+  as a fact is worse than an honest gap, because the operator would plan around it.
+- **The usage endpoint is undocumented and has already moved under us.** It sits behind
+  `UsageAdapter` for that reason. Verified live on 2026-08-04: `seven_day_opus`/`seven_day_sonnet`
+  are now present-but-*null* and the per-model weekly figures have moved into a `limits[]` array
+  (`kind`/`group`/`percent`/`severity`/`resets_at`/`scope.model.display_name`). `parseUsagePayload`
+  reads both that and the shape `docs/RESEARCH.md` §2 documents, takes windows whose `kind` it has
+  never heard of, and **degrades rather than crashing** — a half-understood body yields the meters it
+  could read plus a note counting the fields it could not. Understanding *nothing* is the only
+  failure, and it is what hands over to the estimate. Polling is floored at 180 s **per account**: a
+  monitor that earns a 429 causes the condition it exists to watch for.
+- **An agent is paused at a turn boundary, never mid-turn**, and is never moved to another account.
+  The boundary is the one the runner already knows (`turn_complete`, where the bus flushes);
+  interrupting a live turn would throw away the tokens it has already spent. The pause is persisted
+  (`sessions.state='paused'` plus `paused_at`/`paused_until`), so `resumeAll` does not resurrect a
+  held agent on the next boot and the countdown survives a restart; the resume goes through
+  `options.resume` and tells the agent what happened to it. **If a subscription is exhausted, its
+  agents wait for its window.** There is no "least-loaded account" anywhere in `scheduler.ts` for
+  anything except the orchestrator's initial placement, and there must never be one — that is the ToS
+  line (`docs/RESEARCH.md` §5).
+- **An executor we have let go of may not write over the record of why we let it go.** Every
+  `startExecutor` closes over a generation number and anything that releases an executor (pause,
+  restart, shutdown) bumps it; events from a superseded incarnation are dropped. Without this the
+  `idle` the SDK emits one line after `result` would overwrite the `paused` a boundary pause had just
+  appended, and the row and the transcript would disagree about the same agent.
 - **Accounts are machine-wide, not per project.** A subscription belongs to the operator, not to a
   repository: `accounts` is the one listing on the wire with no `project_id`, and its broadcast goes
   to every socket rather than only to those on one floor. The per-project choice is the *binding* —
@@ -189,11 +220,11 @@ out in the README so users know what they're installing.
 
 Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folders and the 3D
 floor)**, **M1b (several projects in one server, settable room folders, attachments, and the HUD
-rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M3a (the factory bus,
-tasks, and packages that ride real messages)** and **M3b (the orchestrator, task auto-routing and
-the Chronicle)** are complete, and **M2's accounts and login** are done (the limit monitor and the
-scheduler are not) — see `docs/ROADMAP.md` for the acceptance evidence of each. Next: the rest of
-M2 (LimitMonitor, Scheduler) and of M1 (roles library, onboarding agent).
+rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M2 (multi-account, the
+in-app login, the limit monitor and the pause/resume scheduler)**, **M3a (the factory bus, tasks, and
+packages that ride real messages)** and **M3b (the orchestrator, task auto-routing and the
+Chronicle)** are complete — see `docs/ROADMAP.md` for the acceptance evidence of each. Next: the rest
+of M1 (roles library, onboarding agent), then M4 (a container per session).
 
 ## Running it
 
@@ -241,6 +272,10 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   · `accountManager.ts` (accounts: one `CLAUDE_CONFIG_DIR` each, machine-wide, duplicate directories
   refused) · `accountLogin.ts` (`claude auth login` over plain pipes — no PTY, no native module —
   plus the `.credentials.json` watcher)
+  · `usageAdapters.ts` (the limit-reading seam: the OAuth usage endpoint, and the
+  honestly-approximate JSONL estimate behind it) · `limitMonitor.ts` (per-account polling at the
+  180 s floor, persisted snapshots, and the immediate mark from a 429) · `scheduler.ts` (80 % warn,
+  95 % pause at a turn boundary, resume at `resets_at` — and no rotation, ever)
   · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
   each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
   `busTools.ts` (the bus as an in-process MCP server, one per session's room — seven tools for a
@@ -265,12 +300,16 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   function that decides what an agent is actually told about a file) ·
   `App.tsx` (the 3D floor plus three HUD edges) · `scene/*` (the floor) · `hud/*` (room panel,
   console drawer, task board, the chronicle popover, the account switcher and its login flow
-  (`TopLeftBar` places it beside the project switcher), window-wide paste/drop target, the one
-  `NoticeBar`, and `Panel.tsx`
+  (`TopLeftBar` places it beside the project switcher), the per-account limit meters inside that
+  popover (`UsageMeters.tsx` — hatched bars and a `≈` wherever a figure is a guess),
+  window-wide paste/drop target, the one `NoticeBar`, and `Panel.tsx`
   — the shared collapsible edge-panel chrome all three edges are built from) ·
   `ui/*` (shadcn components vendored as our own source: button, input, select, popover, badge).
   **Styling is Tailwind v4** (`src/index.css`, `@theme`, no config file). Chrome colours are
   declared there and are deliberately neutral; every colour that *means* something —
-  the four statuses, selection, bypass — is generated from `scene/palette.ts` by
+  the five statuses, selection, bypass — is generated from `scene/palette.ts` by
   `hud/tokens.ts` and referenced as a CSS variable, so the HUD and the floor cannot disagree.
-  Never re-type one of those hexes.
+  Never re-type one of those hexes. `paused` is the fifth and is deliberately *quiet* — a cold dark
+  slate read against `idle` by temperature and value, not a fourth alarm colour — but it outranks
+  `working` in a room's beacon, because a half-stopped room is the half nobody would otherwise
+  notice.
