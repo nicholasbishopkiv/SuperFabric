@@ -142,7 +142,12 @@ Two layers, by explicit product decision — the factory must *look like a facto
   never go under the floor. Perf discipline:
   instanced meshes for packages, zustand per-object selectors (never re-render the
   scene tree on a status tick), frameloop="demand" when idle.
-- **2D overlay (DOM)** — React above the canvas, built on a component library rather than hand-rolled inline styles (see `docs/decisions/0003-ui-library.md`): **task panel** (manual task
+- **2D overlay (DOM)** — React above the canvas, on Tailwind v4 and Radix primitives vendored into
+  `packages/web/src/ui/` (see `docs/decisions/0003-ui-library.md`). Dark, translucent and blurred,
+  because it floats over a live floor; each of the three edge panels is the same collapsible shell
+  (`hud/Panel.tsx`) and reports its own size into `hudInsets`, which is what the camera frames into.
+  Semantic colour is not the overlay's to invent: `hud/tokens.ts` publishes `scene/palette.ts` as
+  CSS variables, so a panel and a beacon cannot disagree. Surfaces: **task panel** (manual task
   entry; leaving "department" empty routes the task to the orchestrator, which
   analyzes it, picks the room and assignee, and dispatches it), limit meters (per
   account: 5h + weekly + per-model, reset timers), approval cards, agent chat drawer,

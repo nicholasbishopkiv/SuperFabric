@@ -74,9 +74,12 @@ things into it.
       `POST /attachments` (multipart), behind the *same* origin allow-list as the WebSocket;
       the saved paths are staged as chips in the composer and folded into the turn text when
       the operator sends. A new `notice` server message says where each file landed.
-- [ ] **A real UI.** Rebuild the HUD on a component library instead of hand-rolled inline
-      styles, so the panels look designed rather than assembled. Choice and reasoning:
-      `docs/decisions/0003-ui-library.md`.
+- [x] **A real UI.** The HUD is rebuilt on Tailwind v4 and Radix primitives vendored into
+      `packages/web/src/ui/`, in one pass, so it is consistent rather than half-migrated.
+      Choice and reasoning: `docs/decisions/0003-ui-library.md`. Dark, translucent and
+      blurred over the floor; every colour that *means* something is read from
+      `scene/palette.ts` through `hud/tokens.ts`, so a room's dot in a panel and its beacon
+      on the roof cannot disagree. `hud/theme.ts` is gone.
 
 **Acceptance run for the first two (2026-08-04, no agent prompted)**: two projects in one server
 — `factory-a` (three rooms) and `Factory B` (two) — each with a room of the same name in the
@@ -101,6 +104,22 @@ accepted. `curl` against the running server: a disallowed `Origin` got 403 with 
 non-browser request with no `Origin` was accepted, a 30 MB file got 413, and a repeated name
 uniquified to `uploaded-spec-2.md`. 637 tests green (shared 46, server 360 + 1 skipped live-quota
 test, web 231).
+
+**Acceptance run for the shadcn/ui rebuild (2026-08-04, no agent prompted)**: a throwaway factory
+of six rooms, six agents, nine tasks and two bus messages, seeded over the socket and — for the
+agents, the transcript, the pending approval and the queued message — straight into the throwaway
+database, because `create_session` would spawn a real CLI. The whole HUD is dark, translucent and
+blurred over the floor; the room list's status dots, the approval card's amber, the `ungated`
+magenta and the selection cyan are the same constants the beacons and figures read. All three
+panels collapse with the same chevron-on-the-inner-edge control and keep reporting their size
+(320/520/261 px open, 81/81/42 collapsed, restored exactly on re-open), so the camera re-frames
+into the strip that is actually free. Radix's select and popover portal cleanly over the WebGL
+canvas. `elementFromPoint` over the floor, over the free top row and in the gap beside the board
+still hits the canvas, and a synthesised drag panned the camera. `requestAnimationFrame` fired 0
+times in 3 s with every agent idle — the demand frameloop is intact. Bundle: 1,260 kB → 1,402 kB of
+JS plus 33 kB of CSS (gzip 355 → 409 kB). 637 tests green (shared 46, server 360 + 1 skipped
+live-quota test, web 231) — unchanged and untouched, since the web suite is store and pure-logic
+tests.
 
 ## M2 — Multi-account and the limit monitor
 

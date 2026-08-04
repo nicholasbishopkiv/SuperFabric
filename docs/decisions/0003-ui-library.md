@@ -65,3 +65,31 @@ components vendored as our own files rather than imported from a package.
 - Verify at adoption time that the versions actually agree: React 19 + Vite 6 + Tailwind 4
   + the Radix versions shadcn pulls. If any of that fights, say so before proceeding rather
   than pinning something old.
+
+## Adopted — 2026-08-04
+
+Done in one pass. Nothing fought, and nothing was pinned back.
+
+- **Versions.** React 19.2 · Vite 6.4 · Tailwind 4.3.3 (`@tailwindcss/vite`, whose peer range
+  is `^5.2 || ^6 || ^7 || ^8`) · Radix select 2.3, popover 1.1, collapsible 1.1, slot 1.3 —
+  all of which declare `react: … || ^19.0`.
+- **No CLI.** shadcn's generator assumes a Next.js layout and a `components.json`; the five
+  components we wanted were faster to vendor by hand, and they are ours to edit anyway.
+- **Licences.** Radix / Tailwind / clsx / tailwind-merge MIT · `class-variance-authority`
+  Apache-2.0 · `lucide-react` ISC. One exception worth recording: `@tailwindcss/vite` pulls
+  `lightningcss`, which is **MPL-2.0**. It is a build-time CSS transformer, used unmodified,
+  and ships nothing into the bundle — but MPL is file-level copyleft and is not on the
+  policy's list, so it is called out here rather than waved through.
+- **Not adopted from the "hard parts" list.** `@radix-ui/react-tooltip` and
+  `react-scroll-area`. Every tooltip in the HUD is a full path or a full id, which the native
+  `title` shows without a portal per hover and lets the operator read at their own pace; and
+  Radix's scroll area wraps the scrolling element in a viewport of its own, which the
+  console's `scrollTop = scrollHeight` autoscroll would have to reach through. Native
+  overflow with a thin dark scrollbar (`.hud-scroll`) does the same job for no dependency.
+- **Cost.** JS 1,260 → 1,402 kB (gzip 355 → 402), plus 33 kB of CSS (gzip 6). ~140 kB of JS
+  is Radix and floating-ui; `lucide-react` tree-shakes to the dozen icons actually imported.
+  Against three.js's 1.2 MB that is the "small in context" this ADR predicted, but it is not
+  nothing, and it is the number to watch if more primitives are vendored.
+- **`hud/theme.ts` is gone.** Replaced by two things: neutral chrome tokens declared in
+  `index.css`, and semantic colours *generated* from `scene/palette.ts` at boot by
+  `hud/tokens.ts`. The overlay now contains no colour the floor does not also use.

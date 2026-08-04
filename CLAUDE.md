@@ -117,8 +117,8 @@ Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folder
 floor)**, **M3a (the factory bus, tasks, and packages that ride real messages)** and the structural
 half of **M1b (several projects in one server, settable room folders, attachments — files in, paths
 out)** are complete — see
-`docs/ROADMAP.md` for the acceptance evidence of each. Still open in M1b: the shadcn/ui rebuild of
-the HUD (`docs/decisions/0003-ui-library.md`). Then
+`docs/ROADMAP.md` for the acceptance evidence of each. **M1b is now complete**: the HUD is rebuilt
+on Tailwind v4 + Radix (`docs/decisions/0003-ui-library.md`). Next:
 **M3b — the orchestrator and task auto-routing**, the rest of M1 (roles library, onboarding agent)
 and M2 (multi-account and the limit monitor).
 
@@ -183,4 +183,11 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   `attachments.ts` (upload over HTTP, stage the returned paths, and `composeTurn` — the pure
   function that decides what an agent is actually told about a file) ·
   `App.tsx` (the 3D floor plus three HUD edges) · `scene/*` (the floor) · `hud/*` (room panel,
-  console drawer, task board, window-wide paste/drop target).
+  console drawer, task board, window-wide paste/drop target, the one `NoticeBar`, and `Panel.tsx`
+  — the shared collapsible edge-panel chrome all three edges are built from) ·
+  `ui/*` (shadcn components vendored as our own source: button, input, select, popover, badge).
+  **Styling is Tailwind v4** (`src/index.css`, `@theme`, no config file). Chrome colours are
+  declared there and are deliberately neutral; every colour that *means* something —
+  the four statuses, selection, bypass — is generated from `scene/palette.ts` by
+  `hud/tokens.ts` and referenced as a CSS variable, so the HUD and the floor cannot disagree.
+  Never re-type one of those hexes.
