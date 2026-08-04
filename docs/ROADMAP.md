@@ -123,14 +123,38 @@ tests.
 
 ## M2 — Multi-account and the limit monitor
 
-- AccountManager: profiles via `CLAUDE_CONFIG_DIR`; **"Add session" button** opening an
-  embedded terminal (xterm.js ↔ node-pty) where the user logs in; binding rooms/agents
-  to a chosen account at creation time.
-- LimitMonitor: polling the OAuth usage endpoint per account, 5h/weekly/per-model
-  meters in the UI, catching 429s.
-- Scheduler: warn agents at 80%, pause at 95%, auto-resume at `resets_at`.
+**Accounts and login are complete (2026-08-04)**; the monitor and the scheduler are not.
+
+- [x] `AccountManager` (`accountManager.ts`): an account is a `CLAUDE_CONFIG_DIR` plus a row
+      (migration 9). **Machine-wide, not per project** — a subscription is the operator's and serves
+      every floor; the per-project choice is the binding. **One directory is one account**, refused
+      by `create` *and* by a UNIQUE column, with the path canonicalised through `realpath` first so
+      `/a/b`, `/a/b/` and a symlink are the one directory they are.
+- [x] Per-session config dirs: `ExecutorStartOptions.configDir`, `sessions.account_id` resolved once
+      at creation (explicit choice, else the room's default) and re-applied on resume;
+      `set_session_account` restarts the executor exactly as `set_model` does, because
+      `Options.env` is fixed for the lifetime of a `query()`. A session with no account uses the
+      ambient `~/.claude`, unchanged.
+- [x] Login, **and it is not the terminal the plan expected**. Probing found `claude auth login`
+      needs no TTY at all: over plain pipes it prints its OAuth URL and reads the code from stdin.
+      So the flow is a link and a text box, not an xterm — no `node-pty`, no `node-gyp`, no new
+      dependency. `CredentialsWatcher` lights an account up when `.credentials.json` appears, which
+      also covers an operator who logs in from their own terminal. Full probe results and the two
+      rejected alternatives: `docs/decisions/0004-account-login-over-a-pipe.md`.
+- [x] Protocol + UI: an account switcher beside the project switcher (a popover, not a fourth edge
+      panel), the room's default account, and which account each agent runs on.
+- [ ] LimitMonitor: polling the OAuth usage endpoint per account, 5h/weekly/per-model
+      meters in the UI, catching 429s.
+- [ ] Scheduler: warn agents at 80%, pause at 95%, auto-resume at `resets_at`.
 
 **Done when**: 2+ accounts run in parallel; limit pause/resume needs no human.
+
+**Acceptance so far**: two accounts on two throwaway config dirs, a room bound to one, an agent
+inheriting it — asserted from the real executor's recorded `Options` (each `CLAUDE_CONFIG_DIR` its
+own, `PATH` and `HOME` intact) in `test/accountIsolation.test.ts`, and confirmed in a live browser
+run where the spawned CLI wrote its `.claude.json` and `sessions/` into the bound account's folder
+rather than into `~/.claude`. 877 tests green (shared 63, server 561 + 1 skipped live-quota test,
+web 253).
 
 ## M3 — Factory bus and the orchestrator ✅ **complete** (2026-08-04)
 

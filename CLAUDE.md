@@ -17,7 +17,12 @@ and a subscription limit monitor with auto-pause/resume.
 - The SQLite event log is the source of truth; WebSocket is a lossy tail with
   `afterSeq` replay.
 - Room = folder; without SuperFabric the project remains an ordinary repository.
-- One `CLAUDE_CONFIG_DIR` = one account; never share across accounts.
+- **One `CLAUDE_CONFIG_DIR` = one account; never share across accounts** — and this is now enforced
+  in code rather than only written down. The CLI rewrites its refresh token in place inside that
+  directory, so two accounts sharing one would invalidate each other days later with nothing in any
+  log to explain it. `AccountManager.create` refuses a duplicate, migration 9 puts UNIQUE on
+  `accounts.config_dir` so a future write path cannot lose it, and the path is canonicalised through
+  `realpath` first — the check is about the *directory*, not about the string that was typed.
 - Message delivery to agents is push (inject a turn into the input stream), not polling.
 - No account pooling/rotation to evade limits (hard ToS line) — only monitoring, pause,
   and resume of the user's own accounts.
@@ -81,6 +86,21 @@ and a subscription limit monitor with auto-pause/resume.
   bug to be most afraid of in this area, and the store-level tests exist to catch it. Room *names*
   are unique per project, not per server, so anything resolving a name (`busTools`) must scope it.
 
+- **An account is per session, persisted, and re-applied on resume** — the third member of the
+  `autonomy`/`model` family, and for the same mechanical reason: `CLAUDE_CONFIG_DIR` lives in
+  `Options.env`, which is fixed for the lifetime of a `query()`, so `set_session_account` restarts
+  the executor and resumes rather than mutating. `sessions.account_id` is resolved **once**, when the
+  agent is created (its own choice, else its room's default), so a room's default changing later
+  never silently moves someone already working. NULL means the ambient `~/.claude`, which is what
+  every pre-M2 session ran on and still does.
+- **Accounts are machine-wide, not per project.** A subscription belongs to the operator, not to a
+  repository: `accounts` is the one listing on the wire with no `project_id`, and its broadcast goes
+  to every socket rather than only to those on one floor. The per-project choice is the *binding* —
+  `rooms.account_id` (a default for new agents) and `sessions.account_id` (what an agent actually
+  runs on). A per-project account table would have meant re-creating and re-logging-in the same
+  account on every floor, which puts two rows on one directory: the invariant above, broken from the
+  other side.
+
 ## Autonomy (per-agent permission mode)
 
 Three modes, in our own vocabulary (`AutonomyMode` in `packages/shared/src/protocol.ts`):
@@ -112,6 +132,27 @@ The picker's shortlist is `AGENT_MODELS` in `packages/shared/src/protocol.ts` an
 plain non-empty string, so an id we have never heard of still works. `Query.supportedModels()` (see
 `server/notes/agent-sdk-api.md`) is the authoritative list for the installed CLI and could populate
 this dynamically later.
+
+## Accounts and logging one in
+
+An account is a `CLAUDE_CONFIG_DIR` on disk plus a row. Adding one creates the folder; logging in
+fills it.
+
+**The login is not a terminal, and that is a measurement rather than a preference.** The M2 plan
+expected xterm.js over a PTY and expected `node-pty` to be unusable under Bun. Probing found
+`node-pty` *does* work under Bun (N-API) but ships no Linux prebuild, so it would put `node-gyp`
+back into `pnpm install`; that `script -qec` gives a PTY with no native module anyway; that
+`claude setup-token` needs a TTY and issues an inference-only token the limit monitor could not use;
+and that **`claude auth login` needs no TTY at all** — over plain pipes it prints its OAuth URL as
+plain text and reads the code from stdin. So the flow is two fields: a link to open and a box for
+the code. See `docs/decisions/0004-account-login-over-a-pipe.md` for the transcripts.
+
+`AccountLoginManager` owns that conversation (`SpawnLogin` is the test seam — no test ever runs the
+real CLI). `CredentialsWatcher` watches each config directory and lights an account up when
+`.credentials.json` appears, so an operator who prefers `CLAUDE_CONFIG_DIR=… claude auth login` in
+their own shell is served by the same mechanism; the UI shows that command, quoted and copyable,
+next to the button. `credentialsPresent` is a **hint**, not a proof — on macOS the tokens may go to
+the keychain instead — so a clean exit from the CLI counts as success too.
 
 ## Stack
 
@@ -150,8 +191,9 @@ Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folder
 floor)**, **M1b (several projects in one server, settable room folders, attachments, and the HUD
 rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M3a (the factory bus,
 tasks, and packages that ride real messages)** and **M3b (the orchestrator, task auto-routing and
-the Chronicle)** are complete — see `docs/ROADMAP.md` for the acceptance evidence of each. Next:
-the rest of M1 (roles library, onboarding agent) and M2 (multi-account and the limit monitor).
+the Chronicle)** are complete, and **M2's accounts and login** are done (the limit monitor and the
+scheduler are not) — see `docs/ROADMAP.md` for the acceptance evidence of each. Next: the rest of
+M2 (LimitMonitor, Scheduler) and of M1 (roles library, onboarding agent).
 
 ## Running it
 
@@ -196,6 +238,9 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   · `executor.ts` (provider seam) · `executors/claudeCode.ts` (Agent SDK, streaming input)
   · `executors/fake.ts` (scripted, for tests) · `projectManager.ts` (projects: the scope every
   listing is filtered by) · `roomManager.ts` (rooms as folders, charters, settable folders)
+  · `accountManager.ts` (accounts: one `CLAUDE_CONFIG_DIR` each, machine-wide, duplicate directories
+  refused) · `accountLogin.ts` (`claude auth login` over plain pipes — no PTY, no native module —
+  plus the `.credentials.json` watcher)
   · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
   each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
   `busTools.ts` (the bus as an in-process MCP server, one per session's room — seven tools for a
@@ -219,7 +264,8 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   `attachments.ts` (upload over HTTP, stage the returned paths, and `composeTurn` — the pure
   function that decides what an agent is actually told about a file) ·
   `App.tsx` (the 3D floor plus three HUD edges) · `scene/*` (the floor) · `hud/*` (room panel,
-  console drawer, task board, the chronicle popover, window-wide paste/drop target, the one
+  console drawer, task board, the chronicle popover, the account switcher and its login flow
+  (`TopLeftBar` places it beside the project switcher), window-wide paste/drop target, the one
   `NoticeBar`, and `Panel.tsx`
   — the shared collapsible edge-panel chrome all three edges are built from) ·
   `ui/*` (shadcn components vendored as our own source: button, input, select, popover, badge).
