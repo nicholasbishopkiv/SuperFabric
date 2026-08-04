@@ -1,6 +1,7 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServerConfig, Options, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { AutonomyMode, SessionEvent } from "@superfabric/shared";
+import { APPROVAL_DENIED_MESSAGE, classifyExecutorError, mapSdkMessage } from "@superfabric/shared";
+import type { AutonomyMode, SdkMessageLike } from "@superfabric/shared";
 import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../executor.js";
 
 type SdkPermissionMode = NonNullable<Options["permissionMode"]>;
@@ -23,11 +24,13 @@ export function sdkPermissionMode(autonomy: AutonomyMode): SdkPermissionMode {
 /**
  * Coarse classification of executor failures. Rate limits are the one class the runner has to
  * react to differently (back off / surface a wait-until), everything else is opaque.
+ *
+ * Re-exported rather than defined here: it moved to `@superfabric/shared` when a *second* host for
+ * a session appeared (`packages/agent-runner`, inside a container), because both produce the
+ * `session_error` message that `SessionManager` then re-classifies. Existing importers are
+ * unaffected.
  */
-export function classifyExecutorError(err: unknown): "rate_limited" | "unknown" {
-  const s = String(err).toLowerCase();
-  return /429|rate.?limit|usage limit reached/.test(s) ? "rate_limited" : "unknown";
-}
+export { classifyExecutorError };
 
 /** The SDK's own `query` signature — the injection seam used by tests. */
 export type QueryFn = typeof sdkQuery;
@@ -206,7 +209,7 @@ export class ClaudeCodeExecutor implements Executor {
         // SessionManager owns approval_request/approval_resolved events; don't double-emit here.
         return behavior === "allow"
           ? { behavior: "allow", updatedInput: input }
-          : { behavior: "deny", message: "Denied by the SuperFabric operator." };
+          : { behavior: "deny", message: APPROVAL_DENIED_MESSAGE };
       },
     };
     // The SDK requires this alongside "bypassPermissions" ("a safety measure to ensure
@@ -287,6 +290,15 @@ export class ClaudeCodeExecutor implements Executor {
     };
   }
 
+  /**
+   * Turn one SDK message into events.
+   *
+   * The translation itself lives in `@superfabric/shared` (`mapSdkMessage`) because there are now
+   * two hosts for a session — this one, and `agent-runner` inside a container — and `SessionManager`
+   * must not be able to tell their output apart. What stays here is what is local to *this* host:
+   * resolving the session-id promise, and de-duplicating a tool call the `canUseTool` path may
+   * already have recorded.
+   */
   private handleMessage(
     msg: SDKMessage,
     ev: ExecutorEvents,
@@ -294,55 +306,12 @@ export class ClaudeCodeExecutor implements Executor {
     toolNames: Map<string, string>,
     noteToolUse: (toolUseId: string, toolName: string, input: unknown) => void,
   ): void {
-    if (msg.type === "system" && msg.subtype === "init") {
-      resolveSessionId(msg.session_id);
-      return;
-    }
-    if (msg.type === "assistant") {
-      for (const block of msg.message.content) {
-        if (block.type === "text") ev.onEvent({ type: "agent_text", text: block.text });
-        else if (block.type === "thinking") ev.onEvent({ type: "agent_thinking" });
-        // `noteToolUse`, not a bare append: an ungated factory tool is already recorded from
-        // canUseTool, and the operator must see the call once rather than twice.
-        else if (block.type === "tool_use") noteToolUse(block.id, block.name, block.input);
-      }
-      return;
-    }
-    // The CLI reports tool outcomes as `type: "user"` messages carrying tool_result content
-    // blocks — there is no dedicated tool_result message type. `isReplay` marks history the CLI
-    // re-emits when a session is resumed; our own log already holds those rows, so skip them
-    // instead of appending a duplicate transcript on every restart.
-    if (msg.type === "user") {
-      if ("isReplay" in msg && msg.isReplay === true) return;
-      const content = msg.message.content;
-      if (typeof content === "string") return; // our own injected prompts round-tripping back
-      for (const block of content) {
-        if (block.type !== "tool_result") continue;
-        const event: Extract<SessionEvent, { type: "tool_result" }> = {
-          type: "tool_result",
-          toolName: toolNames.get(block.tool_use_id) ?? block.tool_use_id,
-          isError: block.is_error === true,
-        };
-        toolNames.delete(block.tool_use_id);
-        const output = toolResultText(block.content);
-        if (output !== undefined) event.output = output;
-        ev.onEvent(event);
-      }
-      return;
-    }
-    if (msg.type === "result") {
-      ev.onEvent({ type: "turn_complete", costUsd: msg.total_cost_usd });
-      ev.onEvent({ type: "session_status", status: "idle" });
+    for (const m of mapSdkMessage(msg as SdkMessageLike, toolNames)) {
+      if (m.kind === "session_id") resolveSessionId(m.providerSessionId);
+      // `noteToolUse`, not a bare append: an ungated factory tool is already recorded from
+      // canUseTool, and the operator must see the call once rather than twice.
+      else if (m.kind === "tool_use") noteToolUse(m.toolUseId, m.toolName, m.input);
+      else ev.onEvent(m.event);
     }
   }
 }
-
-/** `tool_result.content` is a string or a block array; our event carries a plain string. */
-function toolResultText(content: ToolResultContent): string | undefined {
-  if (content === undefined) return undefined;
-  if (typeof content === "string") return content;
-  return content.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join("\n");
-}
-
-/** Structural stand-in for `ToolResultBlockParam["content"]` (peer `@anthropic-ai/sdk`). */
-type ToolResultContent = string | { type: string; text?: string }[] | undefined;

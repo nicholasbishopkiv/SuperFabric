@@ -1,0 +1,8 @@
+{
+  // outDir must live here, not in tsconfig.base.json: a relative outDir in an extended
+  // config resolves against the base config's directory, which would merge every
+  // package's build output into one root-level dist/.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "outDir": "dist" },
+  "include": ["src"]
+}

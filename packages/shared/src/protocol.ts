@@ -84,6 +84,17 @@ export const SessionEvent = z.discriminatedUnion("type", [
 ]);
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
+/**
+ * What a denied tool call tells the *agent*.
+ *
+ * The SDK requires a `message` on the deny branch of `canUseTool`, and it goes into the model's
+ * context as the tool's result — so this string is part of the conversation, not a log line. Shared
+ * because both hosts of a session produce it (the in-process executor and the containerised
+ * `agent-runner`), and an agent that read two different explanations for the same refusal depending
+ * on where it happened to be running would be a difference the operator never asked for.
+ */
+export const APPROVAL_DENIED_MESSAGE = "Denied by the SuperFabric operator.";
+
 // ---- M1b: projects ----
 
 /**
