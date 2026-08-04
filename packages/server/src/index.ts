@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import Fastify from "fastify";
 import { WebSocketServer, type WebSocket } from "ws";
+import { AccountLoginManager, CredentialsWatcher } from "./accountLogin.js";
 import { AccountManager } from "./accountManager.js";
 import { registerAttachmentRoutes } from "./attachmentRoutes.js";
 import { Chronicle } from "./chronicle.js";
@@ -60,7 +61,25 @@ const router = new TaskRouter({
 mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
   bus, tasks, router, chronicle, accounts,
 });
-const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router, chronicle, accounts });
+// The same one-way-callback shape as the bus and the router: the login flow announces itself and the
+// hub turns that into a frame, rather than the two holding each other. `hub` exists before anything
+// can call back — nothing here runs until a socket sends something.
+let hub!: WsHub;
+const logins = new AccountLoginManager({ accounts, onChange: () => hub.announceAccounts() });
+// So one `AccountInfo` describes the whole account — the row, whether it has credentials, and where
+// its login has got to — rather than the UI joining two lists that can disagree.
+accounts.setLoginStateSource((id) => logins.stateOf(id));
+hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router, chronicle, accounts, logins });
+
+// `.credentials.json` appearing is how the server learns a login finished — and it works whether the
+// login was driven from the UI or by the operator running `claude auth login` in their own terminal,
+// which is the whole reason it is a filesystem watch rather than something the login flow reports.
+const credentials = new CredentialsWatcher(() => hub.announceAccounts());
+const watchAccountDirs = (): void => credentials.sync(accounts.list().map((a) => a.configDir));
+// Re-synced on every account change, so a directory added at runtime is watched from the moment it
+// exists and a removed account stops holding a watcher.
+accounts.onChange(watchAccountDirs);
+watchAccountDirs();
 
 const bootProject = projects.defaultProject();
 // Every project needs its central building, including one that existed before this boot.
@@ -140,6 +159,11 @@ async function shutdown(signal: string): Promise<void> {
 
   console.log("shutdown: stopping executors");
   await mgr.stopAll();
+
+  // A half-finished `claude auth login` must not outlive the server that started it: it holds a
+  // subprocess and a pipe nobody can reach any more.
+  logins.stopAll();
+  credentials.close();
 
   console.log("shutdown: closing fastify");
   await app.close();

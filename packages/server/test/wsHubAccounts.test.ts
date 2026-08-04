@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AccountInfo, ServerMessage } from "@superfabric/shared";
+import { AccountLoginManager, type LoginChild } from "../src/accountLogin.js";
 import { AccountManager } from "../src/accountManager.js";
 import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
@@ -21,6 +22,18 @@ function fakeSocket() {
   return { sock, sent };
 }
 
+/** A fake `claude auth login` the test drives by hand, shared by every login the harness spawns. */
+function fakeLoginSpawner() {
+  let onOutput: (chunk: string) => void = () => {};
+  const child: LoginChild = {
+    onOutput: (cb) => { onOutput = cb; },
+    onExit: () => {},
+    write: () => {},
+    kill: () => {},
+  };
+  return { spawn: () => child, say: (chunk: string) => onOutput(chunk) };
+}
+
 function makeHub(opts: { withAccounts?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "sf-hub-accounts-"));
   const db = openDb(":memory:");
@@ -28,6 +41,11 @@ function makeHub(opts: { withAccounts?: boolean } = {}) {
   const projects = new ProjectManager(db, root);
   const rooms = new RoomManager(db, projects);
   const accounts = new AccountManager(db);
+  const login = fakeLoginSpawner();
+  const logins = new AccountLoginManager({
+    accounts, onChange: () => hub.announceAccounts(), spawn: login.spawn,
+  });
+  accounts.setLoginStateSource((id) => logins.stateOf(id));
   const withAccounts = opts.withAccounts !== false;
   const mgr = new SessionManager(db, store, new FakeExecutor(), rooms, projects, {
     ...(withAccounts ? { accounts } : {}),
@@ -35,12 +53,12 @@ function makeHub(opts: { withAccounts?: boolean } = {}) {
   const hub: WsHub = new WsHub(store, mgr, rooms, projects, {
     // Short enough that a test does not wait out the real 250 ms window.
     sessionsDebounceMs: 5,
-    ...(withAccounts ? { accounts } : {}),
+    ...(withAccounts ? { accounts, logins } : {}),
   });
   const { sock, sent } = fakeSocket();
   hub.attach(sock);
   return {
-    root, db, accounts, rooms, projects, mgr, hub, sock, sent,
+    root, db, accounts, logins, login, rooms, projects, mgr, hub, sock, sent,
     send: (msg: unknown) => hub.handleMessage(sock, JSON.stringify(msg)),
     cleanup: () => { rmSync(root, { recursive: true, force: true }); },
   };
@@ -250,6 +268,49 @@ describe("WsHub: accounts", () => {
     }
   });
 
+  describe("login", () => {
+    it("starts one and pushes the URL to every tab", async () => {
+      const h = makeHub();
+      try {
+        const account = h.accounts.create({ label: "Work", configDir: join(h.root, "work") });
+        h.send({ kind: "begin_account_login", accountId: account.id });
+        h.login.say("If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?state=x\n");
+
+        await waitFor(() => {
+          const listed = latestAccounts(h.sent)?.[0];
+          if (listed === undefined) throw new Error("not yet");
+          expect(listed.login.status).toBe("awaiting_code");
+          expect(listed.login.url).toBe("https://claude.com/cai/oauth/authorize?state=x");
+        });
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    it("a code sent before the URL is an error rather than a silent no-op", () => {
+      const h = makeHub();
+      try {
+        const account = h.accounts.create({ label: "Work", configDir: join(h.root, "work") });
+        h.send({ kind: "begin_account_login", accountId: account.id });
+        h.send({ kind: "submit_account_login_code", accountId: account.id, code: "guess" });
+        expect(errors(h.sent).join()).toMatch(/has not printed/);
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    it("cancelling one is harmless when there is nothing to cancel", () => {
+      const h = makeHub();
+      try {
+        const account = h.accounts.create({ label: "Work", configDir: join(h.root, "work") });
+        h.send({ kind: "cancel_account_login", accountId: account.id });
+        expect(errors(h.sent)).toEqual([]);
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
   it("the credentials file appearing lights the account up", async () => {
     const h = makeHub();
     try {
@@ -275,9 +336,11 @@ describe("WsHub: accounts", () => {
       // a surface that showed the second for the first would be lying.
       h.send({ kind: "list_accounts" });
       h.send({ kind: "create_account", label: "Work", configDir: join(h.root, "work") });
+      h.send({ kind: "begin_account_login", accountId: "x" });
       expect(errors(h.sent)).toEqual([
         "Error: this server has no accounts",
         "Error: this server has no accounts",
+        "Error: this server cannot log accounts in",
       ]);
     } finally {
       h.cleanup();

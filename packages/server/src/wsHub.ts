@@ -1,4 +1,5 @@
 import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@superfabric/shared";
+import type { AccountLoginManager } from "./accountLogin.js";
 import type { AccountManager } from "./accountManager.js";
 import type { Chronicle } from "./chronicle.js";
 import type { EventStore } from "./eventStore.js";
@@ -47,6 +48,8 @@ export interface WsHubOptions {
    * no accounts configured" and "you have no accounts" are different facts.
    */
   accounts?: AccountManager;
+  /** The in-app login flow. Absent => an account can still be created and bound, just not logged in here. */
+  logins?: AccountLoginManager;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -74,6 +77,7 @@ export class WsHub {
   private readonly router: TaskRouter | undefined;
   private readonly chronicle: Chronicle | undefined;
   private readonly accounts: AccountManager | undefined;
+  private readonly logins: AccountLoginManager | undefined;
 
   constructor(
     private store: EventStore,
@@ -88,6 +92,7 @@ export class WsHub {
     this.router = opts.router;
     this.chronicle = opts.chronicle;
     this.accounts = opts.accounts;
+    this.logins = opts.logins;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -349,12 +354,18 @@ export class WsHub {
           });
           break;
         }
-        // The in-app login. Started, answered and abandoned through three more messages — the flow
-        // itself is the next commit; until it is wired in these are refused rather than ignored.
+        // The in-app login. Three messages for one conversation: start it, hand over the code the
+        // OAuth page gives you, or give up. Nothing here blocks — the flow reports itself through the
+        // `accounts` broadcast, which is also what makes it visible in a second tab.
         case "begin_account_login":
+          this.loginStore().begin(msg.accountId);
+          break;
         case "submit_account_login_code":
+          this.loginStore().submitCode(msg.accountId, msg.code);
+          break;
         case "cancel_account_login":
-          throw new Error("this server cannot log accounts in");
+          this.loginStore().cancel(msg.accountId);
+          break;
         // Projects. `list_projects` answers the asking socket; the other two change global state (a
         // new project) or per-socket state (which floor this tab is on), and both end with this socket
         // holding a complete, freshly scoped set of lists.
@@ -600,6 +611,16 @@ export class WsHub {
   private accountStore(): AccountManager {
     if (this.accounts === undefined) throw new Error("this server has no accounts");
     return this.accounts;
+  }
+
+  /**
+   * Likewise for the login flow. Separate from `accountStore` because they can genuinely differ: a
+   * server can list and bind accounts without being able to log one in here, and "logging in from the
+   * app is not available" is a better answer than a button that does nothing.
+   */
+  private loginStore(): AccountLoginManager {
+    if (this.logins === undefined) throw new Error("this server cannot log accounts in");
+    return this.logins;
   }
 
   /** Likewise for the bus: "no factory bus here" is an answer, an empty list would be a lie. */
