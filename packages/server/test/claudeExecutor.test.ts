@@ -421,6 +421,25 @@ describe("ClaudeCodeExecutor", () => {
     // "user" excluded so the operator's personal hooks/model/permission rules stay out of
     // factory agents; project/local stay because a room's own config lives in its folder.
     expect(o.settingSources).toEqual(["project", "local"]);
+    // An agent's MCP servers are exactly the ones the factory hands it. Not a nice-to-have: the
+    // operator's own servers (obsidian, a browser driver, a desktop-control server) reaching a
+    // factory agent is a hole a sandbox would not close, because the server runs on this side of it.
+    expect(o.strictMcpConfig).toBe(true);
+  });
+
+  it("gives a session its room's MCP servers and nothing the operator happens to run", () => {
+    const fq = makeFakeQuery();
+    const exec = new ClaudeCodeExecutor({ query: fq.fn });
+    const factory = { type: "sdk", name: "factory", instance: {} } as never;
+    exec.start(
+      { cwd: "/repo", mcpServers: { factory } },
+      { onEvent: () => {}, requestApproval: async () => "deny" },
+    );
+    const o = fq.options()!;
+    // The whole set, not a superset: strictMcpConfig is what makes this list exhaustive rather
+    // than "ours plus whatever the CLI found lying around".
+    expect(Object.keys(o.mcpServers ?? {})).toEqual(["factory"]);
+    expect(o.strictMcpConfig).toBe(true);
   });
 
   it("allows a room to opt into an autonomous permission mode", () => {

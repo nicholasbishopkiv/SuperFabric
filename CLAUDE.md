@@ -34,6 +34,17 @@ and a subscription limit monitor with auto-pause/resume.
   release schedule, not our protocol: the wire takes any non-empty string, `AGENT_MODELS` in
   `packages/shared` is a shortlist for the UI, and a free-text field covers everything else. Never
   hard-code an id you are not sure of — a wrong one is a 404 mid-turn.
+- **An agent's tool servers are the factory's, not the operator's.** The executor sets
+  `strictMcpConfig: true`, so a session's MCP servers are exactly what SuperFabric passes in
+  `Options.mcpServers` — the room's factory bus today. The operator's own `~/.claude.json` servers,
+  their plugins' servers and their claude.ai connectors are all out, by a documented flag rather than
+  as a side effect of `settingSources` (`~/.claude.json` is not a settings *file*, so nothing
+  promised that). Anything we pass is *trusted* — it skips the CLI's approval flow — so a future
+  room-level MCP configuration has to answer the trust question itself. **Known limitation:** this
+  decides what the agent is *offered*; it is not isolation. The session still runs as the operator,
+  with their credentials and their `~/.claude`. The real fix is M4 — a container per session and one
+  `CLAUDE_CONFIG_DIR` per account. See `packages/server/notes/agent-sdk-api.md`, "How the SDK sources
+  MCP servers", for the probe and the measurements.
 - **A restart never eats an instruction.** `set_autonomy`/`set_model` restart a live session's
   executor, and a `prompt` landing in that window is *held* and delivered the moment the replacement
   is up — never dropped. The hold is bounded (`MAX_HELD_PROMPTS` in `sessionManager.ts`); past it the

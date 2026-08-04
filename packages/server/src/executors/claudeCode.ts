@@ -177,8 +177,17 @@ export class ClaudeCodeExecutor implements Executor {
       //     permission rules out of factory agents, so a room behaves the same on any machine.
       //     "project"/"local" stay because a room's own CLAUDE.md, skills and agents live in its
       //     folder and are meant to apply.
+      //   strictMcpConfig — the agent's MCP servers are exactly the ones *we* pass in `mcpServers`
+      //     (today: the room's factory bus). The operator's personal servers, their plugins' servers
+      //     and their claude.ai connectors are all out, and by a documented flag rather than as a
+      //     side effect of `settingSources` — `~/.claude.json` is not a settings *file*, so nothing
+      //     promises that dropping "user" keeps its `mcpServers` out, and an isolation property
+      //     must not rest on behaviour nobody documented. A room that needs a server of its own
+      //     gets it through `mcpServers`, which is a decision SuperFabric makes and can show the
+      //     operator. See `notes/agent-sdk-api.md` ("How the SDK sources MCP servers").
       permissionMode,
       settingSources: ["project", "local"],
+      strictMcpConfig: true,
       canUseTool: async (toolName, input, { toolUseID }): Promise<PermissionResult> => {
         // The factory's own bus tools are the factory's nervous system, not the agent reaching
         // outside it: an approval card for "tell the payments room I need a webhook" is noise, and
