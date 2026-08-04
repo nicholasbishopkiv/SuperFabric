@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc",
     "test": "bun test",
-    "bundle": "bun build src/index.ts --target=bun --external @anthropic-ai/claude-agent-sdk --outfile dist/runner.js",
+    "bundle": "bun build src/index.ts --target=bun --external @anthropic-ai/claude-agent-sdk --outfile dist/bundle/runner.js",
     "image": "bash scripts/build-image.sh"
   },
   "dependencies": {

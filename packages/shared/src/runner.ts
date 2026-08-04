@@ -39,6 +39,30 @@ export const RUNNER_PROTOCOL_VERSION = 1;
 export const RUNNER_WS_PATH = "/runner";
 
 /**
+ * The container image a contained session runs in — the one name the build script produces and the
+ * server looks for.
+ *
+ * Here rather than in either of them because it is exactly a contract between the two: a server
+ * that looks for a tag nobody builds fails at the worst possible moment (an operator switching a
+ * room to `container` for the first time), and the failure would look like Docker's problem rather
+ * than ours. `packages/agent-runner/scripts/build-image.sh` reads this value rather than repeating
+ * it, so there is one string.
+ *
+ * The tag is versioned so a stale image left over from an earlier release is a *different* tag and
+ * simply gets built, rather than being silently reused with an older protocol inside it.
+ */
+export const RUNNER_IMAGE_TAG = "superfabric/agent-runner:0.0.1";
+
+/** Where `ContainerExecutor` mounts the room's workspace. The agent's `cwd` is this or below it. */
+export const RUNNER_WORKSPACE_DIR = "/workspace";
+
+/**
+ * Where `ContainerExecutor` mounts the account's `CLAUDE_CONFIG_DIR`, read-write because the CLI
+ * rewrites its refresh token in place — the invariant that makes one directory one account.
+ */
+export const RUNNER_CONFIG_DIR = "/config";
+
+/**
  * How many un-acknowledged frames a runner holds while the server is away, and therefore how long
  * an agent can keep working through a server restart before something has to give.
  *
