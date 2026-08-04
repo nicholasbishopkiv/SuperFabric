@@ -1,5 +1,6 @@
 import type { RoomInfo } from "@superfabric/shared";
-import { useFrame } from "@react-three/fiber";
+import { Html } from "@react-three/drei";
+import { useFrame, useThree } from "@react-three/fiber";
 import { memo, useEffect, useMemo, useRef } from "react";
 import type { Group } from "three";
 import {
@@ -15,11 +16,16 @@ import {
 import type { Errand, FactoryStatus } from "../store";
 import {
   agentStatus,
+  showsBubble,
+  useAgentBubble,
   useBeltDirections,
+  useIsSelected,
   useRoomAgents,
   useRoomErrandDirections,
   useRoomErrands,
 } from "../store";
+import { subscribe } from "../wsClient";
+import type { Bubble } from "./bubble";
 import { errandAt, fetchPath, pathLength, walkAt, type WalkPath } from "./errands";
 import { agentFacing, agentSlots, bayForDirection } from "./layout";
 import {
@@ -340,6 +346,98 @@ function CarriedTool({ carry }: { carry: CarryKind }) {
   );
 }
 
+/**
+ * Where a bubble floats: clear of the crown, and above the bypass spike so an ungated agent's marker
+ * and its bubble never grow through each other.
+ */
+const BUBBLE_Y = CROWN_Y + 0.95;
+
+/**
+ * How the `n`-th agent's bubble is lifted clear of its neighbour's, **in screen pixels**.
+ *
+ * Neighbours on the arc stand about 1.3 units apart and a bubble is far wider than that on screen, so
+ * without this a selected room's bubbles sit on top of each other — measured, in the first screenshot
+ * of two working agents, where one covered the other's text. Three levels, so two bubbles at the same
+ * height are three posts apart, which is enough room to be two bubbles.
+ *
+ * Pixels rather than world units, and that is the whole point of the second attempt: the bubble is a
+ * constant *screen* size at every zoom (it has no `distanceFactor`), so a stagger measured in world
+ * units is exactly the wrong unit — half a world unit separated them at close range and became seven
+ * pixels at the reading distance, which is where the collision actually happens.
+ */
+const BUBBLE_LEVELS = 3;
+const BUBBLE_LEVEL_RISE_PX = 19;
+
+/**
+ * A line over an agent's head saying what it is doing right now.
+ *
+ * **Drawn as DOM (`<Html>`), and therefore not animated at all.** It has no `distanceFactor` — on an
+ * orthographic camera drei multiplies that by `camera.zoom`, which once filled the screen with a
+ * single label — so it is a constant screen size at every zoom, which is also what a plan view wants.
+ * Nothing here moves under its own clock, so `hasMotion` is untouched by this whole feature; the one
+ * frame it *does* need is the one that repositions it after its text changes, which `frameloop="demand"`
+ * would otherwise never render, so it asks for that itself.
+ *
+ * No `occlude`, unlike the building labels — deliberately. A label is architecture and may hide behind
+ * a roof; a bubble is the factory saying something, and an approval request that disappeared because
+ * the operator orbited the camera would be the one message this floor must never lose.
+ *
+ * The stripe on the left is the agent's own status colour, from the one palette: the bubble and the
+ * vest under it are the same fact, and the chrome around it is the same white chip the building labels
+ * use so the floor has one voice for text.
+ */
+function ThoughtBubble({ bubble, level }: { bubble: Bubble; level: number }) {
+  const invalidate = useThree((s) => s.invalidate);
+  // drei positions `<Html>` inside the render loop, so a bubble whose words just changed needs one
+  // frame to be drawn — and on a demand loop nothing else will ask for it.
+  useEffect(() => {
+    invalidate();
+  }, [invalidate, bubble.text]);
+
+  return (
+    <Html position={[0, BUBBLE_Y, 0]} center>
+      <div
+        style={{
+          position: "relative",
+          // The stagger. On the inner element, so drei's own centring transform on the wrapper is
+          // left alone.
+          transform: `translateY(${-level * BUBBLE_LEVEL_RISE_PX}px)`,
+          font: "500 11px system-ui, sans-serif",
+          color: "#1c1c1c",
+          background: "rgba(255,255,255,0.92)",
+          borderTop: "1px solid #c3c9ce",
+          borderRight: "1px solid #c3c9ce",
+          borderBottom: "1px solid #c3c9ce",
+          borderLeft: `3px solid ${STATUS_COLOR[bubble.status]}`,
+          borderRadius: 9,
+          padding: "2px 7px",
+          whiteSpace: "nowrap",
+          // The figure owns every pointer event around it: a bubble that swallowed a click would make
+          // the building under it unselectable from exactly where the operator is looking.
+          pointerEvents: "none",
+          userSelect: "none",
+        }}
+      >
+        {bubble.text}
+        {/* The tail. Without it this is a second building label floating at head height; with it, it
+            belongs to the figure underneath. */}
+        <span
+          style={{
+            position: "absolute",
+            left: 9,
+            bottom: -5,
+            width: 0,
+            height: 0,
+            borderLeft: "4px solid transparent",
+            borderRight: "4px solid transparent",
+            borderTop: "5px solid rgba(255,255,255,0.92)",
+          }}
+        />
+      </div>
+    </Html>
+  );
+}
+
 /** One agent's walk to a bay and back: the clock the store fixed, and the route it implies. */
 interface Fetch {
   errand: Errand;
@@ -367,6 +465,8 @@ const AgentFigure = memo(function AgentFigure({
   roleId,
   bypass,
   orchestrator,
+  bubbles,
+  bubbleLevel,
   x,
   z,
   fetch,
@@ -381,6 +481,10 @@ const AgentFigure = memo(function AgentFigure({
   bypass: boolean;
   /** This is the factory's senior agent. See `MAST_GEOMETRY` for why it is a shape and not a hue. */
   orchestrator: boolean;
+  /** Whether this figure should say what it is doing. See `showsBubble` for who does and who does not. */
+  bubbles: boolean;
+  /** Which of `BUBBLE_LEVELS` heights this figure's bubble hangs at, so a room's bubbles do not stack. */
+  bubbleLevel: number;
   x: number;
   z: number;
   /** This agent has been sent to a bay to meet a crate, or `undefined` if it is at its post. */
@@ -454,6 +558,7 @@ const AgentFigure = memo(function AgentFigure({
     if (crate.current !== null) crate.current.visible = false;
   }, [working, blocked, fetch, x, z, restYaw]);
 
+  const bubble = useAgentBubble(id, bubbles);
   const vest = VEST_MATERIALS[status];
   const look = roleLook(roleId);
   // The role decides the hat's shape; seniority overrules its colour and nothing else.
@@ -521,6 +626,11 @@ const AgentFigure = memo(function AgentFigure({
         )}
       </group>
 
+      {/* Outside the facing group, so it never turns edge-on with the body, and outside the arms so a
+          swinging arm cannot move it. It rides the group that bobs and walks, which is what keeps it
+          attached to the figure it is speaking for. */}
+      {bubble !== null && <ThoughtBubble bubble={bubble} level={bubbleLevel} />}
+
       {bypass && (
         <>
           <mesh
@@ -553,6 +663,8 @@ export const Agents = memo(function Agents({
   kind: RoomInfo["kind"];
 }) {
   const agents = useRoomAgents(roomId);
+  // Selecting a building is what asks its agents to say what they are doing — see `showsBubble`.
+  const selected = useIsSelected(roomId);
   const errands = useRoomErrands(roomId);
   // Which way each errand's crate came from, and which way this room's belts leave: between them they
   // say which of the drawn doors the agent is walking to. Flat numbers — see `useBeltDirections`.
@@ -580,6 +692,18 @@ export const Agents = memo(function Agents({
     return byAgent;
   }, [errands, errandDirections, beltDirections, agents, slots, kind]);
 
+  // A bubble can only quote a log this tab actually holds, and the tab holds a session's log only
+  // once it has subscribed — the console does the same for the agent you click. So the floor follows
+  // exactly the agents it is about to speak for: the selected room's, and any blocked agent anywhere.
+  // Idempotent (`wsClient` keeps a set) and asked for from the last contiguous seq, not from zero.
+  //
+  // The socket call is a component's, not the store's: the store never talks to the socket.
+  useEffect(() => {
+    for (const agent of agents) {
+      if (showsBubble(agent, selected)) subscribe(agent.id);
+    }
+  }, [agents, selected]);
+
   return (
     <>
       {agents.map((agent, i) => (
@@ -589,6 +713,8 @@ export const Agents = memo(function Agents({
           status={agentStatus(agent)}
           roleId={agent.roleId}
           bypass={agent.autonomy === "bypass"}
+          bubbles={showsBubble(agent, selected)}
+          bubbleLevel={i % BUBBLE_LEVELS}
           orchestrator={agent.isOrchestrator}
           x={slots[i][0]}
           z={slots[i][1]}

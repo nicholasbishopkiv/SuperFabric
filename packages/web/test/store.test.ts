@@ -20,6 +20,7 @@ import {
   orchestratorSession,
   roomAgents,
   roomRoleIds,
+  showsBubble,
   roomlessSessions,
   roleLabel,
   ROLE_NONE_LABEL,
@@ -499,6 +500,38 @@ describe("roomAgents", () => {
     // a figure standing next to a label that says "2 agents" would be a lie either way round
     expect(roomAgents(sessions, "r1")).toHaveLength(liveAgentCount(sessions, "r1"));
     expect(roomAgents(sessions, "r1").map((s) => s.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("showsBubble", () => {
+  it("gives every agent in the selected room a bubble, and nobody else one", () => {
+    const busy = session({ status: "working" });
+    expect(showsBubble(busy, true)).toBe(true);
+    expect(showsBubble(busy, false)).toBe(false);
+    const quiet = session({ status: "idle" });
+    expect(showsBubble(quiet, true)).toBe(true);
+    expect(showsBubble(quiet, false)).toBe(false);
+  });
+
+  it("**always** gives a blocked agent one, wherever it is standing", () => {
+    // The one case that is not detail: the factory is asking the operator a question, and making them
+    // hunt for which figure it was wastes the only thing the amber vest cannot say.
+    const stuck = session({ status: "idle", blocked: true });
+    expect(showsBubble(stuck, false)).toBe(true);
+    expect(showsBubble(stuck, true)).toBe(true);
+  });
+
+  it("does not single out a paused or failed agent on an unselected room", () => {
+    // Both are quiet facts about a room, and the beacon already carries them; only an approval is a
+    // question aimed at the operator.
+    expect(showsBubble(session({ state: "paused" }), false)).toBe(false);
+    expect(showsBubble(session({ status: "error" }), false)).toBe(false);
+  });
+
+  it("agrees with the floor's own status, so a bubble never contradicts a vest", () => {
+    const stuck = session({ status: "working", blocked: true });
+    expect(agentStatus(stuck)).toBe("blocked");
+    expect(showsBubble(stuck, false)).toBe(true);
   });
 });
 

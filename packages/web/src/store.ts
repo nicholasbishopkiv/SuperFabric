@@ -19,6 +19,7 @@ import type {
 } from "@superfabric/shared";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
+import { agentBubble, type Bubble } from "./scene/bubble";
 import {
   chooseFetcher,
   errandEndsAt,
@@ -1511,6 +1512,57 @@ export function roomAgents(sessions: readonly SessionInfo[], roomId: string): Se
  */
 export const useRoomAgents = (roomId: string): SessionInfo[] =>
   useFabric(useShallow((s) => roomAgents(s.sessions, roomId)));
+
+// ---- what an agent is doing ----------------------------------------------------------------------
+
+/**
+ * Whether the floor should put a thought bubble over this agent, and it is **the** decision this
+ * feature turns on: twenty bubbles at once is a floor nobody can read, so what matters is not how a
+ * bubble is drawn but when there is one.
+ *
+ * Two cases, and deliberately no third:
+ *
+ * - **Every agent in the room the operator selected.** Selecting a building is already this floor's
+ *   "tell me more about this" gesture — it opens the room panel — so it is where the detail belongs,
+ *   and it bounds the count to one department's agents. With nothing selected, the floor is exactly as
+ *   quiet as it was before this feature: no bubbles at all.
+ * - **Any agent that is `blocked`, anywhere.** That one is not detail: it is the factory asking the
+ *   operator a question, and making them hunt for which figure it was would waste the only thing the
+ *   amber vest cannot say — *what* it is asking about. Blocked agents are normally few; if they are
+ *   not, then a floor covered in "waiting for you" is the correct picture.
+ *
+ * Everything else was considered and dropped. *Always while working* is the twenty-bubble floor.
+ * *On hover* asks the operator to find a 40-pixel figure with the pointer, and the standing lesson of
+ * the blocked pose is that at that size only a silhouette survives. *Nearest N to the camera* makes
+ * which bubbles you get depend on where you happened to pan.
+ */
+export function showsBubble(
+  session: Pick<SessionInfo, "state" | "status" | "blocked">,
+  roomSelected: boolean,
+): boolean {
+  return roomSelected || agentStatus(session) === "blocked";
+}
+
+/**
+ * What the bubble over one agent says, or `null` for none — including when it is not being shown at
+ * all, so an unselected room's figures do the work of nothing.
+ *
+ * `useShallow`, because the answer is a fresh little object every time: without it a selector that
+ * builds one re-renders for ever, and with it a bubble whose text has not changed does not re-render at
+ * all. That matters here more than usual — a working agent's log grows several rows a second.
+ */
+export const useAgentBubble = (sessionId: string, show: boolean): Bubble | null =>
+  useFabric(
+    useShallow((s) => {
+      if (!show) return null;
+      const session = s.sessions.find((x) => x.id === sessionId);
+      if (session === undefined) return null;
+      return agentBubble(
+        { status: agentStatus(session), pausedUntil: session.pausedUntil },
+        s.events[sessionId] ?? [],
+      );
+    }),
+  );
 
 /**
  * The distinct roles standing in one room, sorted — which is what the room's **furniture** is chosen
