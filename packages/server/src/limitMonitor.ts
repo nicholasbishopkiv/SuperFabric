@@ -163,6 +163,16 @@ export class LimitMonitor {
   }
 
   /**
+   * Re-read the stored readings. The public door onto `hydrate`, for the one caller that writes
+   * snapshots behind this class's back: demo mode, which seeds a history so the meters and the
+   * burn-rate projection have something to draw. Nothing in a real factory needs it — the monitor
+   * writes every reading it holds.
+   */
+  reload(): void {
+    this.hydrate();
+  }
+
+  /**
    * Bring the last known reading of every account back into memory.
    *
    * Persistence exists for exactly this moment: without it a reboot shows every meter empty, and an

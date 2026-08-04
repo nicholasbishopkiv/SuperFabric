@@ -145,6 +145,10 @@ function harness(): Harness {
   });
   const mgr = new SessionManager(db, store, executor, rooms, projects, {
     accounts,
+    // The *same* clock the monitor and the scheduler run on. `paused_at` is compared against a
+    // reading's timestamp, so two clocks here make the outcome depend on what time of day the suite
+    // is run at — which is exactly what happened before this line existed.
+    now: () => clock.ms,
     onRateLimited: (_s, accountId) => { if (accountId !== null) monitor.markLimited(accountId, "429"); },
   });
   const scheduler = new LimitScheduler({

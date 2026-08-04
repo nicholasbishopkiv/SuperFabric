@@ -1,5 +1,5 @@
-import { mkdirSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import Docker from "dockerode";
 import Fastify from "fastify";
@@ -9,6 +9,7 @@ import { AccountLoginManager, CredentialsWatcher } from "./accountLogin.js";
 import { AccountManager } from "./accountManager.js";
 import { registerAttachmentRoutes } from "./attachmentRoutes.js";
 import { Chronicle } from "./chronicle.js";
+import { DemoExecutor, startDemo } from "./demo.js";
 import { Demolition } from "./demolition.js";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
@@ -34,7 +35,19 @@ import { RunnerHub } from "./runnerHub.js";
 import { startRunnerListener } from "./runnerListener.js";
 import { WsHub } from "./wsHub.js";
 
-const dataDir = process.env.SUPERFABRIC_DATA ?? path.join(process.cwd(), ".fabrica");
+/**
+ * Demo mode: a seeded factory that simulates everything and reaches no real CLI.
+ *
+ * Two things follow from the flag and they are both here rather than buried: the data directory is a
+ * throwaway (so a demo can never write into the operator's `.fabrica`, or read the factory they
+ * actually work in), and the executors below are replaced wholesale. See `demo.ts` for why that
+ * replacement is the enforcement rather than a promise.
+ */
+const DEMO = process.env.SUPERFABRIC_DEMO === "1" || process.env.SUPERFABRIC_DEMO === "true";
+
+const dataDir = DEMO
+  ? mkdtempSync(path.join(tmpdir(), "superfabric-demo-"))
+  : process.env.SUPERFABRIC_DATA ?? path.join(process.cwd(), ".fabrica");
 mkdirSync(dataDir, { recursive: true });
 
 /** An optional numeric knob. A value that is not a number is ignored rather than becoming NaN. */
@@ -75,7 +88,7 @@ const accounts = new AccountManager(db);
 // only when `.credentials.json` is actually there: see `AccountManager.adoptAmbient`.
 // Both providers, the same way: an account is a config directory plus a row, and which CLI wrote it
 // only decides which file means "logged in" (`PROVIDER_CREDENTIALS_FILE`).
-for (const provider of AgentProvider.options) {
+for (const provider of DEMO ? [] : AgentProvider.options) {
   const fromEnv = provider === "claude" ? process.env.CLAUDE_CONFIG_DIR : process.env.CODEX_HOME;
   const dir = fromEnv ?? path.join(homedir(), PROVIDER_HOME_DIRNAME[provider]);
   const adopted = accounts.adoptAmbient(dir, provider);
@@ -163,13 +176,17 @@ const containerExecutor = new ContainerExecutor({
     : {}),
   log: (line) => console.log(`container: ${line}`),
 });
-mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
-  bus, tasks, router, chronicle, accounts, roles, skills, containerExecutor,
+// **The one place an executor is chosen**, and therefore the one place demo mode has to touch: in
+// demo every provider is the simulator, so there is no code path from an agent to a real CLI.
+const demoExecutor = new DemoExecutor();
+mgr = new SessionManager(db, store, DEMO ? demoExecutor : new ClaudeCodeExecutor(), rooms, projects, {
+  bus, tasks, router, chronicle, accounts, roles, skills,
+  ...(DEMO ? {} : { containerExecutor }),
   // The other CLIs an agent can run on. Registered unconditionally: whether the binary is actually
   // installed is a question for the moment a turn is spawned (which reports it in the agent's own
   // log), not for boot — a machine that installs `codex` tomorrow should not need a restart to have
   // asked us today. What the *picker* offers is decided from `list_toolchain`, which does look.
-  providers: { codex: new CodexExecutor() },
+  providers: { codex: DEMO ? demoExecutor : new CodexExecutor() },
   // A getter for the same reason `onRateLimited` below is a closure: it is read when an executor
   // starts, which is long after both objects exist.
   get onboarding() { return onboarding; },
@@ -246,6 +263,22 @@ scheduler.start();
 // first run opened on a factory built over SuperFabric's own source tree that nothing could remove.
 // With nothing configured the server starts empty and the UI asks for a folder.
 if (seededRoot !== undefined) projects.defaultProject();
+// …and in demo mode, one is built: eight rooms, thirteen agents, a board mid-week and traffic on the
+// belts. Into a temp directory of its own, by the same managers an operator's clicks would use.
+if (DEMO) {
+  // A named folder inside the temp directory rather than the temp directory itself: the central
+  // building is labelled with its root's basename, and `superfabric-demo-factory-Kl4trw` is not the
+  // name of anybody's project.
+  const demoRoot = path.join(mkdtempSync(path.join(tmpdir(), "superfabric-demo-")), "payments-platform");
+  mkdirSync(demoRoot, { recursive: true });
+  startDemo({
+    db, projects, rooms, tasks, bus, chronicle, accounts, sessions: mgr, root: demoRoot,
+    log: (line) => console.log(line),
+  });
+  // The seeded readings were written straight into `usage_snapshots`, which the monitor hydrated
+  // from before they existed. This is the only caller of `reload` in the product.
+  limits.reload();
+}
 // Every project needs its central building, including one that existed before this boot.
 for (const project of projects.list()) rooms.ensureProjectRoom(project.id);
 const known = projects.list();

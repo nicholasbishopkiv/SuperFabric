@@ -457,7 +457,7 @@ project is invented from the server's working directory, the UI opens on a folde
 guide, and a logged-in `~/.claude` found on disk is adopted as a visible account. See the "Removing
 things" and "First run" sections of `docs/ROADMAP.md`.
 
-**1435 tests green** (shared 89, server 885 + 1 skipped live-quota test, web 431, agent-runner 30).
+**1442 tests green** (shared 89, server 892 + 1 skipped live-quota test, web 431, agent-runner 30).
 
 **What is *not* built is listed at the end of `docs/ROADMAP.md`** and is worth reading before you
 add a doc sentence that implies otherwise — there are no notifications off the browser tab, eleven
@@ -465,6 +465,11 @@ role presets rather than fifty, one provider behind the `Executor` seam, no fold
 per-turn token counts, and no serialised OAuth refresh within a single account.
 
 ## Running it
+
+`pnpm demo` opens a seeded factory — eight rooms, twelve agents, a board mid-week, traffic on the
+belts — with **every executor replaced by a simulator**, a temp data directory and a temp project
+root. It is what the README's screenshot is, and it is the only configuration in which an agent
+cannot reach a real CLI. See `src/demo.ts`.
 
 `./scripts/setup.sh` bootstraps a bare machine — system packages, Node 22+, pnpm, Bun, the `claude`
 CLI, the plugin toolkit agents draw skills from, and `pnpm install`. It detects before it installs,
@@ -592,6 +597,10 @@ README names).
   rather than a guess when there is too little history) ·
   `factoryPortability.ts` (M5: a factory as one portable file with no credential and no absolute
   path in it, and an import that goes through `createRoom` and reports what it could not do) ·
+  `demo.ts` (demo mode: a seeded factory, and a simulator in place of every executor — the one
+  configuration in which no agent can reach a real CLI) ·
+  `demolition.ts` (removing an agent, a room or a factory: the cascade order, and the list of what
+  deliberately survives it) ·
   `taskStore.ts` (the task board; announces its own changes) ·
   `attachmentStore.ts` (files in, paths out: filename sanitising, MIME→extension, containment
   against whichever root the file is going into, and never overwriting) ·

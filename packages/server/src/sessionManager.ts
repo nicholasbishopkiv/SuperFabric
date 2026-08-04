@@ -164,6 +164,15 @@ export interface SessionManagerOptions {
    * `accountId` is null for a session on the ambient `~/.claude`, which has no row to mark.
    */
   onRateLimited?: (sessionId: string, accountId: string | null) => void;
+  /**
+   * The clock, in milliseconds. A seam rather than a feature, and the same one `TaskStore`,
+   * `Chronicle` and `LimitMonitor` already have: `paused_at` is compared against the timestamp of a
+   * *reading* to decide whether an agent may come back, so a test driving the monitor on a fake
+   * clock and this class on the real one is a test that passes or fails depending on the hour it is
+   * run at. (It did: the scheduler's 429 case started failing at 01:00 one night, because the fake
+   * clock had walked past midnight and the real one had not.)
+   */
+  now?: () => number;
 }
 
 /**
@@ -1121,7 +1130,8 @@ export class SessionManager {
    * exists to save quota.
    */
   private async applyPause(id: string, until: number | null, reason: string): Promise<void> {
-    const changed = this.stmts.markPaused.run(Math.floor(Date.now() / 1000), until, id).changes;
+    const now = Math.floor((this.opts.now?.() ?? Date.now()) / 1000);
+    const changed = this.stmts.markPaused.run(now, until, id).changes;
     // A session that is not 'active' any more (it errored, or shutdown beat us here) is not paused.
     if (changed === 0) return;
 
