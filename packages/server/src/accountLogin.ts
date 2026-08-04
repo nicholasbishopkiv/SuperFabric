@@ -104,6 +104,13 @@ interface Running {
    * being the answer.
    */
   finished: boolean;
+  /**
+   * The operator pressed Cancel. Kept because killing the child lands in `finish` with a non-zero
+   * exit, which is indistinguishable from a real failure — and reporting "failed", with whatever the
+   * CLI happened to have printed last, to someone who *chose* to stop is noise dressed as an error.
+   * A cancelled login goes quietly back to idle; only a login that failed on its own says so.
+   */
+  cancelled: boolean;
 }
 
 export interface AccountLoginDeps {
@@ -149,6 +156,7 @@ export class AccountLoginManager {
       timer: setTimeout(() => this.expire(accountId), LOGIN_TIMEOUT_MS),
       awaitingAnswer: false,
       finished: false,
+      cancelled: false,
     };
     // Never the reason the process refuses to exit: an abandoned login is a stuck operator, not a
     // reason to keep the server alive.
@@ -179,10 +187,22 @@ export class AccountLoginManager {
     this.deps.onChange();
   }
 
-  /** Give up on a login. Killing the child is what ends it; `finish` does the tidying. */
+  /**
+   * Give up on a login. Killing the child is what ends it; `finish` does the tidying.
+   *
+   * Also clears a login that has already *failed* — the button reads "Dismiss" in that state, and
+   * the entry is only still there to hold the reason on screen.
+   */
   cancel(accountId: string): void {
     const entry = this.running.get(accountId);
-    if (entry === undefined || entry.finished) return;
+    if (entry === undefined) return;
+    if (entry.finished) {
+      clearTimeout(entry.timer);
+      this.running.delete(accountId);
+      this.deps.onChange();
+      return;
+    }
+    entry.cancelled = true;
     entry.child.kill();
   }
 
@@ -253,6 +273,9 @@ export class AccountLoginManager {
 
     if (code === 0) {
       this.deps.accounts.touch(accountId);
+    } else if (entry.cancelled) {
+      // Asked for. Back to idle with nothing said, rather than an "error" whose text is whatever the
+      // CLI was in the middle of printing when it was killed.
     } else {
       // Re-inserted with no child: the state is the record of what happened, and it is cleared by
       // the next `begin` (which replaces the entry) rather than by a timer nobody asked for.
@@ -273,7 +296,9 @@ export class AccountLoginManager {
   /** An abandoned login. Killing the child lands in `finish`, which reports it as a failure. */
   private expire(accountId: string): void {
     const entry = this.running.get(accountId);
-    if (entry === undefined) return;
+    if (entry === undefined || entry.finished) return;
+    // Not `cancelled`: nobody asked for this, and an operator who wandered off has to be told why the
+    // flow is no longer waiting for them.
     entry.output = "The sign-in was not completed in time. Start it again.";
     entry.child.kill();
   }

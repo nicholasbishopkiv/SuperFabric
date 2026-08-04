@@ -297,6 +297,37 @@ describe("AccountLoginManager", () => {
     }
   });
 
+  it("a cancelled login goes quietly back to idle, not to 'failed'", () => {
+    const h = harness();
+    try {
+      h.logins.begin(h.account.id);
+      h.fake.say(REAL_PROMPT);
+      h.logins.cancel(h.account.id);
+      // Killing the child exits non-zero, which is indistinguishable from a real failure — but the
+      // operator *asked* for this, and reporting "failed: Paste code here if prompted >" at someone
+      // who pressed Cancel is noise dressed as an error.
+      expect(h.logins.stateOf(h.account.id)).toEqual({ status: "idle", url: null, message: null });
+      // And it can be started again immediately.
+      expect(() => h.logins.begin(h.account.id)).not.toThrow();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("dismissing a failed login clears it", () => {
+    const h = harness();
+    try {
+      h.logins.begin(h.account.id);
+      h.fake.exit(1);
+      expect(h.logins.stateOf(h.account.id).status).toBe("failed");
+      // The button reads "Dismiss" in that state; the entry only exists to hold the reason on screen.
+      h.logins.cancel(h.account.id);
+      expect(h.logins.stateOf(h.account.id).status).toBe("idle");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it("stopAll ends every login, so none outlives the server", () => {
     const h = harness();
     try {
