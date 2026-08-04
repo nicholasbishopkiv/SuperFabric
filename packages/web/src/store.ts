@@ -4,6 +4,7 @@ import type {
   ChronicleHit,
   MessageInfo,
   MessageKind,
+  OnboardingState,
   ProjectInfo,
   RoleProblem,
   RoleSpec,
@@ -241,6 +242,15 @@ export interface FabricState {
   conveyors: Conveyor[];
   /** Packages travelling a belt right now. Empty is the normal state. */
   packages: PackageInFlight[];
+  /**
+   * Where this factory stands with onboarding, or null before the server has said.
+   *
+   * Per project, unlike the roles and the accounts: `onboarded` is a `CLAUDE.md` at *this* project's
+   * root, so a factory switch drops it and waits for the new floor's own frame. Null is the honest
+   * pre-answer state — "we have not been told" must not draw the same surface as "this project has
+   * never been written down".
+   */
+  onboarding: OnboardingState | null;
   /** The task board, newest first — the server's whole list, rebroadcast on every change. */
   tasks: TaskInfo[];
   /** The chronicle surface's current question and its answer. See `ChronicleState`. */
@@ -383,6 +393,10 @@ const EMPTY_PROJECT_STATE = {
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
   tasks: [] as TaskInfo[],
+  // The factory we have just left may be documented and this one may not be. Null rather than a
+  // guess: the new floor's own `onboarding` frame is one round trip away, and offering to interview
+  // someone about a project we know nothing about yet is exactly the wrong first impression.
+  onboarding: null as OnboardingState | null,
   // Decisions belong to a project's own repository, so the hits from the factory we have just left
   // describe files that are not on this floor at all.
   chronicle: { asked: "", answered: null, hits: [] } as ChronicleState,
@@ -424,6 +438,7 @@ export const initialFabricState = {
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
   tasks: [] as TaskInfo[],
+  onboarding: null as OnboardingState | null,
   chronicle: { asked: "", answered: null, hits: [] } as ChronicleState,
   waiting: [] as WaitingMessage[],
   animatedMessages: {} as Record<string, true>,
@@ -733,6 +748,10 @@ export const useFabric = create<FabricState>((set, get) => ({
       // Answered once per connect and only changed by the operator editing a file, so there is
       // nothing here to coalesce or to preserve identity through — the whole list is the answer.
       if (msg.kind === "roles") return { roles: msg.roles, roleProblems: msg.problems };
+      // The whole state every time, like the room list: one frame rebuilds the surface and there is
+      // nothing to merge. It arrives unasked whenever an agent finishes a turn, which is how the
+      // offer disappears the moment the CLAUDE.md it asked for exists.
+      if (msg.kind === "onboarding") return { onboarding: msg.onboarding };
       // An answer to a question nobody is asking any more is dropped: the operator has typed on,
       // and showing them the hits for a prefix of what is in the box would be worse than showing
       // them nothing. See `ChronicleState`.
@@ -1042,6 +1061,14 @@ export function roleLabel(roles: readonly RoleSpec[], roleId: string | null): st
 
 /** What "no role" is called wherever it is offered or shown. */
 export const ROLE_NONE_LABEL = "no role";
+
+// ---- onboarding ----
+//
+// Per project, unlike the roles and the accounts: whether a project has been written down is a fact
+// about *that* project's root folder.
+
+/** Where this factory stands with onboarding, or null before the server has said. */
+export const useOnboarding = (): OnboardingState | null => useFabric((s) => s.onboarding);
 
 /** The factory this tab is showing, or undefined before the server has said which. */
 export const useActiveProject = (): ProjectInfo | undefined =>
