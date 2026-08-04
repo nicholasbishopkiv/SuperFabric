@@ -457,7 +457,7 @@ project is invented from the server's working directory, the UI opens on a folde
 guide, and a logged-in `~/.claude` found on disk is adopted as a visible account. See the "Removing
 things" and "First run" sections of `docs/ROADMAP.md`.
 
-**1435 tests green** (shared 89, server 885 + 1 skipped live-quota test, web 431, agent-runner 30).
+**1520 tests** (shared 89, server 885 + 1 skipped live-quota test, web 516, agent-runner 30).
 
 **What is *not* built is listed at the end of `docs/ROADMAP.md`** and is worth reading before you
 add a doc sentence that implies otherwise — there are no notifications off the browser tab, eleven
@@ -620,7 +620,10 @@ README names).
   head)) ·
   `hud/*` (room panel,
   console drawer, task board, the chronicle popover, the account switcher and its login flow
-  (`TopLeftBar` places it beside the project switcher), the per-account limit meters inside that
+  (`TopLeftBar` places it beside the project switcher), **how much subscription is left, on the
+  switcher's own trigger** (`limitHeadline.ts` — pure, and mostly about *silence*: with no accounts,
+  no credentials or no poll yet the strip says which of those it is, because a blank reads as "fine"
+  while the scheduler stands by to pause the whole floor at 95 %), the per-account limit meters inside that
   popover (`UsageMeters.tsx` — hatched bars and a `≈` wherever a figure is a guess) and the
   burn rate and cost-equivalent under them plus this factory's spend by room (`BurnRate.tsx` —
   a duration at a resolution the readings support, and "Time left: unknown" with the server's
@@ -633,7 +636,9 @@ README names).
   export/import in the project switcher (`FactoryTransfer.tsx` — the import's *problems* list is
   the point of the surface and stays up until dismissed; the download happens in an effect,
   because writing a file is a DOM side effect and the store is a reducer),
-  window-wide paste/drop target, the one `NoticeBar`, and `Panel.tsx`
+  window-wide paste/drop target, the one `NoticeBar`, `collapseRuns.ts` (consecutive identical
+  transcript rows folded into `· starting ×18`, adjacent-only — folding non-adjacent repeats would
+  reorder a transcript, and a transcript whose order is a lie is worse than a long one) and `Panel.tsx`
   — the shared collapsible edge-panel chrome all three edges are built from) ·
   the role picker (`RoleSelect.tsx` — name plus its one-line summary, on the room panel's
   "New agents arrive as" line and on every agent row),
@@ -644,12 +649,24 @@ README names).
   `Onboarding.tsx` (first contact, over the floor: the offer on an un-onboarded project, the
   "under way" strip, and the accept/edit room list — `onboardingSurface` is the one pure function
   that decides which of the four, so "prominent only when un-onboarded" is testable),
-  `ui/*` (shadcn components vendored as our own source: button, input, select, popover, badge).
+  `ui/*` (shadcn components vendored as our own source: button, input, select, popover, badge,
+  tooltip, tabs, scroll-area, separator, card, progress, dialog, alert — all Radix, all MIT).
+  Three of them carry decisions rather than styling: **`Button` and `Badge` route their own `title`
+  into a real tooltip**, and the wrapping happens *inside* the component so
+  `<PopoverTrigger asChild><Button title="…"/></PopoverTrigger>` keeps working — Radix clones the
+  `Button` element and its handlers still reach the real `<button>`; wrapping the other way round
+  puts a plain function component in that chain and drops them silently. **`Progress` takes its fill
+  as a style rather than a variant**, because the callers that matter hatch the bar when the reading
+  is a guess, and that is semantics, not a look to be picked. **`Card` is the middle of the surface
+  hierarchy** — `panel` is the chassis, a card is an entity standing on it, `CardBody` is content
+  recessed into one; before it existed every surface was `bg-panel/80` and a create-room form weighed
+  as much as the rooms it created.
   **Styling is Tailwind v4** (`src/index.css`, `@theme`, no config file). Chrome colours are
   declared there and are deliberately neutral; every colour that *means* something —
   the five statuses, selection, bypass — is generated from `scene/palette.ts` by
   `hud/tokens.ts` and referenced as a CSS variable, so the HUD and the floor cannot disagree.
-  Never re-type one of those hexes. `paused` is the fifth and is deliberately *quiet* — a cold dark
+  Never re-type one of those hexes — `test/hudHygiene.test.ts` now fails on one, and on a native
+  `title=` reaching a DOM element. `paused` is the fifth and is deliberately *quiet* — a cold dark
   slate read against `idle` by temperature and value, not a fourth alarm colour — but it outranks
   `working` in a room's beacon, because a half-stopped room is the half nobody would otherwise
   notice.
