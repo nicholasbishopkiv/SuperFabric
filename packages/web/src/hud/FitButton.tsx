@@ -1,6 +1,7 @@
+import { ExpandIcon } from "lucide-react";
 import { useEffect } from "react";
-import { useFabric } from "../store";
-import { HUD } from "./theme";
+import { useFabric, useHudInsets } from "../store";
+import { Button } from "../ui/button";
 
 /**
  * "Fit" — put the whole factory back in frame, at the default isometric angle.
@@ -16,6 +17,9 @@ import { HUD } from "./theme";
  */
 export function FitButton() {
   const requestCameraFit = useFabric((s) => s.requestCameraFit);
+  // Pinned to the free strip's bottom-left corner rather than the viewport's, so the room panel
+  // never paints over it and it never floats on top of the task board.
+  const insets = useHudInsets();
 
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
@@ -32,23 +36,15 @@ export function FitButton() {
   }, [requestCameraFit]);
 
   return (
-    <button
+    <Button
       onClick={requestCameraFit}
+      size="md"
+      className="fixed z-40 bg-panel/80 backdrop-blur-xl"
+      style={{ left: insets.left + 12, bottom: insets.bottom + 12 }}
       title="Frame the whole factory and restore the default view (f) — drag to pan, right-drag to orbit, wheel to zoom"
-      style={{
-        position: "fixed",
-        left: 12,
-        bottom: 12,
-        font: "600 13px system-ui, sans-serif",
-        color: HUD.text,
-        background: HUD.panel,
-        border: `1px solid ${HUD.line}`,
-        borderRadius: 6,
-        padding: "5px 10px",
-        cursor: "pointer",
-      }}
     >
-      ⤢ fit
-    </button>
+      <ExpandIcon />
+      fit
+    </Button>
   );
 }

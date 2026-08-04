@@ -1,7 +1,8 @@
+import { DownloadIcon, LoaderCircleIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { dragHasFiles, filesFromClipboard, uploadIntoComposer } from "../attachments";
 import { useFabric, useSelectedRoomId } from "../store";
-import { HUD as C } from "./theme";
+import { cn } from "../ui/utils";
 
 /**
  * Paste and drop, for the whole window.
@@ -88,37 +89,25 @@ export function AttachmentDrop() {
   return (
     <div
       data-testid="attachment-drop"
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 50,
+      className={cn(
         // Never intercept the pointer: the drop is handled on `window`, and an overlay that ate
         // events would break the drag it is describing.
-        pointerEvents: "none",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: dragging ? "rgba(10, 90, 120, 0.18)" : "transparent",
-        border: dragging ? `3px dashed ${C.accent}` : "none",
-        boxSizing: "border-box",
-      }}
+        "pointer-events-none fixed inset-0 z-50 flex items-center justify-center",
+        dragging && "border-[3px] border-dashed border-accent bg-accent/10",
+      )}
     >
-      <div
-        style={{
-          font: "600 16px system-ui, sans-serif",
-          color: C.text,
-          background: "#ffffffee",
-          border: `1px solid ${C.line}`,
-          borderRadius: 8,
-          padding: "12px 18px",
-          boxShadow: "0 6px 24px rgba(0,0,0,0.18)",
-          textAlign: "center",
-        }}
-      >
-        {uploading ? "Saving…" : "Drop to save into "}
-        {!uploading && <code style={{ font: "inherit", fontWeight: 400 }}>{where}</code>}
-        <div style={{ font: "400 12px system-ui, sans-serif", color: C.dim, marginTop: 4 }}>
-          The agent is handed the path, never the bytes.
+      <div className="flex items-center gap-2.5 rounded-[6px] border border-line-strong bg-panel/90 px-4 py-3 text-center shadow-[0_10px_40px_rgba(0,0,0,0.6)] backdrop-blur-xl">
+        {uploading ? (
+          <LoaderCircleIcon className="size-4 shrink-0 animate-spin text-accent" />
+        ) : (
+          <DownloadIcon className="size-4 shrink-0 text-accent" />
+        )}
+        <div className="text-left">
+          <div className="text-sm font-semibold text-fg">
+            {uploading ? "Saving…" : "Drop to save into "}
+            {!uploading && <code className="font-mono font-normal text-accent">{where}</code>}
+          </div>
+          <div className="text-2xs text-fg-muted">The agent is handed the path, never the bytes.</div>
         </div>
       </div>
     </div>

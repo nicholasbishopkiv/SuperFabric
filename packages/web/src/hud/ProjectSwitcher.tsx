@@ -1,8 +1,11 @@
+import { ChevronsUpDownIcon, FactoryIcon, PlusIcon } from "lucide-react";
 import { useState } from "react";
 import { useActiveProject, useFabric, useHudInsets, useProjects } from "../store";
-import { SELECT_COLOR } from "../scene/palette";
+import { Button } from "../ui/button";
+import { FieldNote, Input } from "../ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
+import { cn } from "../ui/utils";
 import { createProject, openProject } from "../wsClient";
-import { HUD } from "./theme";
 
 /**
  * The project switcher: which factory this tab is looking at, and how to look at another.
@@ -10,6 +13,12 @@ import { HUD } from "./theme";
  * It sits along the top edge because the top edge is the one thing the HUD leaves free — the room
  * panel owns the left, the console the right, the board the bottom — and it is offset by the room
  * panel's own width so the two never overlap however wide the panel gets.
+ *
+ * Now a Radix popover rather than a box that grew when clicked: the list of factories and the
+ * "add one" form only exist while they are being used, and growing a panel over the floor to hold
+ * them cost a permanent hole in the view. Radix also brings what a hand-rolled dropdown over a
+ * canvas gets wrong — click-outside, Escape, focus return, and a portal that clears the WebGL
+ * surface.
  *
  * Switching is a server round trip, not a local filter: the socket's active project is what scopes
  * every list, so this only sends `open_project` and waits. The store throws away the previous
@@ -23,7 +32,6 @@ export function ProjectSwitcher() {
   const active = useActiveProject();
   const activeProjectId = useFabric((s) => s.activeProjectId);
   const connected = useFabric((s) => s.connected);
-  const lastError = useFabric((s) => s.lastError);
   const clearError = useFabric((s) => s.clearError);
   const insets = useHudInsets();
 
@@ -50,50 +58,29 @@ export function ProjectSwitcher() {
 
   return (
     <div
-      style={{
-        position: "fixed",
-        top: 12,
-        // The room panel measures itself into `hudInsets.left`; sitting past it is what keeps this
-        // out of the panel's way when it is open and hard against the edge when it is collapsed.
-        left: insets.left + 12,
-        maxWidth: "min(420px, calc(100vw - 32px))",
-        fontFamily: "system-ui, sans-serif",
-        fontSize: 14,
-        color: HUD.text,
-        background: HUD.panel,
-        border: `1px solid ${HUD.line}`,
-        borderRadius: 6,
-        padding: open ? "8px 10px" : "5px 8px",
-        boxSizing: "border-box",
-      }}
+      className="fixed top-3 z-40"
+      // The room panel measures itself into `hudInsets.left`; sitting past it is what keeps this out
+      // of the panel's way when it is open and hard against the edge when it is collapsed.
+      style={{ left: insets.left + 12 }}
     >
-      <button
-        onClick={() => setOpen(!open)}
-        title={active === undefined ? "Waiting for the server…" : `Factory root: ${active.root}`}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          width: "100%",
-          font: "600 13px system-ui, sans-serif",
-          color: HUD.text,
-          background: "transparent",
-          border: "none",
-          padding: 0,
-          cursor: "pointer",
-          textAlign: "left",
-        }}
-      >
-        <span style={{ color: HUD.dim, fontWeight: 400 }}>factory</span>
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {active?.name ?? (connected ? "—" : "connecting…")}
-        </span>
-        <span style={{ color: HUD.dim, fontWeight: 400 }}>{open ? "▴" : "▾"}</span>
-      </button>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            variant="outline"
+            size="md"
+            className="max-w-[min(320px,50vw)] bg-panel/80 backdrop-blur-xl"
+            title={active === undefined ? "Waiting for the server…" : `Factory root: ${active.root}`}
+          >
+            <FactoryIcon className="text-fg-faint" />
+            <span className="truncate font-semibold">
+              {active?.name ?? (connected ? "—" : "connecting…")}
+            </span>
+            <ChevronsUpDownIcon className="text-fg-faint" />
+          </Button>
+        </PopoverTrigger>
 
-      {open && (
-        <div style={{ marginTop: 8 }}>
-          <ul style={{ listStyle: "none", margin: "0 0 8px", padding: 0 }}>
+        <PopoverContent className="w-[min(420px,90vw)]">
+          <ul className="mb-2 space-y-0.5">
             {projects.map((p) => {
               const selected = p.id === activeProjectId;
               return (
@@ -102,64 +89,61 @@ export function ProjectSwitcher() {
                     onClick={() => switchTo(p.id)}
                     disabled={!connected}
                     title={p.root}
-                    style={{
-                      display: "block",
-                      width: "100%",
-                      font: "inherit",
-                      textAlign: "left",
-                      padding: "5px 7px",
-                      marginBottom: 3,
-                      cursor: "pointer",
+                    className={cn(
+                      "block w-full rounded-[3px] border px-2 py-1 text-left outline-none transition-colors",
+                      "focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-40",
                       // Selection is cyan everywhere in this UI: on the floor, in the room list, here.
-                      background: selected ? "#e6fbff" : "#fff",
-                      border: `1px solid ${selected ? SELECT_COLOR : HUD.line}`,
-                      borderRadius: 4,
-                    }}
+                      selected
+                        ? "border-accent/70 bg-accent/12"
+                        : "border-transparent hover:border-line hover:bg-fg/5",
+                    )}
                   >
-                    <div style={{ fontWeight: selected ? 700 : 400 }}>{p.name}</div>
-                    <div style={{ color: HUD.dim, fontSize: 12, wordBreak: "break-all" }}>{p.root}</div>
+                    <div className={cn("truncate text-sm", selected ? "font-semibold text-accent" : "text-fg")}>
+                      {p.name}
+                    </div>
+                    <div className="break-all font-mono text-2xs text-fg-muted">{p.root}</div>
                   </button>
                 </li>
               );
             })}
             {projects.length === 0 && (
-              <li style={{ color: HUD.dim }}>{connected ? "No projects yet." : "Waiting for the server…"}</li>
+              <li className="text-2xs text-fg-faint">
+                {connected ? "No projects yet." : "Waiting for the server…"}
+              </li>
             )}
           </ul>
 
-          <form onSubmit={submit}>
-            <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
-              <input
+          <form onSubmit={submit} className="border-t border-line pt-2">
+            <div className="flex gap-1.5">
+              <Input
                 name="projectRoot"
                 value={root}
                 onChange={(e) => setRoot(e.target.value)}
                 placeholder="/absolute/path/to/a/project"
-                style={{ flex: 2, minWidth: 0, padding: "5px 7px", font: "inherit" }}
+                className="flex-2 font-mono text-xs"
               />
-              <input
+              <Input
                 name="projectName"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="name (optional)"
-                style={{ flex: 1, minWidth: 0, padding: "5px 7px", font: "inherit" }}
+                className="flex-1"
               />
-              <button type="submit" disabled={!connected} style={{ font: "inherit" }}>
+              <Button type="submit" variant="accent" disabled={!connected} className="shrink-0">
+                <PlusIcon />
                 Add
-              </button>
+              </Button>
             </div>
             {/* Honest about what this field is. A real folder picker needs either the File System
                 Access API (Chromium only, and it hands back a handle rather than a path the server
                 could open) or a server-side browse endpoint; neither exists yet. */}
-            <div style={{ color: HUD.dim, fontSize: 12 }}>
+            <FieldNote>
               Type the folder's absolute path — the browser cannot hand the server a real directory
               path yet, so there is no folder picker. The folder must already exist.
-            </div>
-            {lastError !== null && (
-              <div style={{ color: HUD.err, fontSize: 12, marginTop: 4 }}>server: {lastError}</div>
-            )}
+            </FieldNote>
           </form>
-        </div>
-      )}
+        </PopoverContent>
+      </Popover>
     </div>
   );
 }

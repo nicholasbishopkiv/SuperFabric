@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { AttachmentDrop } from "./hud/AttachmentDrop";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
 import { FitButton } from "./hud/FitButton";
+import { NoticeBar } from "./hud/NoticeBar";
 import { ProjectSwitcher } from "./hud/ProjectSwitcher";
 import { RoomPanel } from "./hud/RoomPanel";
 import { TaskPanel } from "./hud/TaskPanel";
@@ -29,6 +30,9 @@ export default function App() {
       <ConsoleDrawer />
       <TaskPanel />
       <ProjectSwitcher />
+      {/* The one place the server speaks: `error` and `notice`, centred in the strip the panels
+          leave free. No panel renders either any more — see `NoticeBar`. */}
+      <NoticeBar />
       {/* Last, so it paints over the panel's own corner. */}
       <FitButton />
       {/* Not a panel: a window-wide paste/drop surface that only draws anything while a file is
