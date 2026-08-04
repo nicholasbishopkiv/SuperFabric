@@ -497,6 +497,90 @@ describe("the chronicle tools", () => {
     });
   });
 
+  // ---- long records: kept and marked, never refused ----
+  //
+  // The live failure this guards against happened upstream of us — the model's own tool-input
+  // serialisation gave out around 3 kB and the API refused the call before it ever reached a
+  // handler. That is not fixable from here. What *is* ours is the second half of the same story: a
+  // record that does arrive but runs long must not be thrown away by our own schema, because a
+  // rejected decision is a decision nobody ever wrote down.
+
+  it("records a 4 kB context in full", async () => {
+    await withChronicle(async ({ call, toolsFor, chronicle, backend, projectId }) => {
+      const context = "why this was hard.".repeat(210).trim(); // ~3.8 kB, past where the live call broke
+      const res = resultOf(await call(toolsFor(backend.id), "factory_record_decision", {
+        title: "A long one", context, decision: "do the thing",
+      }));
+
+      expect(res.isError).toBe(false);
+      expect(res.text).not.toMatch(/truncated/i);
+      const recorded = chronicle.list(projectId);
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]!.context).toBe(context);
+      expect(readFileSync(recorded[0]!.path, "utf8")).toContain(context);
+    });
+  });
+
+  it("keeps an over-long decision, truncated and marked, rather than refusing it", async () => {
+    await withChronicle(async ({ call, toolsFor, chronicle, backend, projectId }) => {
+      const res = resultOf(await call(toolsFor(backend.id), "factory_record_decision", {
+        title: "An enormous one",
+        context: "x".repeat(12_000),
+        decision: "y".repeat(20_000),
+        alternatives: "z".repeat(9_000),
+      }));
+
+      // The decision landed. That is the whole point: losing it because it was long is worse than
+      // keeping a shortened copy that admits it is shortened.
+      expect(res.isError).toBe(false);
+      const recorded = chronicle.list(projectId);
+      expect(recorded).toHaveLength(1);
+
+      // Every over-long field is cut to the stored budget and carries the marker.
+      for (const field of [recorded[0]!.context, recorded[0]!.decision, recorded[0]!.alternatives]) {
+        expect(field.length).toBe(8000);
+        expect(field).toContain("truncated by SuperFabric");
+      }
+      // …and the ADR file says so too, so a reader who never sees the tool reply still knows.
+      expect(readFileSync(recorded[0]!.path, "utf8")).toContain("truncated by SuperFabric");
+
+      // The agent is told what was cut and what to do about it, in words it can act on.
+      expect(res.text).toMatch(/truncated/i);
+      expect(res.text).toContain("context");
+      expect(res.text).toContain("decision");
+      expect(res.text).toContain("alternatives");
+      expect(res.text).toMatch(/edit the file/i);
+    });
+  });
+
+  it("caps an over-long title and an over-long link list instead of rejecting them", async () => {
+    await withChronicle(async ({ call, toolsFor, chronicle, backend, projectId }) => {
+      const res = resultOf(await call(toolsFor(backend.id), "factory_record_decision", {
+        title: "T".repeat(500),
+        context: "",
+        decision: "do the thing",
+        links: Array.from({ length: 30 }, (_, i) => `src/file-${i}.ts`),
+      }));
+
+      expect(res.isError).toBe(false);
+      const recorded = chronicle.list(projectId)[0]!;
+      expect(recorded.title.length).toBe(200);
+      expect(recorded.links).toHaveLength(20);
+      expect(recorded.links[0]).toBe("src/file-0.ts");
+      expect(res.text).toMatch(/truncated/i);
+    });
+  });
+
+  it("asks the model for a concise record, since a huge tool input may never arrive at all", async () => {
+    await withChronicle(({ toolsFor, backend }) => {
+      const record = toolsFor(backend.id).find((d) => d.name === "factory_record_decision")!;
+      expect(record.description).toMatch(/short|concise/i);
+      expect(record.description).toMatch(/not an essay/i);
+      // No length limit is advertised as a refusal, because none of them is one.
+      expect(record.description).toMatch(/never rejected|ever rejected for being too long/i);
+    });
+  });
+
   it("factory_search_history reports what, when, who and a snippet", async () => {
     await withChronicle(async ({ call, toolsFor, backend }) => {
       await call(toolsFor(backend.id), "factory_record_decision", {
