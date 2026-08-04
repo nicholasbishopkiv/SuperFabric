@@ -9,6 +9,8 @@ import {
   agentStatus,
   beltDirections,
   beltFan,
+  crateDirections,
+  errandDirections,
   DEFAULT_PACKAGE_MS,
   hasMotion,
   initialFabricState,
@@ -35,6 +37,7 @@ beforeEach(() => {
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
     selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
+    bayCrates: [], errands: [],
     projects: [], activeProjectId: null, accounts: [], usage: [], roles: [], roleProblems: [],
     chronicle: { asked: "", answered: null, hits: [] },
   });
@@ -1135,7 +1138,7 @@ describe("bus messages on the belts", () => {
 });
 
 describe("hasMotion", () => {
-  const still = { sessions: [], packages: [], drag: null };
+  const still = { sessions: [], packages: [], drag: null, errands: [] };
 
   it("is false for an empty factory", () => {
     expect(hasMotion(still)).toBe(false);
@@ -1201,6 +1204,223 @@ describe("hasMotion", () => {
   });
 });
 
+// ---- M5: agents that fetch crates, and chimneys that fade ----
+
+describe("agents fetching a crate from the bay", () => {
+  /** The project block plus two workshops, joined to it by the spine. */
+  const floor = () =>
+    apply({
+      kind: "rooms",
+      rooms: [
+        room({ id: "p", name: "shop", kind: "project", position: { x: 0, z: 0 } }),
+        room({ id: "r1", name: "backend", position: { x: 12, z: 0 } }),
+        room({ id: "r2", name: "web", position: { x: 0, z: 12 } }),
+      ],
+    });
+
+  const staff = (...sessions: SessionInfo[]) => apply({ kind: "sessions", sessions });
+
+  const state = () => useFabric.getState();
+
+  it("sends one of the receiving room's agents out to meet the box", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 100);
+
+    expect(state().errands).toHaveLength(1);
+    expect(state().errands[0]).toMatchObject({
+      agentId: "a1",
+      roomId: "r1",
+      fromRoomId: "p",
+      crateId: state().packages[0].id,
+    });
+    // Timed to meet it: the walk is planned from the box's own arrival, not from now.
+    expect(state().errands[0].pickupAt).toBeGreaterThanOrEqual(
+      state().packages[0].startedAt + state().packages[0].durationMs,
+    );
+  });
+
+  it("stands the box on the dock until the agent walking to it actually gets there", () => {
+    // The walk round a building is routinely longer than the belt ride, so the box lands before the
+    // agent arrives. It has to be *visible* for those seconds, or it teleports into a pair of hands.
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 100);
+    const errand = state().errands[0];
+    expect(errand.pickupAt).toBeGreaterThan(Date.now() + 100);
+
+    state().reapPackages(Date.now() + 200);
+    expect(state().packages).toEqual([]);
+    expect(state().bayCrates).toHaveLength(1);
+    expect(state().bayCrates[0].id).toBe(errand.crateId);
+  });
+
+  it("takes the crate off the dock the moment the agent picks it up, not when it gets home", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 100);
+    const errand = state().errands[0];
+    state().reapPackages(Date.now() + 200);
+    expect(state().bayCrates).toHaveLength(1);
+
+    state().reapErrands(errand.pickupAt);
+    // In its hands, and only in its hands: the errand still has the whole walk home to run.
+    expect(state().bayCrates).toEqual([]);
+    expect(state().errands).toHaveLength(1);
+  });
+
+  it("never re-lands a crate the agent is already carrying", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 100);
+    const errand = state().errands[0];
+    state().reapPackages(errand.pickupAt + 1);
+    expect(state().bayCrates).toEqual([]);
+  });
+
+  it("clears the errand and the crate when the agent has walked back in", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 100);
+    const errand = state().errands[0];
+
+    state().reapErrands(errand.pickupAt + errand.legMs - 1);
+    expect(state().errands).toHaveLength(1);
+
+    state().reapErrands(errand.pickupAt + errand.legMs);
+    expect(state().errands).toEqual([]);
+    expect(state().bayCrates).toEqual([]);
+  });
+
+  it("leaves the crate at the bay when the room has nobody home", () => {
+    floor();
+    state().sendPackage("p", "r2", 50);
+    expect(state().errands).toEqual([]);
+
+    state().reapPackages(Date.now() + 100);
+    expect(state().bayCrates).toMatchObject([{ roomId: "r2", fromRoomId: "p" }]);
+  });
+
+  it("piles them up: a room nobody is in accumulates, visibly", () => {
+    floor();
+    state().sendPackage("p", "r2", 50);
+    state().sendPackage("p", "r2", 50);
+    state().sendPackage("p", "r2", 50);
+    state().reapPackages(Date.now() + 100);
+    expect(state().bayCrates).toHaveLength(3);
+    // And it stays: a pile is a state, and nothing about it is an animation.
+    expect(hasMotion(state())).toBe(false);
+  });
+
+  it("sends nobody when the room's only agent is blocked, so the crate waits", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle", blocked: true }));
+    state().sendPackage("p", "r1", 50);
+    expect(state().errands).toEqual([]);
+
+    state().reapPackages(Date.now() + 100);
+    expect(state().bayCrates).toHaveLength(1);
+  });
+
+  it("collects the pile the moment somebody frees up", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle", blocked: true }));
+    state().sendPackage("p", "r1", 50);
+    state().reapPackages(Date.now() + 100);
+    expect(state().bayCrates).toHaveLength(1);
+
+    // The approval is answered: the agent is free, and there is a crate at its own door.
+    staff(session({ id: "a1", roomId: "r1", status: "idle", blocked: false }));
+    expect(state().errands).toMatchObject([{ agentId: "a1", crateId: state().bayCrates[0].id }]);
+  });
+
+  it("sends one agent per crate: a second box waits for a second pair of hands", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 50);
+    state().sendPackage("p", "r1", 50);
+
+    // One agent, two boxes: it is sent after one of them and the other has nobody coming for it.
+    expect(state().errands).toHaveLength(1);
+    const claimed = state().errands[0].crateId;
+    state().reapPackages(Date.now() + 100);
+    expect(state().bayCrates).toHaveLength(2);
+    expect(state().bayCrates.filter((c) => c.id !== claimed)).toHaveLength(1);
+
+    // …and it goes back out for the second one as soon as it has carried the first inside.
+    const errand = state().errands[0];
+    state().reapErrands(errand.pickupAt + errand.legMs);
+    expect(state().errands).toMatchObject([{ agentId: "a1" }]);
+    expect(state().errands[0].crateId).not.toBe(claimed);
+  });
+
+  it("prefers an idle agent to a working one", () => {
+    floor();
+    staff(
+      session({ id: "a1", roomId: "r1", status: "working" }),
+      session({ id: "a2", roomId: "r1", status: "idle" }),
+    );
+    state().sendPackage("p", "r1", 50);
+    expect(state().errands[0].agentId).toBe("a2");
+  });
+
+  it("ignores a package addressed to a room this client has not been told about", () => {
+    floor();
+    state().sendPackage("p", "ghost", 50);
+    state().reapPackages(Date.now() + 100);
+    expect(state().errands).toEqual([]);
+    expect(state().bayCrates).toEqual([]);
+  });
+
+  it("takes crates and errands off the floor with the room they belonged to", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 50);
+    state().sendPackage("p", "r2", 50);
+    state().reapPackages(Date.now() + 100);
+    expect(state().errands).toHaveLength(1);
+    expect(state().bayCrates).toHaveLength(2);
+
+    apply({
+      kind: "rooms",
+      rooms: [room({ id: "p", name: "shop", kind: "project", position: { x: 0, z: 0 } })],
+    });
+    expect(state().errands).toEqual([]);
+    expect(state().bayCrates).toEqual([]);
+  });
+
+  it("says which way each crate and each errand came from, in step with its own list", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 50);
+    state().sendPackage("r2", "r1", 50);
+    state().reapPackages(Date.now() + 100);
+
+    // r1 stands at (12, 0); the project block is at the origin and r2 at (0, 12).
+    expect(errandDirections(state(), "r1")).toEqual([-12, 0]);
+    // Both boxes are on r1's dock — one with an agent on its way, one with nobody coming — and each
+    // says which belt it arrived on, in the same order.
+    expect(state().bayCrates.map((c) => c.fromRoomId)).toEqual(["p", "r2"]);
+    expect(crateDirections(state(), "r1")).toEqual([-12, 0, -12, 12]);
+  });
+
+  it("is motion while an agent is walking, and still once it is back", () => {
+    floor();
+    staff(session({ id: "a1", roomId: "r1", status: "idle" }));
+    state().sendPackage("p", "r1", 50);
+    expect(hasMotion(state())).toBe(true);
+
+    const errand = state().errands[0];
+    state().reapPackages(Date.now() + 100);
+    expect(state().packages).toEqual([]);
+    // The box has landed, so only the walk is keeping the canvas awake.
+    expect(hasMotion(state())).toBe(true);
+
+    state().reapErrands(errand.pickupAt + errand.legMs);
+    expect(hasMotion(state())).toBe(false);
+  });
+});
+
 // ---- M1b: switching factories ----
 
 describe("projects", () => {
@@ -1231,6 +1451,10 @@ describe("projects", () => {
     useFabric.getState().setConnected(true);
     apply({ kind: "messages", messages: [message({ id: "m1", deliveredAt: null })] });
     apply({ kind: "event", sessionId: "s1", seq: 1, event: { type: "agent_text", text: "working" } });
+    // …a crate nobody collected and an agent walking to fetch another, so the switch has them to lose.
+    useFabric.getState().sendPackage("p", "r2", 40);
+    useFabric.getState().reapPackages(Date.now() + 80);
+    useFabric.getState().sendPackage("p", "r1", 40);
   }
 
   it("records the list and the active project the server says this socket is on", () => {
@@ -1257,6 +1481,8 @@ describe("projects", () => {
     expect(before.conveyors.length).toBeGreaterThan(0);
     expect(before.waiting).toHaveLength(1);
     expect(before.events["s1"]).toHaveLength(1);
+    expect(before.bayCrates).toHaveLength(1);
+    expect(before.errands).toHaveLength(1);
 
     apply({ kind: "projects", projects: [project(), other], activeProjectId: "p2" });
 
@@ -1268,6 +1494,10 @@ describe("projects", () => {
     expect(s.tasks).toEqual([]);
     expect(s.waiting).toEqual([]);
     expect(s.packages).toEqual([]);
+    // A crate stands at a bay of a room on the floor we just left, and an errand is a figure walking
+    // across it. Neither has anywhere to be on the new one.
+    expect(s.bayCrates).toEqual([]);
+    expect(s.errands).toEqual([]);
     expect(s.conveyors).toEqual([]);
     expect(s.packagedPairs).toEqual({});
     expect(s.animatedMessages).toEqual({});

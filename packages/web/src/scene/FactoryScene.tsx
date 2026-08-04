@@ -1,5 +1,5 @@
 import { MapControls } from "@react-three/drei";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { useCallback, useEffect } from "react";
 import { useFabric, useHasMotion } from "../store";
 import { Buildings } from "./Buildings";
@@ -61,9 +61,30 @@ export function FactoryScene() {
           need: the drag has to silence them, and the framing has to notice the operator using them. */}
       <RoomDrag />
       <CameraFraming />
+      <FloorClock />
       <RedrawOnStoreChange />
     </Canvas>
   );
+}
+
+/**
+ * The one place the render loop hands time back to the store.
+ *
+ * An errand outlives the state that started it and has to be retired by somebody: the agent has
+ * walked back in, so the errand and the crate it carried are done with. It is what keeps `hasMotion`
+ * true, so **not** retiring it is a GPU spinning for ever — and that store change is what lets the
+ * canvas fall back to `frameloop="demand"`.
+ *
+ * One `useFrame` for the whole floor rather than one per room, and it is a real no-op when there is
+ * nothing to retire (it returns the state object itself, which notifies no listener), so an animating
+ * factory pays one comparison a frame for this.
+ */
+function FloorClock() {
+  const reapErrands = useFabric((s) => s.reapErrands);
+  useFrame(() => {
+    reapErrands(Date.now());
+  });
+  return null;
 }
 
 /**
@@ -128,10 +149,15 @@ function RedrawOnStoreChange() {
   // The waiting markers are static by design (see `WaitingPackages`), so nothing else will ever ask
   // for the frame that draws a new one — or erases the one that just left on a belt.
   const waiting = useFabric((s) => s.waiting);
+  // The crates piled at a bay are static for the same reason, so the same applies: one frame when a
+  // crate lands at an unstaffed door, and one more when somebody finally carries it in.
+  const bayCrates = useFabric((s) => s.bayCrates);
+  // An errand ending is the frame that puts the figure back on its mark with empty hands.
+  const errands = useFabric((s) => s.errands);
 
   useEffect(() => {
     invalidate();
-  }, [invalidate, rooms, sessions, selectedRoomId, packages, waiting]);
+  }, [invalidate, rooms, sessions, selectedRoomId, packages, waiting, bayCrates, errands]);
 
   return null;
 }

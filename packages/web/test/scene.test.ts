@@ -3,6 +3,7 @@ import { ringPosition as sharedRingPosition } from "@superfabric/shared";
 import {
   agentFacing,
   agentSlots,
+  bayForDirection,
   beaconHeight,
   buildingSize,
   CAMERA_FAR,
@@ -495,6 +496,34 @@ describe("loadingBays", () => {
     const bays = loadingBays("project", [20, 0, 0, 20, -20, 0, 0, -20]);
     expect(bays).toHaveLength(4);
     expect(new Set(bays.map((b) => b.yaw)).size).toBe(4);
+  });
+});
+
+describe("bayForDirection", () => {
+  it("gives the door a belt from that direction actually arrives at", () => {
+    const directions = [20, 0, 0, 20];
+    expect(bayForDirection("room", directions, 20, 0)).toEqual(loadingBays("room", directions)[0]);
+    expect(bayForDirection("room", directions, 0, 20)).toEqual(loadingBays("room", directions)[1]);
+  });
+
+  it("answers with the *surviving* door when two belts share one, not with an index", () => {
+    // Answering by position in the belt list would send an agent to a door that is not drawn: the
+    // project block joined to six workshops has fewer openings than belts.
+    const directions: number[] = [];
+    for (let i = 0; i < 6; i++) directions.push(20, i * 0.2);
+    const bays = loadingBays("project", directions);
+    expect(bays).toHaveLength(1);
+    for (let i = 0; i < 6; i++) {
+      expect(bayForDirection("project", directions, 20, i * 0.2)).toEqual(bays[0]);
+    }
+  });
+
+  it("has nothing for a direction of zero, which no wall faces", () => {
+    expect(bayForDirection("room", [20, 0], 0, 0)).toBeUndefined();
+  });
+
+  it("has nothing for a building with no doors at all", () => {
+    expect(bayForDirection("room", [], 20, 0)).toBeUndefined();
   });
 });
 

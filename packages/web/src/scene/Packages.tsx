@@ -5,7 +5,7 @@ import { BoxGeometry, Color, Matrix4, MeshStandardMaterial, Quaternion, Vector3 
 import type { PackageInFlight } from "../store";
 import { beltFan, useFabric, useWaitingMessages } from "../store";
 import { conveyorCurve, pointAt, waitingSlot, waitingStackIndices } from "./conveyorPath";
-import { PACKAGE_COLORS, WAITING_PACKAGE_COLOR } from "./palette";
+import { PACKAGE_COLORS, packageToneIndex, WAITING_PACKAGE_COLOR } from "./palette";
 
 /**
  * How many packages can be in flight at once. A factory that saturates this is a factory whose bus is
@@ -46,7 +46,10 @@ function variantOf(id: string): { tone: Color; scale: number } {
   }
   const unit = (hash >>> 0) / 4294967296;
   return {
-    tone: PACKAGE_TONES[(hash >>> 8) % PACKAGE_TONES.length],
+    // The tone comes from the shared `packageToneIndex`, not from this hash: the crate an agent
+    // carries in and the crate left standing at a bay are the *same box* as this one, and they read
+    // the tone from there.
+    tone: PACKAGE_TONES[packageToneIndex(id)],
     scale: 1 - SIZE_SPREAD + unit * SIZE_SPREAD * 2,
   };
 }

@@ -201,6 +201,21 @@ export const PACKAGE_COLORS = ["#c58a4a", "#b87d42", "#d09a5c", "#a97239"] as co
 export const PACKAGE_COLOR = PACKAGE_COLORS[0];
 
 /**
+ * Which of the four tones a package of this id wears. **One answer, used in three places** — the box
+ * riding a belt, the crate left standing at a bay and the crate in an agent's hands are the same
+ * object at three moments of its life, and a box that changed colour when somebody picked it up would
+ * read as a different box.
+ */
+export function packageToneIndex(id: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 8) % PACKAGE_COLORS.length;
+}
+
+/**
  * A message nobody has picked up yet, stacked at its sender's loading bay.
  *
  * Cool grey rather than cardboard, and on purpose: warm cardboard is what *moves* on this floor, so

@@ -8,11 +8,15 @@ import {
   useIsSelected,
   useRoom,
   useRoomAgentCount,
+  useRoomCrateDirections,
+  useRoomCrates,
   useRoomHasOrchestrator,
   useRoomPosition,
   useRoomStatus,
 } from "../store";
 import { Agents } from "./Agents";
+import { BayPile } from "./BayPile";
+import { pilesByBay } from "./errands";
 import {
   BAY_WIDTH,
   beaconHeight,
@@ -68,6 +72,9 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
   // factory have one at all" from a screenshot, with no figure to squint at.
   const hasOrchestrator = useRoomHasOrchestrator(roomId);
   const beltDirections = useBeltDirections(roomId);
+  // The crates standing at this room's own doors, and which belt each of them arrived on.
+  const crates = useRoomCrates(roomId);
+  const crateDirections = useRoomCrateDirections(roomId);
   const selectRoom = useFabric((s) => s.selectRoom);
   const beginRoomDrag = useFabric((s) => s.beginRoomDrag);
 
@@ -76,6 +83,20 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
     () => (kind === undefined ? [] : loadingBays(kind, beltDirections)),
     [kind, beltDirections],
   );
+  // One pile per *door*, not per belt: `loadingBays` collapses doors that are too close together, and
+  // two piles at one door would draw two stacks of crates through each other.
+  const piles = useMemo(() => {
+    if (kind === undefined || crates.length === 0) return [];
+    return pilesByBay(
+      kind,
+      beltDirections,
+      crates.map((c, i) => ({
+        id: c.id,
+        dx: crateDirections[i * 2] ?? 0,
+        dz: crateDirections[i * 2 + 1] ?? 0,
+      })),
+    );
+  }, [kind, beltDirections, crates, crateDirections]);
   // Stable per name, so a department keeps its colour across reloads and machines.
   const accent = useMemo(() => roomAccent(room?.name ?? ""), [room?.name]);
 
@@ -142,11 +163,16 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
 
       {isProject ? <ProjectRoof width={width} height={height} /> : <RoomRoof width={width} height={height} />}
 
-      {bays.map((bay, i) => (
-        <group key={i} position={[bay.x, 0, bay.z]} rotation-y={bay.yaw}>
-          <LoadingBayMesh frame={isProject ? PROJECT.ridge : accent.light} canopy={trimDeep} />
-        </group>
-      ))}
+      {bays.map((bay, i) => {
+        const pile = piles.find((p) => p.bay.x === bay.x && p.bay.z === bay.z);
+        return (
+          <group key={i} position={[bay.x, 0, bay.z]} rotation-y={bay.yaw}>
+            <LoadingBayMesh frame={isProject ? PROJECT.ridge : accent.light} canopy={trimDeep} />
+            {/* What nobody came out to collect. See `BayPile`. */}
+            {pile !== undefined && <BayPile ids={pile.ids} />}
+          </group>
+        );
+      })}
 
       <StatusBeacon status={status} y={beaconHeight(kind)} />
 

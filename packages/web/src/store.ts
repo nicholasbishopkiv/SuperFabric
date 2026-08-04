@@ -19,6 +19,15 @@ import type {
 } from "@superfabric/shared";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
+import {
+  chooseFetcher,
+  errandEndsAt,
+  type ErrandTiming,
+  fetchPath,
+  fetchWalkMs,
+  planErrand,
+} from "./scene/errands";
+import { agentSlots, bayForDirection } from "./scene/layout";
 
 export interface EventRow {
   seq: number;
@@ -76,6 +85,43 @@ export interface PackageInFlight {
   to: string;
   startedAt: number;
   durationMs: number;
+}
+
+/**
+ * A crate that has come down a belt, reached a room's loading bay, and that **nobody collected**.
+ *
+ * A different fact again from a package in flight and from a `WaitingMessage`: the bus delivered this
+ * one, it is physically at the door, and the room has nobody free to carry it in. A pile of them is
+ * how a room with nobody home looks like a room with nobody home — which is information, not a gap,
+ * and the reason this outlives the 2.4 s the box spent on the belt.
+ *
+ * The id is the package's (and therefore the bus message's), so the box that landed, the crate on the
+ * dock and the crate an agent eventually carries away are one object throughout.
+ */
+export interface BayCrate {
+  id: string;
+  /** The room whose bay it stands at. */
+  roomId: string;
+  /** Which room it came from, which is what picks the bay: a belt arrives at one wall. */
+  fromRoomId: string;
+  landedAt: number;
+}
+
+/**
+ * One of a room's agents walking to a loading bay to meet a crate and carrying it back.
+ *
+ * The whole clock is fixed when the errand is created (`ErrandTiming`), so no frame has to re-decide
+ * anything: the scene asks `errandAt(errand, Date.now())` where the figure is and whether it has the
+ * crate yet. It lives in the store rather than in the scene for two reasons — `hasMotion` has to see
+ * it (a walking figure is motion, and `frameloop="demand"` renders nothing otherwise), and an
+ * assignment that was recomputed on every render could swap two agents mid-walk.
+ */
+export interface Errand extends ErrandTiming {
+  /** The crate being fetched: a package still on the belt, or one already on the dock. */
+  crateId: string;
+  agentId: string;
+  roomId: string;
+  fromRoomId: string;
 }
 
 /**
@@ -243,6 +289,15 @@ export interface FabricState {
   /** Packages travelling a belt right now. Empty is the normal state. */
   packages: PackageInFlight[];
   /**
+   * Crates standing at a loading bay that nobody has carried in, oldest first. See `BayCrate`.
+   *
+   * Deliberately **not** part of `hasMotion`: a pile is a state to read, exactly like the queue at a
+   * sender's door, and animating it would pin the frameloop for as long as a room stayed unstaffed.
+   */
+  bayCrates: BayCrate[];
+  /** Agents currently walking to a bay and back. See `Errand`. */
+  errands: Errand[];
+  /**
    * Where this factory stands with onboarding, or null before the server has said.
    *
    * Per project, unlike the roles and the accounts: `onboarded` is a `CLAUDE.md` at *this* project's
@@ -374,8 +429,19 @@ export interface FabricState {
    * camera is asked to re-frame for the same reason: the new floor is somewhere else.
    */
   applyProjects(projects: ProjectInfo[], activeProjectId: string): void;
-  /** Drop packages that have arrived. Called from the render loop and by a per-package timer. */
+  /**
+   * Drop packages that have arrived — and leave a crate at the bay for every one of them **no agent
+   * was sent to meet**. Called from the render loop and by a per-package timer.
+   */
   reapPackages(now?: number): void;
+  /**
+   * Give every unclaimed crate — on the belt or already on the dock — to a free agent in the room it
+   * is addressed to, if there is one. Idempotent and a real no-op when there is nothing to assign, so
+   * it is safe to call from a frame callback; run whenever the traffic or the agents change.
+   */
+  reconcileErrands(now?: number): void;
+  /** Forget finished errands, and the crates they carried in. The frame loop's other half. */
+  reapErrands(now?: number): void;
 }
 
 /**
@@ -392,6 +458,10 @@ const EMPTY_PROJECT_STATE = {
   roomStatus: {} as Record<string, FactoryStatus>,
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
+  // A crate stands at a bay of a room on the floor we are leaving, and an errand is a figure walking
+  // across it. Neither has anywhere to be on the new one.
+  bayCrates: [] as BayCrate[],
+  errands: [] as Errand[],
   tasks: [] as TaskInfo[],
   // The factory we have just left may be documented and this one may not be. Null rather than a
   // guess: the new floor's own `onboarding` frame is one round trip away, and offering to interview
@@ -437,6 +507,8 @@ export const initialFabricState = {
   roomStatus: {} as Record<string, FactoryStatus>,
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
+  bayCrates: [] as BayCrate[],
+  errands: [] as Errand[],
   tasks: [] as TaskInfo[],
   onboarding: null as OnboardingState | null,
   chronicle: { asked: "", answered: null, hits: [] } as ChronicleState,
@@ -614,6 +686,90 @@ export function beltFan(conveyors: readonly Conveyor[], from: string, to: string
   return 0;
 }
 
+// ---- who fetches what ----------------------------------------------------------------------------
+
+/**
+ * Which crate each free agent is sent to meet, given everything the floor knows right now.
+ *
+ * The interesting cases are the ones it *declines*:
+ *
+ * - **No agent free** — nothing is returned, so the crate lands and stays at the bay. That is the
+ *   whole point: a room with nobody home visibly piles up, and inventing a fetch would hide it.
+ * - **A room with no agents at all** — the same, by the same code path rather than as a special case.
+ * - **A crate already claimed** by a live errand, so a rebroadcast cannot send a second agent after
+ *   the same box.
+ * - **A belt this room has no door for**, which is the only thing here that would be a lie about the
+ *   geometry rather than about the work.
+ *
+ * Oldest first, and crates already on the dock before boxes still in the air: a queue that let new
+ * arrivals overtake a pile would leave the pile there for ever.
+ */
+export function scheduleErrands(
+  state: Pick<FabricState, "rooms" | "sessions" | "packages" | "bayCrates" | "errands" | "conveyors" | "drag">,
+  now: number = Date.now(),
+): Errand[] {
+  const claimed = new Set(state.errands.map((e) => e.crateId));
+  const busy = new Set(state.errands.map((e) => e.agentId));
+
+  const wanted: { id: string; roomId: string; fromRoomId: string; arrivesAt: number }[] = [];
+  for (const crate of state.bayCrates) {
+    if (claimed.has(crate.id)) continue;
+    // Already on the dock: it can be picked up the moment someone reaches it.
+    wanted.push({ id: crate.id, roomId: crate.roomId, fromRoomId: crate.fromRoomId, arrivesAt: now });
+  }
+  for (const pkg of state.packages) {
+    if (claimed.has(pkg.id) || pkg.from === pkg.to) continue;
+    const arrivesAt = pkg.startedAt + pkg.durationMs;
+    // One that has already landed is `reapPackages`' business: it becomes a crate, and the next pass
+    // through here picks it up from the dock.
+    if (arrivesAt <= now) continue;
+    wanted.push({ id: pkg.id, roomId: pkg.to, fromRoomId: pkg.from, arrivesAt });
+  }
+  wanted.sort((a, b) => a.arrivesAt - b.arrivesAt);
+
+  const added: Errand[] = [];
+  for (const want of wanted) {
+    const room = state.rooms.find((r) => r.id === want.roomId);
+    if (room === undefined) continue;
+    const agents = roomAgents(state.sessions, want.roomId);
+    const agentId = chooseFetcher(
+      agents.map((a) => ({ id: a.id, status: agentStatus(a) })),
+      busy,
+    );
+    if (agentId === null) continue;
+
+    const self = roomPosition(state, want.roomId);
+    const origin = roomPosition(state, want.fromRoomId);
+    if (self === undefined || origin === undefined) continue;
+    const bay = bayForDirection(
+      room.kind,
+      beltDirections(state, want.roomId),
+      origin.x - self.x,
+      origin.z - self.z,
+    );
+    if (bay === undefined) continue;
+
+    const post = agentSlots(agents.length, room.kind)[agents.findIndex((a) => a.id === agentId)];
+    const legMs = fetchWalkMs(fetchPath(room.kind, post, bay));
+    added.push({
+      crateId: want.id,
+      agentId,
+      roomId: want.roomId,
+      fromRoomId: want.fromRoomId,
+      ...planErrand(now, want.arrivesAt, legMs),
+    });
+    busy.add(agentId);
+  }
+  return added;
+}
+
+/**
+ * How many uncollected crates the floor remembers at once. Generous — a pile is information and
+ * throwing it away loses it — but finite, because a factory left running for a week with an unstaffed
+ * room must not grow an unbounded array. Past this the oldest are forgotten.
+ */
+export const BAY_CRATE_LIMIT = 400;
+
 /**
  * The server sends the whole room list on every change, so applying it naively would hand every
  * building a brand-new object and re-render the entire floor because one room moved. Unchanged rows
@@ -630,6 +786,7 @@ function applyRooms(s: FabricState, incoming: RoomInfo[]): Partial<FabricState> 
 
   const ids = rooms.map((r) => r.id);
   const idsUnchanged = ids.length === s.roomIds.length && ids.every((id, i) => id === s.roomIds[i]);
+  const roomStatus = nextRoomStatus(s.roomStatus, rooms, s.sessions);
   return {
     rooms,
     roomIds: idsUnchanged ? s.roomIds : ids,
@@ -640,9 +797,19 @@ function applyRooms(s: FabricState, incoming: RoomInfo[]): Partial<FabricState> 
     // of changing. The local position wins until the pointer comes up. The one exception is a
     // building that is no longer on the floor — there is nothing left to drag.
     drag: s.drag !== null && !ids.includes(s.drag.roomId) ? null : s.drag,
-    roomStatus: nextRoomStatus(s.roomStatus, rooms, s.sessions),
+    roomStatus,
     conveyors: nextConveyors(s.conveyors, rooms, s.packagedPairs),
+    // A crate stands at a room's bay and an errand walks across its forecourt; neither survives the
+    // room leaving the floor.
+    bayCrates: keptOnFloor(s.bayCrates, ids),
+    errands: keptOnFloor(s.errands, ids),
   };
+}
+
+/** Drops crates and errands belonging to rooms that are no longer on the floor. */
+function keptOnFloor<T extends { roomId: string }>(rows: T[], ids: readonly string[]): T[] {
+  const kept = rows.filter((row) => ids.includes(row.roomId));
+  return kept.length === rows.length ? rows : kept;
 }
 
 /**
@@ -741,8 +908,15 @@ export const useFabric = create<FabricState>((set, get) => ({
     // a side effect that has no business inside `set`.
     if (msg.kind === "messages") return get().applyMessages(msg.messages);
     if (msg.kind === "projects") return get().applyProjects(msg.projects, msg.activeProjectId);
+    if (msg.kind === "sessions") {
+      set((s) => applySessions(s, msg.sessions));
+      // An agent that has just gone idle can collect a crate that has been sitting at a bay, and a
+      // room that has just gained its first agent can clear the pile that built up while it was
+      // empty. Nothing else notices; this is the only place the agents change.
+      get().reconcileErrands();
+      return;
+    }
     set((s) => {
-      if (msg.kind === "sessions") return applySessions(s, msg.sessions);
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
       if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
       if (msg.kind === "accounts") return applyAccounts(s, msg.accounts);
@@ -884,6 +1058,8 @@ export const useFabric = create<FabricState>((set, get) => ({
     // The scene reaps the frame a package lands, but a backgrounded tab renders no frames at all —
     // and a package that is never reaped leaves `hasMotion` true forever. Belt and braces.
     setTimeout(() => get().reapPackages(), durationMs + 80);
+    // Send someone out to meet it, if the receiving room has anyone to send.
+    get().reconcileErrands();
   },
 
   applyMessages: (incoming) => {
@@ -954,6 +1130,9 @@ export const useFabric = create<FabricState>((set, get) => ({
     // Same belt-and-braces reap as the demo action: a backgrounded tab renders no frames, and an
     // unreaped package would leave `hasMotion` true for ever.
     if (started.length > 0) setTimeout(() => get().reapPackages(), DEFAULT_PACKAGE_MS + 80);
+    // Somebody has to be sent to the bay before the box gets there, so this cannot wait for the
+    // landing: the walk is timed to *meet* the crate (see `planErrand`).
+    if (started.length > 0) get().reconcileErrands(now);
   },
 
   applyProjects: (projects, activeProjectId) =>
@@ -984,12 +1163,86 @@ export const useFabric = create<FabricState>((set, get) => ({
       };
     }),
 
-  reapPackages: (now = Date.now()) =>
+  reapPackages: (now = Date.now()) => {
+    let landedAny = false;
     set((s) => {
       const packages = s.packages.filter((p) => now - p.startedAt < p.durationMs);
-      return packages.length === s.packages.length ? s : { packages };
-    }),
+      if (packages.length === s.packages.length) return s;
+      landedAny = true;
+
+      // Everything that just landed stands on the dock — including a box somebody is on their way to
+      // fetch, because "on their way" can be a long walk round the building and a crate that vanished
+      // for those seconds would be a box that teleported into a pair of hands. What is excluded is a
+      // crate the agent has **already picked up**: that one is in its hands, and drawing it on the
+      // ground as well would double the same box.
+      const claimed = new Set(
+        s.errands.filter((e) => now >= e.pickupAt).map((e) => e.crateId),
+      );
+      const known = new Set(s.bayCrates.map((c) => c.id));
+      const onFloor = new Set(s.rooms.map((r) => r.id));
+      const landed: BayCrate[] = [];
+      for (const p of s.packages) {
+        if (now - p.startedAt < p.durationMs) continue;
+        if (claimed.has(p.id) || known.has(p.id) || p.from === p.to) continue;
+        // A package addressed to a room this client has not been told about has no bay to wait at.
+        if (!onFloor.has(p.to) || !onFloor.has(p.from)) continue;
+        landed.push({ id: p.id, roomId: p.to, fromRoomId: p.from, landedAt: p.startedAt + p.durationMs });
+      }
+      const bayCrates = landed.length === 0
+        ? s.bayCrates
+        : [...s.bayCrates, ...landed].slice(-BAY_CRATE_LIMIT);
+      return { packages, bayCrates };
+    });
+    // A crate that has just reached an unstaffed bay is still a crate an agent could collect the
+    // moment one frees up, so the assignment is re-run rather than waiting for the next broadcast.
+    // Only when something actually landed: this is called from a frame callback.
+    if (landedAny) get().reconcileErrands(now);
+  },
+
+  reconcileErrands: (now = Date.now()) => {
+    let added = 0;
+    set((s) => {
+      const errands = scheduleErrands(s, now);
+      added = errands.length;
+      return errands.length === 0 ? s : { errands: [...s.errands, ...errands] };
+    });
+    if (added > 0) armErrandReap(get);
+  },
+
+  reapErrands: (now = Date.now()) => {
+    let freed = false;
+    set((s) => {
+      // A crate leaves the dock the moment the agent's hand closes on it — `pickupAt`, not the end of
+      // the errand — or the same box would be standing on the ground and riding at somebody's side.
+      const carried = new Set(s.errands.filter((e) => now >= e.pickupAt).map((e) => e.crateId));
+      const bayCrates = s.bayCrates.filter((c) => !carried.has(c.id));
+      const errands = s.errands.filter((e) => now < errandEndsAt(e));
+      if (errands.length === s.errands.length && bayCrates.length === s.bayCrates.length) return s;
+      // Only a *finished* errand frees an agent; a crate leaving the dock does not.
+      freed = errands.length !== s.errands.length;
+      return {
+        errands: errands.length === s.errands.length ? s.errands : errands,
+        bayCrates: bayCrates.length === s.bayCrates.length ? s.bayCrates : bayCrates,
+      };
+    });
+    // The agent that just walked back in is free, and there may be a pile waiting for it. Guarded for
+    // the same reason as above: this runs in the render loop.
+    if (freed) get().reconcileErrands(now);
+  },
+
 }));
+
+/**
+ * The same belt-and-braces the packages have: the scene reaps a finished errand on the frame it ends,
+ * but a backgrounded tab renders no frames at all, and an errand nobody reaps leaves `hasMotion` true
+ * for ever. One timer for the earliest deadline is enough — reaping re-arms for the next.
+ */
+function armErrandReap(get: () => FabricState): void {
+  const errands = get().errands;
+  if (errands.length === 0) return;
+  const earliest = Math.min(...errands.map(errandEndsAt));
+  setTimeout(() => get().reapErrands(), Math.max(0, earliest - Date.now()) + 80);
+}
 
 // ---- per-object selectors ----
 //
@@ -1271,6 +1524,66 @@ export function openTaskCount(tasks: readonly TaskInfo[], roomId: string): numbe
 export const useRoomTaskCount = (roomId: string): number =>
   useFabric((s) => openTaskCount(s.tasks, roomId));
 
+// ---- fetching crates -----------------------------------------------------------------------------
+//
+// Per room, like everything else the floor draws: one room's agent setting off must not re-render the
+// building next door. The two `…Directions` selectors return **flat numbers** for the same reason
+// `beltDirections` does — they go through `useShallow`, which compares element by element, and an
+// array of fresh `{x, z}` objects would never compare equal and would re-render for ever.
+
+/** The errands running at one room right now, in the order they were assigned. */
+export const useRoomErrands = (roomId: string): Errand[] =>
+  useFabric(useShallow((s) => s.errands.filter((e) => e.roomId === roomId)));
+
+/** The crates standing uncollected at one room's bays, oldest first. */
+export const useRoomCrates = (roomId: string): BayCrate[] =>
+  useFabric(useShallow((s) => s.bayCrates.filter((c) => c.roomId === roomId)));
+
+/**
+ * Which way each of `rows` came from, as a flat `[dx0, dz0, dx1, dz1, …]` pointing from `roomId`
+ * towards the room each row's crate travelled from. That vector is what picks the bay
+ * (`bayForDirection`), and it has to be resolved here because only the store knows where the *other*
+ * building stands — `Building` and `Agents` subscribe to their own room and nothing else.
+ *
+ * A row whose origin room is not on this floor gets `(0, 0)`, which no wall faces, so it is dropped
+ * by whoever asks for its bay rather than being drawn at a guessed door.
+ */
+function fromDirections(
+  state: Pick<FabricState, "rooms" | "drag">,
+  roomId: string,
+  rows: readonly { fromRoomId: string }[],
+): number[] {
+  const self = roomPosition(state, roomId);
+  if (self === undefined) return [];
+  const out: number[] = [];
+  for (const row of rows) {
+    const origin = roomPosition(state, row.fromRoomId);
+    if (origin === undefined) out.push(0, 0);
+    else out.push(origin.x - self.x, origin.z - self.z);
+  }
+  return out;
+}
+
+export function errandDirections(
+  state: Pick<FabricState, "rooms" | "drag" | "errands">,
+  roomId: string,
+): number[] {
+  return fromDirections(state, roomId, state.errands.filter((e) => e.roomId === roomId));
+}
+
+export function crateDirections(
+  state: Pick<FabricState, "rooms" | "drag" | "bayCrates">,
+  roomId: string,
+): number[] {
+  return fromDirections(state, roomId, state.bayCrates.filter((c) => c.roomId === roomId));
+}
+
+export const useRoomErrandDirections = (roomId: string): number[] =>
+  useFabric(useShallow((s) => errandDirections(s, roomId)));
+
+export const useRoomCrateDirections = (roomId: string): number[] =>
+  useFabric(useShallow((s) => crateDirections(s, roomId)));
+
 /**
  * The bus messages nobody has picked up yet. Deliberately *not* part of `hasMotion`: the marker is
  * static, because a pile-up that pinned the frameloop to `"always"` would spin the GPU for as long as
@@ -1280,21 +1593,33 @@ export const useWaitingMessages = (): WaitingMessage[] => useFabric((s) => s.wai
 
 /**
  * Whether anything in the scene needs animating. The canvas runs `frameloop="demand"` and only
- * switches to `"always"` while this is true, so an idle factory does not spin the GPU. Tasks 6 and 7
- * must keep this accurate: a beacon or a package that looks frozen is this returning false when it
- * should not.
+ * switches to `"always"` while this is true, so an idle factory does not spin the GPU. **Every moving
+ * thing on the floor has to be in this list**: something left out is a frozen mesh, and something
+ * left in that never clears is a GPU spinning for ever. Both have happened here.
  *
- * `starting` deliberately does **not** count, even though Task 6's beacon colours it like `working`.
+ * The five, and what each of them draws:
+ *
+ * - a **drag**, because the building has to follow the pointer — without it the demand loop renders
+ *   the frame the pointer went down and then nothing;
+ * - a **package in flight**, which also drives the crawling slats of the belt it is on;
+ * - an **errand**, which is a figure walking to a bay and back with a crate;
+ * - a **working agent**, which drives its own bob and its room's beacon.
+ *
+ * `starting` deliberately does **not** count, even though the beacon colours it like `working`.
  * A Claude Code session reports `starting` when its executor spawns and only leaves that status when
  * its first turn completes — so a freshly created agent nobody has prompted yet stays `starting`
  * indefinitely, and counting it would pin the frameloop to `"always"` for the rest of the session.
  *
- * A drag counts because a drag *is* motion: without it the demand loop renders the frame the pointer
- * went down and then nothing, and the building sits frozen while the operator hauls on it.
+ * A **pile of crates at a bay** is deliberately absent, for the same reason a queue of undelivered
+ * messages is: it is a state to read rather than an animation to watch, and a room with nobody home
+ * would otherwise spin the GPU precisely because nothing is happening in it.
  */
-export function hasMotion(state: Pick<FabricState, "sessions" | "packages" | "drag">): boolean {
+export function hasMotion(
+  state: Pick<FabricState, "sessions" | "packages" | "drag" | "errands">,
+): boolean {
   return state.drag !== null
     || state.packages.length > 0
+    || state.errands.length > 0
     || state.sessions.some((s) => s.status === "working");
 }
 

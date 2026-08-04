@@ -383,6 +383,34 @@ export function loadingBays(kind: RoomInfo["kind"], directions: readonly number[
 }
 
 /**
+ * Which bay a belt arriving from direction `(dx, dz)` actually ends at — the one an agent has to walk
+ * to when a crate comes down that belt.
+ *
+ * It is not simply "the i-th bay": `loadingBays` **collapses** openings closer together than one bay
+ * width, so the project block joined to six workshops has fewer doors than belts and several belts
+ * share one. Answering this by index would send an agent to a door that is not drawn.
+ *
+ * `undefined` for a direction of zero (a room on top of another) and for a room with no bays at all.
+ */
+export function bayForDirection(
+  kind: RoomInfo["kind"],
+  directions: readonly number[],
+  dx: number,
+  dz: number,
+): LoadingBay | undefined {
+  const longest = Math.max(Math.abs(dx), Math.abs(dz));
+  if (longest === 0) return undefined;
+  const half = buildingSize(kind).width / 2;
+  const t = half / longest;
+  const x = round3(dx * t);
+  const z = round3(dz * t);
+  // The same test `loadingBays` collapses with, so the answer is always a door that exists: the
+  // first bay within one bay width of where this belt crosses the wall, else the exact one.
+  const bays = loadingBays(kind, directions);
+  return bays.find((b) => Math.hypot(b.x - x, b.z - z) < BAY_WIDTH);
+}
+
+/**
  * Where each of a room's agents stands: on a short arc in *front* of the building, meaning the
  * +x/+z corner, which is the one the fixed isometric camera looks at. One agent stands in the
  * middle; more fan out around it, and the arc widens with the crowd so eight agents still read as
