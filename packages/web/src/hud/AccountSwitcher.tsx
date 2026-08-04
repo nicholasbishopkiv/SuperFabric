@@ -1,4 +1,4 @@
-import type { AccountInfo } from "@superfabric/shared";
+import type { AccountInfo, AccountUsage } from "@superfabric/shared";
 import {
   CheckIcon,
   ChevronsUpDownIcon,
@@ -9,12 +9,14 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { useState } from "react";
-import { useAccounts, useFabric } from "../store";
+import { useAccounts, useAccountUsage, useFabric, useUsage } from "../store";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { cn } from "../ui/utils";
+import { LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT } from "@superfabric/shared";
+import { UsageMeters } from "./UsageMeters";
 import { send } from "../wsClient";
 
 /**
@@ -28,7 +30,26 @@ import { send } from "../wsClient";
  * **Accounts are machine-wide**, so nothing here is scoped to a project and switching factories does
  * not change what it shows. What is per-project is the *binding*, which lives where the thing being
  * bound lives: the room panel.
+ *
+ * The limit meters live here too rather than in a fourth edge panel, and for the same reason the
+ * popover exists at all: "how much quota is left on which subscription" is the neighbouring question
+ * to "which subscriptions do I have", and a permanent hole in the floor is a high price for three
+ * rows of bars. The trigger carries the worst number across every account, so the question can be
+ * answered without opening anything.
  */
+
+/** The fullest meter anywhere, which is what the trigger has room to say. */
+function worstReading(usage: readonly AccountUsage[]): { percent: number; approximate: boolean } | null {
+  let worst: { percent: number; approximate: boolean } | null = null;
+  for (const account of usage) {
+    for (const window of account.windows) {
+      if (worst === null || window.utilization > worst.percent) {
+        worst = { percent: window.utilization, approximate: account.approximate };
+      }
+    }
+  }
+  return worst;
+}
 
 /** Whether the trigger should be warning-coloured: an account exists but cannot run anything yet. */
 function anyNeedsLogin(accounts: readonly AccountInfo[]): boolean {
@@ -166,6 +187,7 @@ function LoginFlow({ account, connected }: { account: AccountInfo; connected: bo
 
 /** One account: whether it can actually run anything, where its credentials live, and the login. */
 function AccountRow({ account, connected }: { account: AccountInfo; connected: boolean }) {
+  const usage = useAccountUsage(account.id);
   return (
     <li className="rounded-[3px] border border-line/60 bg-panel-sunken/30 px-2 py-1.5">
       <div className="flex items-center gap-1.5">
@@ -200,6 +222,9 @@ function AccountRow({ account, connected }: { account: AccountInfo; connected: b
         </Button>
       </div>
       <div className="mt-0.5 break-all font-mono text-2xs text-fg-muted">{account.configDir}</div>
+      {/* Only for an account that could have a reading at all: a meter under "not logged in" would
+          be answering a question the operator has not reached yet. */}
+      {account.credentialsPresent && <UsageMeters usage={usage} />}
       <LoginFlow account={account} connected={connected} />
     </li>
   );
@@ -210,6 +235,7 @@ export function AccountSwitcher() {
   const [label, setLabel] = useState("");
   const [configDir, setConfigDir] = useState("");
   const accounts = useAccounts();
+  const usage = useUsage();
   const connected = useFabric((s) => s.connected);
   const clearError = useFabric((s) => s.clearError);
 
@@ -225,6 +251,8 @@ export function AccountSwitcher() {
   }
 
   const needsLogin = anyNeedsLogin(accounts);
+  const worst = worstReading(usage);
+  const anyLimited = usage.some((u) => u.limited);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -239,10 +267,36 @@ export function AccountSwitcher() {
               : `${accounts.length} account${accounts.length === 1 ? "" : "s"}`
           }
         >
-          <CircleUserIcon className={cn(needsLogin ? "text-status-blocked" : "text-fg-faint")} />
+          <CircleUserIcon
+            className={cn(
+              anyLimited ? "text-status-error" : needsLogin ? "text-status-blocked" : "text-fg-faint",
+            )}
+          />
           <span className="font-semibold tabular-nums">
             {accounts.length === 0 ? "Accounts" : accounts.length}
           </span>
+          {/* The fullest window across every subscription, so "am I about to run out" is answerable
+              without opening anything. `≈` when the number behind it is an estimate — the mark
+              travels with the figure wherever the figure goes. */}
+          {worst !== null && (
+            <span
+              className="font-mono text-2xs tabular-nums"
+              style={{
+                color: worst.percent >= LIMIT_PAUSE_PERCENT
+                  ? "var(--color-status-error)"
+                  : worst.percent >= LIMIT_WARN_PERCENT
+                    ? "var(--color-status-blocked)"
+                    : undefined,
+              }}
+              title={
+                worst.approximate
+                  ? "The fullest limit window across your accounts — estimated, not read from Anthropic"
+                  : "The fullest limit window across your accounts"
+              }
+            >
+              {worst.approximate ? "≈" : ""}{Math.round(worst.percent)}%
+            </span>
+          )}
           <ChevronsUpDownIcon className="text-fg-faint" />
         </Button>
       </PopoverTrigger>

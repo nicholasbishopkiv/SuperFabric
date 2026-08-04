@@ -555,10 +555,13 @@ describe("agentSlots", () => {
 });
 
 describe("the status palette", () => {
-  it("gives the four statuses four distinguishable colours", () => {
+  it("gives the five statuses five distinguishable colours", () => {
     const colors = Object.values(STATUS_COLOR);
-    expect(colors).toHaveLength(4);
-    expect(new Set(colors).size).toBe(4);
+    expect(colors).toHaveLength(5);
+    expect(new Set(colors).size).toBe(5);
+    // `paused` is a quiet state and shares the slate family with `idle`, so the two are separated by
+    // value and temperature rather than by hue — but they must still be different enough to read.
+    expect(STATUS_COLOR.paused).not.toBe(STATUS_COLOR.idle);
     // the two an operator must never confuse: "answer me" and "I failed"
     expect(STATUS_COLOR.blocked).not.toBe(STATUS_COLOR.error);
     // and the bypass marker must not collide with any of them
@@ -567,6 +570,10 @@ describe("the status palette", () => {
 
   it("keeps idle quiet and everything that wants attention bright", () => {
     expect(STATUS_EMISSIVE.idle).toBeLessThan(STATUS_EMISSIVE.working);
+    // A held agent is worth a second look, never an alarm: lit more than idle, far less than the
+    // three that want something from you.
+    expect(STATUS_EMISSIVE.paused).toBeGreaterThan(STATUS_EMISSIVE.idle);
+    expect(STATUS_EMISSIVE.paused).toBeLessThan(STATUS_EMISSIVE.working);
     expect(STATUS_EMISSIVE.blocked).toBeGreaterThanOrEqual(STATUS_EMISSIVE.working);
     expect(STATUS_EMISSIVE.error).toBeGreaterThanOrEqual(STATUS_EMISSIVE.working);
   });

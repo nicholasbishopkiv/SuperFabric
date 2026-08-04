@@ -30,6 +30,7 @@ import { AutonomySelect } from "./AutonomySelect";
 import { ModelSelect } from "./ModelSelect";
 import { EdgePanel, PanelSection } from "./Panel";
 import { StatusDot } from "./StatusDot";
+import { formatCountdown, useTickingNow } from "./UsageMeters";
 
 /**
  * The room panel: the first surface from which a person can actually build a factory.
@@ -173,6 +174,8 @@ function OrchestratorLine({ connected }: { connected: boolean }) {
 /** One agent of the selected room: what it is doing, how much rope it has, and what it runs on. */
 function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolean }) {
   const status = agentStatus(agent);
+  // Only a paused agent with a known return time has anything to count down.
+  const now = useTickingNow(status === "paused" && agent.pausedUntil !== null);
   return (
     // Two rows rather than one: the panel is narrow and an agent carries two controls. Wrapping
     // keeps them both readable instead of squeezing each into a few characters.
@@ -182,6 +185,22 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
         {agent.id.slice(0, 8)}
       </code>
       <span className="text-2xs text-fg-muted">{status}</span>
+      {/* A held agent says *when it comes back*, not merely that it stopped. "Paused" with no
+          horizon reads as broken; a countdown reads as a thing that is being handled. */}
+      {status === "paused" && (
+        <span
+          className="text-2xs text-status-paused"
+          title={
+            agent.pausedUntil === null
+              ? "Held because its account is at its limit. Nothing said when that lifts, so it resumes as soon as a reading says the window has rolled."
+              : new Date(agent.pausedUntil * 1000).toLocaleString()
+          }
+        >
+          {agent.pausedUntil === null
+            ? "waiting for the limit to lift"
+            : `resumes ${formatCountdown(new Date(agent.pausedUntil * 1000), now)}`}
+        </span>
+      )}
       {agent.isOrchestrator && (
         <Badge variant="accent" title="The factory's senior agent: it routes work and records why">
           <FlagIcon />

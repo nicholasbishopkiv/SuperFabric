@@ -1,5 +1,5 @@
 import type {
-  AccountInfo, ChronicleHit, MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo,
+  AccountInfo, AccountUsage, ChronicleHit, MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo,
 } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
@@ -17,6 +17,7 @@ import {
   roomAgents,
   roomlessSessions,
   roomPosition,
+  roomStatusMap,
   TASK_STATUS_ORDER,
   tasksByStatus,
   unassignedTasks,
@@ -31,7 +32,7 @@ beforeEach(() => {
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
     selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
-    projects: [], activeProjectId: null, accounts: [],
+    projects: [], activeProjectId: null, accounts: [], usage: [],
     chronicle: { asked: "", answered: null, hits: [] },
   });
 });
@@ -319,12 +320,14 @@ describe("rooms", () => {
 });
 
 describe("agentStatus", () => {
-  it("collapses the six session statuses onto the four the floor paints", () => {
+  it("collapses the six session statuses onto the five the floor paints", () => {
     expect(agentStatus(session({ status: "idle" }))).toBe("idle");
-    expect(agentStatus(session({ status: "paused" }))).toBe("idle");
     expect(agentStatus(session({ status: "done" }))).toBe("idle");
     expect(agentStatus(session({ status: "working" }))).toBe("working");
     expect(agentStatus(session({ status: "error" }))).toBe("error");
+    // `paused` used to fold into `idle`, and that was wrong the moment anything could pause an agent
+    // without being asked — see the `paused agent` cases below.
+    expect(agentStatus(session({ status: "paused" }))).toBe("paused");
   });
 
   it("reads a starting agent as working, the way the beacon paints it", () => {
@@ -1406,5 +1409,93 @@ describe("accounts", () => {
       expect(accountLabel([account()], "a-gone")).toBe("a-gone");
       expect(accountLabel([], "a1")).toBe("a1");
     });
+  });
+});
+
+describe("limit meters", () => {
+  const usage = (over: Partial<AccountUsage> = {}): AccountUsage => ({
+    accountId: "a1", source: "endpoint", approximate: false, readAt: 1_800_000_000,
+    note: null, limited: false, limitedUntil: null, limitedBy: null,
+    windows: [{
+      key: "five_hour", label: "5-hour", utilization: 43,
+      resetsAt: "2026-08-04T04:10:00Z", detail: null,
+    }],
+    ...over,
+  });
+
+  it("stores the meters", () => {
+    apply({ kind: "usage", usage: [usage(), usage({ accountId: "a2", approximate: true })] });
+    expect(useFabric.getState().usage.map((u) => u.accountId)).toEqual(["a1", "a2"]);
+    expect(useFabric.getState().usage[1]!.approximate).toBe(true);
+  });
+
+  it("an identical poll changes nothing, so three bars do not repaint every three minutes", () => {
+    apply({ kind: "usage", usage: [usage()] });
+    const before = useFabric.getState().usage;
+    apply({ kind: "usage", usage: [usage()] });
+    expect(useFabric.getState().usage).toBe(before);
+  });
+
+  it("a moved needle repaints only the account it moved on", () => {
+    apply({ kind: "usage", usage: [usage(), usage({ accountId: "a2" })] });
+    const before = useFabric.getState().usage;
+    apply({
+      kind: "usage",
+      usage: [
+        usage(),
+        usage({ accountId: "a2", windows: [{ ...usage().windows[0]!, utilization: 91 }] }),
+      ],
+    });
+    const after = useFabric.getState().usage;
+    expect(after[0]).toBe(before[0]);
+    expect(after[1]).not.toBe(before[1]);
+  });
+
+  it("survives a project switch, because a quota is not a repository's either", () => {
+    const projects = [
+      { id: "p1", name: "shop", root: "/code/shop", lastOpenedAt: null },
+      { id: "p2", name: "vendor", root: "/code/vendor", lastOpenedAt: null },
+    ];
+    apply({ kind: "projects", projects, activeProjectId: "p1" });
+    apply({ kind: "usage", usage: [usage()] });
+    apply({ kind: "projects", projects, activeProjectId: "p2" });
+    expect(useFabric.getState().usage).toHaveLength(1);
+  });
+});
+
+describe("a paused agent", () => {
+  it("reads as paused, not as idle", () => {
+    // The two facts an operator most needs to tell apart on a floor that has gone still: "quiet
+    // because there is nothing to do" and "stopped because the subscription is spent".
+    expect(agentStatus(session({ state: "paused", status: "paused" }))).toBe("paused");
+    expect(agentStatus(session({ state: "active", status: "idle" }))).toBe("idle");
+  });
+
+  it("is paused if either the row or its log says so", () => {
+    // `state` is what the scheduler wrote and what survives a reboot; `status` is the newest thing
+    // the agent's own log said. Either alone is enough.
+    expect(agentStatus(session({ state: "paused", status: "idle" }))).toBe("paused");
+    expect(agentStatus(session({ state: "active", status: "paused" }))).toBe("paused");
+  });
+
+  it("still loses to a waiting approval and to a failure", () => {
+    expect(agentStatus(session({ state: "paused", status: "paused", blocked: true }))).toBe("blocked");
+    expect(agentStatus(session({ state: "paused", status: "error" }))).toBe("error");
+  });
+
+  it("makes its room read as paused even when a sibling is working", () => {
+    // Half-stopped is the part nobody would otherwise notice, so it outranks `working`.
+    const map = roomStatusMap([{ id: "r1" }], [
+      session({ id: "s1", roomId: "r1", status: "working" }),
+      session({ id: "s2", roomId: "r1", state: "paused", status: "paused" }),
+    ]);
+    expect(map.r1).toBe("paused");
+  });
+
+  it("carries its countdown, and null when nothing knows when it lifts", () => {
+    apply({ kind: "sessions", sessions: [session({ id: "s1", state: "paused", status: "paused", pausedUntil: 1_800_000_500 })] });
+    expect(useFabric.getState().sessions[0]!.pausedUntil).toBe(1_800_000_500);
+    apply({ kind: "sessions", sessions: [session({ id: "s1", state: "paused", status: "paused", pausedUntil: null })] });
+    expect(useFabric.getState().sessions[0]!.pausedUntil).toBeNull();
   });
 });

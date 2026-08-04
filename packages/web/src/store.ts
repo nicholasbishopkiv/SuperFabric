@@ -1,5 +1,6 @@
 import type {
   AccountInfo,
+  AccountUsage,
   ChronicleHit,
   MessageInfo,
   MessageKind,
@@ -27,16 +28,27 @@ export interface EventRow {
  *
  * - `idle` — nothing to do.
  * - `working` — something is happening; leave it alone.
+ * - `paused` — held by the limit scheduler; it will come back on its own, and it is *not* idle.
  * - `blocked` — an approval is waiting for **you**.
  * - `error` — something failed and will not un-fail on its own.
  *
- * `paused` and `done` read as `idle` (nothing is moving), `starting` reads as `working` (it looks
- * busy). The colours live in `scene/palette.ts` and are keyed by exactly this type.
+ * `done` reads as `idle` (nothing is moving) and `starting` reads as `working` (it looks busy).
+ * `paused` used to fold into `idle` too, and that was wrong once anything could pause an agent
+ * without being asked: "quiet because there is nothing to do" and "stopped because the subscription
+ * is spent" are the two facts an operator most needs to tell apart on a floor that has gone still.
+ * The colours live in `scene/palette.ts` and are keyed by exactly this type.
  */
-export type FactoryStatus = "idle" | "working" | "blocked" | "error";
+export type FactoryStatus = "idle" | "working" | "paused" | "blocked" | "error";
 
-/** Precedence: a room shows the most demanding state any of its agents is in. */
-const STATUS_RANK: Record<FactoryStatus, number> = { idle: 0, working: 1, blocked: 2, error: 3 };
+/**
+ * Precedence: a room shows the most demanding state any of its agents is in.
+ *
+ * `paused` outranks `working` deliberately. A room where one agent is held and another is busy is a
+ * room that is *half stopped*, and the half that stopped is the part nobody would otherwise notice.
+ */
+const STATUS_RANK: Record<FactoryStatus, number> = {
+  idle: 0, working: 1, paused: 2, blocked: 3, error: 4,
+};
 
 /** A belt between two buildings. Undirected: one pair of rooms is one belt, drawn once. */
 export interface Conveyor {
@@ -155,6 +167,14 @@ export interface FabricState {
    * piece of server state in this store that a factory switch leaves alone.
    */
   accounts: AccountInfo[];
+  /**
+   * What each account's limits look like, in the account list's own order.
+   *
+   * A separate list from `accounts` because it changes for a different reason and on a different
+   * clock: the account list moves when the operator configures something, the meters move on the
+   * server's three-minute poll. Machine-wide like the accounts, so a factory switch leaves it alone.
+   */
+  usage: AccountUsage[];
   /**
    * The factory this tab is looking at, or null before the server has said. Server-owned: the socket
    * holds the active project, so this is whatever the last `projects` message carried and never
@@ -374,6 +394,7 @@ const EMPTY_PROJECT_STATE = {
 export const initialFabricState = {
   projects: [] as ProjectInfo[],
   accounts: [] as AccountInfo[],
+  usage: [] as AccountUsage[],
   activeProjectId: null as string | null,
   sessions: [] as SessionInfo[],
   rooms: [] as RoomInfo[],
@@ -440,6 +461,7 @@ function sameSession(a: SessionInfo, b: SessionInfo): boolean {
   return a.state === b.state && a.status === b.status && a.blocked === b.blocked
     && a.autonomy === b.autonomy && a.model === b.model && a.roomId === b.roomId
     && a.isOrchestrator === b.isOrchestrator && a.accountId === b.accountId
+    && a.pausedUntil === b.pausedUntil
     && a.claudeSessionId === b.claudeSessionId && a.lastSeq === b.lastSeq;
 }
 
@@ -447,9 +469,13 @@ function sameSession(a: SessionInfo, b: SessionInfo): boolean {
  * What one agent's figure shows. Per session, not per room: two agents in the same room routinely
  * disagree, and the whole point of a figure each is that you can see which one is stuck.
  */
-export function agentStatus(session: Pick<SessionInfo, "status" | "blocked">): FactoryStatus {
+export function agentStatus(session: Pick<SessionInfo, "state" | "status" | "blocked">): FactoryStatus {
   if (session.status === "error") return "error";
   if (session.blocked) return "blocked";
+  // The row and the log are both consulted: `state` is what the scheduler wrote and what survives a
+  // reboot, `status` is the newest thing the agent's own log said. Either one saying "paused" is
+  // enough — an agent that is held must never be drawn as merely quiet.
+  if (session.state === "paused" || session.status === "paused") return "paused";
   if (session.status === "working" || session.status === "starting") return "working";
   return "idle";
 }
@@ -644,6 +670,34 @@ function applyAccounts(s: FabricState, incoming: AccountInfo[]): Partial<FabricS
   return { accounts };
 }
 
+/** Every field a meter draws from. `windows` is compared by value: it is short and rebuilt per poll. */
+function sameUsage(a: AccountUsage, b: AccountUsage): boolean {
+  return a.source === b.source && a.approximate === b.approximate && a.readAt === b.readAt
+    && a.note === b.note && a.limited === b.limited && a.limitedUntil === b.limitedUntil
+    && a.limitedBy === b.limitedBy
+    && a.windows.length === b.windows.length
+    && a.windows.every((w, i) => {
+      const other = b.windows[i]!;
+      return w.key === other.key && w.label === other.label && w.utilization === other.utilization
+        && w.resetsAt === other.resetsAt && w.detail === other.detail;
+    });
+}
+
+/**
+ * Same identity-preserving trick as `applyAccounts`: the meters are rebroadcast whole on every poll,
+ * and most polls change nothing. An unchanged row keeps its object so the popover does not repaint
+ * three bars because a fourth moved.
+ */
+function applyUsage(s: FabricState, incoming: AccountUsage[]): Partial<FabricState> | FabricState {
+  const previous = new Map(s.usage.map((u) => [u.accountId, u]));
+  const usage = incoming.map((u) => {
+    const prev = previous.get(u.accountId);
+    return prev !== undefined && sameUsage(prev, u) ? prev : u;
+  });
+  if (usage.length === s.usage.length && usage.every((u, i) => u === s.usage[i])) return s;
+  return { usage };
+}
+
 export const useFabric = create<FabricState>((set, get) => ({
   ...initialFabricState,
 
@@ -657,6 +711,7 @@ export const useFabric = create<FabricState>((set, get) => ({
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
       if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
       if (msg.kind === "accounts") return applyAccounts(s, msg.accounts);
+      if (msg.kind === "usage") return applyUsage(s, msg.usage);
       // An answer to a question nobody is asking any more is dropped: the operator has typed on,
       // and showing them the hits for a prefix of what is in the box would be worse than showing
       // them nothing. See `ChronicleState`.
@@ -928,6 +983,13 @@ export function accountLabel(accounts: readonly AccountInfo[], accountId: string
   if (accountId === null) return ACCOUNT_NONE_LABEL;
   return accounts.find((a) => a.id === accountId)?.label ?? accountId;
 }
+
+/** Every account's meters. Machine-wide like `useAccounts`, so it takes no project. */
+export const useUsage = (): AccountUsage[] => useFabric(useShallow((s) => s.usage));
+
+/** One account's meters, or `undefined` before the server has said anything about it. */
+export const useAccountUsage = (accountId: string): AccountUsage | undefined =>
+  useFabric((s) => s.usage.find((u) => u.accountId === accountId));
 
 /** What "no account" is called wherever it is offered or shown. One string, not four. */
 export const ACCOUNT_NONE_LABEL = "default";

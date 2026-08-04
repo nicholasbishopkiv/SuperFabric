@@ -33,6 +33,7 @@ import type { FactoryStatus } from "../store";
  * |---|---|---|
  * | `idle` | desaturated slate | quiet, not alarming: nothing is wrong with an idle agent |
  * | `working` | green | running, hands off |
+ * | `paused` | cold blue-slate | held by the limit scheduler; it comes back on its own |
  * | `blocked` | amber | *you* have to answer something |
  * | `error` | red | it failed |
  *
@@ -40,10 +41,19 @@ import type { FactoryStatus } from "../store";
  * family, and `blocked` and `error` are the two states an operator must never confuse (one wants an
  * answer, the other wants a fix). Green/amber/red separates all three by hue, and nothing else on
  * the floor is green, amber or red.
+ *
+ * **`paused` is deliberately quiet rather than loud, and that is why it may share a hue band.** The
+ * three saturated statuses are separated by hue because they compete for attention across a room;
+ * `paused` is the opposite kind of fact — "this is stopped, on purpose, and will fix itself" — and a
+ * fourth alarm colour would dilute the three that mean act-now. So it is a *cold, dark* slate: the
+ * same family as `idle` and read against it by temperature and value (bluer, and noticeably darker),
+ * which is exactly the comparison an operator makes when a floor goes still. At 17% saturation it is
+ * below the accent scale's 30% too, so it cannot be mistaken for a workshop's identity either.
  */
 export const STATUS_COLOR: Record<FactoryStatus, string> = {
   idle: "#8b959d",
   working: "#25c26e",
+  paused: "#606f87",
   blocked: "#ffb02e",
   error: "#ec3b3b",
 };
@@ -55,6 +65,10 @@ export const STATUS_COLOR: Record<FactoryStatus, string> = {
 export const STATUS_EMISSIVE: Record<FactoryStatus, number> = {
   idle: 0.25,
   working: 1.3,
+  // Lit, but only just: a held agent is a thing to notice on a second look, not a thing to be
+  // alarmed by. Brighter than `idle` because it is unexpected; far dimmer than the three that want
+  // something from you.
+  paused: 0.55,
   blocked: 1.6,
   error: 1.6,
 };

@@ -29,6 +29,7 @@
      loudly rather than quietly show a colour the floor does not agree with. */
   --color-status-idle: var(--sf-status-idle);
   --color-status-working: var(--sf-status-working);
+  --color-status-paused: var(--sf-status-paused);
   --color-status-blocked: var(--sf-status-blocked);
   --color-status-error: var(--sf-status-error);
   --color-accent: var(--sf-accent);

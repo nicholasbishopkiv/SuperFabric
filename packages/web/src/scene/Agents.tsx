@@ -85,6 +85,7 @@ const STANDARD_X = MAST_X + 0.18;
 const VEST_MATERIALS: Record<FactoryStatus, MeshStandardMaterial> = {
   idle: new MeshStandardMaterial({ color: STATUS_COLOR.idle, roughness: 0.7 }),
   working: new MeshStandardMaterial({ color: STATUS_COLOR.working, roughness: 0.55 }),
+  paused: new MeshStandardMaterial({ color: STATUS_COLOR.paused, roughness: 0.7 }),
   blocked: new MeshStandardMaterial({ color: STATUS_COLOR.blocked, roughness: 0.55 }),
   error: new MeshStandardMaterial({ color: STATUS_COLOR.error, roughness: 0.55 }),
 };

@@ -48,6 +48,9 @@ export function connect(): void {
     // Accounts. Asked for like the rest, and *not* re-asked on `open_project`: a subscription is
     // machine-wide, so the answer is the same on every floor and the list survives a switch.
     send({ kind: "list_accounts" });
+    // The meters beside them. A *query* over what the server already holds — asking never makes it
+    // read the usage endpoint, so a tab reloading ten times costs the operator's quota nothing.
+    send({ kind: "list_usage" });
     // The server hard-terminates sockets on shutdown, so a reconnect must re-ask for the tail of
     // every session we were following — from the last contiguous seq we hold, not from 0.
     const { contiguousSeq } = useFabric.getState();

@@ -40,8 +40,12 @@ function glowTexture(): CanvasTexture | null {
 const GLOW_TEXTURE = glowTexture();
 
 /** How wide the glow is, and how bright, per status. `idle` is a lamp that is on but not saying much. */
-const GLOW_SIZE: Record<FactoryStatus, number> = { idle: 1.5, working: 2.6, blocked: 3, error: 3 };
-const GLOW_OPACITY: Record<FactoryStatus, number> = { idle: 0.18, working: 0.6, blocked: 0.75, error: 0.75 };
+const GLOW_SIZE: Record<FactoryStatus, number> = {
+  idle: 1.5, working: 2.6, paused: 1.8, blocked: 3, error: 3,
+};
+const GLOW_OPACITY: Record<FactoryStatus, number> = {
+  idle: 0.18, working: 0.6, paused: 0.3, blocked: 0.75, error: 0.75,
+};
 
 /**
  * The lamp on top of a workshop: what the room is doing, readable from anywhere on the floor without
