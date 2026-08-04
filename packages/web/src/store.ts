@@ -298,6 +298,16 @@ export interface FabricState {
   /** Agents currently walking to a bay and back. See `Errand`. */
   errands: Errand[];
   /**
+   * roomId -> when that room's chimney plume has finished fading, for rooms that have **stopped**
+   * working. A room that *is* working has no entry: it is smoking now, and `hasMotion` already counts
+   * a working agent.
+   *
+   * This exists so the plume can fade instead of vanishing, which needs frames after the last agent
+   * went quiet — the one thing `frameloop="demand"` will not give you for free. `reapSmoke` drops an
+   * expired deadline, and that store change is what lets the canvas go back to demand.
+   */
+  smokeUntil: Record<string, number>;
+  /**
    * Where this factory stands with onboarding, or null before the server has said.
    *
    * Per project, unlike the roles and the accounts: `onboarded` is a `CLAUDE.md` at *this* project's
@@ -442,6 +452,8 @@ export interface FabricState {
   reconcileErrands(now?: number): void;
   /** Forget finished errands, and the crates they carried in. The frame loop's other half. */
   reapErrands(now?: number): void;
+  /** Forget chimney plumes that have finished fading, which is what lets the frameloop stop. */
+  reapSmoke(now?: number): void;
 }
 
 /**
@@ -462,6 +474,7 @@ const EMPTY_PROJECT_STATE = {
   // across it. Neither has anywhere to be on the new one.
   bayCrates: [] as BayCrate[],
   errands: [] as Errand[],
+  smokeUntil: {} as Record<string, number>,
   tasks: [] as TaskInfo[],
   // The factory we have just left may be documented and this one may not be. Null rather than a
   // guess: the new floor's own `onboarding` frame is one round trip away, and offering to interview
@@ -509,6 +522,7 @@ export const initialFabricState = {
   packages: [] as PackageInFlight[],
   bayCrates: [] as BayCrate[],
   errands: [] as Errand[],
+  smokeUntil: {} as Record<string, number>,
   tasks: [] as TaskInfo[],
   onboarding: null as OnboardingState | null,
   chronicle: { asked: "", answered: null, hits: [] } as ChronicleState,
@@ -607,6 +621,41 @@ export function roomStatusMap(
     if (STATUS_RANK[next] > STATUS_RANK[map[roomId]]) map[roomId] = next;
   }
   return map;
+}
+
+/**
+ * How long a chimney keeps smoking after the last agent in its room stops working. Long enough for a
+ * plume to thin out and disappear, short enough that a factory that has gone quiet looks quiet.
+ */
+export const SMOKE_FADE_MS = 2_200;
+
+/**
+ * When each room's plume finishes fading, after a status change.
+ *
+ * A room that **is** working gets no entry: it is smoking at full and `hasMotion` already counts it.
+ * A room that has just *stopped* gets `now + SMOKE_FADE_MS`, which is the only reason this state
+ * exists — without a deadline in the future nothing would ask for the frames the fade is drawn in,
+ * and the plume would pop out of existence the instant a turn completed.
+ *
+ * Deadlines already in the past are dropped here as well as by `reapSmoke`, and a room that starts
+ * working again loses its deadline rather than fading under a live plume.
+ */
+export function nextSmokeUntil(
+  previous: Record<string, number>,
+  before: Record<string, FactoryStatus>,
+  after: Record<string, FactoryStatus>,
+  now: number,
+): Record<string, number> {
+  const next: Record<string, number> = {};
+  for (const [id, status] of Object.entries(after)) {
+    if (status === "working") continue;
+    const until = before[id] === "working" ? now + SMOKE_FADE_MS : previous[id];
+    if (until !== undefined && until > now) next[id] = until;
+  }
+  const keys = Object.keys(next);
+  const unchanged = keys.length === Object.keys(previous).length
+    && keys.every((id) => previous[id] === next[id]);
+  return unchanged ? previous : next;
 }
 
 /** Keeps the previous map when nothing about it changed, so a beacon does not re-render for free. */
@@ -798,6 +847,8 @@ function applyRooms(s: FabricState, incoming: RoomInfo[]): Partial<FabricState> 
     // building that is no longer on the floor — there is nothing left to drag.
     drag: s.drag !== null && !ids.includes(s.drag.roomId) ? null : s.drag,
     roomStatus,
+    // A room that has left the floor takes its plume with it.
+    smokeUntil: nextSmokeUntil(s.smokeUntil, s.roomStatus, roomStatus, Date.now()),
     conveyors: nextConveyors(s.conveyors, rooms, s.packagedPairs),
     // A crate stands at a room's bay and an errand walks across its forecourt; neither survives the
     // room leaving the floor.
@@ -824,7 +875,14 @@ function applySessions(s: FabricState, incoming: SessionInfo[]): Partial<FabricS
     return prev !== undefined && sameSession(prev, x) ? prev : x;
   });
   if (sessions.length === s.sessions.length && sessions.every((x, i) => x === s.sessions[i])) return s;
-  return { sessions, roomStatus: nextRoomStatus(s.roomStatus, s.rooms, sessions) };
+  const roomStatus = nextRoomStatus(s.roomStatus, s.rooms, sessions);
+  return {
+    sessions,
+    roomStatus,
+    // The one place a room is noticed *stopping*: the chimney needs a deadline to fade towards, and
+    // nothing else in the store looks at the transition rather than the state.
+    smokeUntil: nextSmokeUntil(s.smokeUntil, s.roomStatus, roomStatus, Date.now()),
+  };
 }
 
 /** Every field a card on the board draws from. */
@@ -914,6 +972,9 @@ export const useFabric = create<FabricState>((set, get) => ({
       // room that has just gained its first agent can clear the pile that built up while it was
       // empty. Nothing else notices; this is the only place the agents change.
       get().reconcileErrands();
+      // A room that has just *stopped* working has a plume to fade out, and a fade needs frames after
+      // the work stopped — belt and braces for a tab that renders none.
+      armSmokeReap(get);
       return;
     }
     set((s) => {
@@ -1230,6 +1291,12 @@ export const useFabric = create<FabricState>((set, get) => ({
     if (freed) get().reconcileErrands(now);
   },
 
+  reapSmoke: (now = Date.now()) =>
+    set((s) => {
+      const entries = Object.entries(s.smokeUntil).filter(([, until]) => until > now);
+      if (entries.length === Object.keys(s.smokeUntil).length) return s;
+      return { smokeUntil: Object.fromEntries(entries) };
+    }),
 }));
 
 /**
@@ -1242,6 +1309,14 @@ function armErrandReap(get: () => FabricState): void {
   if (errands.length === 0) return;
   const earliest = Math.min(...errands.map(errandEndsAt));
   setTimeout(() => get().reapErrands(), Math.max(0, earliest - Date.now()) + 80);
+}
+
+/** The same, for a plume that has to stop asking for frames when it has finished fading. */
+function armSmokeReap(get: () => FabricState): void {
+  const deadlines = Object.values(get().smokeUntil);
+  if (deadlines.length === 0) return;
+  const latest = Math.max(...deadlines);
+  setTimeout(() => get().reapSmoke(), Math.max(0, latest - Date.now()) + 80);
 }
 
 // ---- per-object selectors ----
@@ -1585,6 +1660,31 @@ export const useRoomCrateDirections = (roomId: string): number[] =>
   useFabric(useShallow((s) => crateDirections(s, roomId)));
 
 /**
+ * When this room's chimney has finished fading, or `0` when it is not fading at all — either because
+ * it is working (and smoking at full) or because it has been quiet for a while.
+ */
+export const useRoomSmokeUntil = (roomId: string): number =>
+  useFabric((s) => s.smokeUntil[roomId] ?? 0);
+
+/**
+ * Which way traffic is moving on the belt drawn `from -> to`: `1` along it, `-1` against it, `0` when
+ * it is empty. The slats crawl with it, and stand still on an empty belt.
+ *
+ * A number rather than a boolean because a belt is undirected — one pair of rooms is one belt — so
+ * "there is a box on it" does not say which way the box is going.
+ */
+export function beltFlow(packages: readonly PackageInFlight[], from: string, to: string): number {
+  for (const pkg of packages) {
+    if (pkg.from === from && pkg.to === to) return 1;
+    if (pkg.from === to && pkg.to === from) return -1;
+  }
+  return 0;
+}
+
+export const useBeltFlow = (from: string, to: string): number =>
+  useFabric((s) => beltFlow(s.packages, from, to));
+
+/**
  * The bus messages nobody has picked up yet. Deliberately *not* part of `hasMotion`: the marker is
  * static, because a pile-up that pinned the frameloop to `"always"` would spin the GPU for as long as
  * a room was busy — and a queue is a state to read, not an animation to watch.
@@ -1603,7 +1703,10 @@ export const useWaitingMessages = (): WaitingMessage[] => useFabric((s) => s.wai
  *   the frame the pointer went down and then nothing;
  * - a **package in flight**, which also drives the crawling slats of the belt it is on;
  * - an **errand**, which is a figure walking to a bay and back with a crate;
- * - a **working agent**, which drives its own bob and its room's beacon.
+ * - a **working agent**, which drives its own bob, its room's beacon and its chimney;
+ * - a **plume still fading**, which is the one thing that outlives the state that caused it: a room
+ *   that stops working needs frames *after* it stopped for the smoke to thin out, and `reapSmoke`
+ *   dropping the expired deadline is what ends them.
  *
  * `starting` deliberately does **not** count, even though the beacon colours it like `working`.
  * A Claude Code session reports `starting` when its executor spawns and only leaves that status when
@@ -1615,12 +1718,14 @@ export const useWaitingMessages = (): WaitingMessage[] => useFabric((s) => s.wai
  * would otherwise spin the GPU precisely because nothing is happening in it.
  */
 export function hasMotion(
-  state: Pick<FabricState, "sessions" | "packages" | "drag" | "errands">,
+  state: Pick<FabricState, "sessions" | "packages" | "drag" | "errands" | "smokeUntil">,
+  now: number = Date.now(),
 ): boolean {
   return state.drag !== null
     || state.packages.length > 0
     || state.errands.length > 0
-    || state.sessions.some((s) => s.status === "working");
+    || state.sessions.some((s) => s.status === "working")
+    || Object.values(state.smokeUntil).some((until) => until > now);
 }
 
 export const useHasMotion = (): boolean => useFabric(hasMotion);

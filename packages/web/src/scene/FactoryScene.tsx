@@ -70,19 +70,23 @@ export function FactoryScene() {
 /**
  * The one place the render loop hands time back to the store.
  *
- * An errand outlives the state that started it and has to be retired by somebody: the agent has
- * walked back in, so the errand and the crate it carried are done with. It is what keeps `hasMotion`
- * true, so **not** retiring it is a GPU spinning for ever — and that store change is what lets the
- * canvas fall back to `frameloop="demand"`.
+ * Two things outlive the state that started them and have to be retired by somebody: an errand (the
+ * agent has walked back in, so the errand and the crate it carried are done with) and a chimney plume
+ * that has finished fading. Both are what keep `hasMotion` true, so **not** retiring them is a GPU
+ * spinning for ever — and both of those store changes are what let the canvas fall back to
+ * `frameloop="demand"`.
  *
- * One `useFrame` for the whole floor rather than one per room, and it is a real no-op when there is
- * nothing to retire (it returns the state object itself, which notifies no listener), so an animating
- * factory pays one comparison a frame for this.
+ * One `useFrame` for the whole floor rather than one per room, and both actions are real no-ops when
+ * there is nothing to retire (they return the state object itself, which notifies no listener), so an
+ * animating factory pays two comparisons a frame for this.
  */
 function FloorClock() {
   const reapErrands = useFabric((s) => s.reapErrands);
+  const reapSmoke = useFabric((s) => s.reapSmoke);
   useFrame(() => {
-    reapErrands(Date.now());
+    const now = Date.now();
+    reapErrands(now);
+    reapSmoke(now);
   });
   return null;
 }
@@ -152,12 +156,15 @@ function RedrawOnStoreChange() {
   // The crates piled at a bay are static for the same reason, so the same applies: one frame when a
   // crate lands at an unstaffed door, and one more when somebody finally carries it in.
   const bayCrates = useFabric((s) => s.bayCrates);
+  // …and the plume: `smokeUntil` clearing is what stops the fade, so the frame that draws the *last*
+  // state of it — no smoke at all — has to be asked for, because by then `hasMotion` is false again.
+  const smokeUntil = useFabric((s) => s.smokeUntil);
   // An errand ending is the frame that puts the figure back on its mark with empty hands.
   const errands = useFabric((s) => s.errands);
 
   useEffect(() => {
     invalidate();
-  }, [invalidate, rooms, sessions, selectedRoomId, packages, waiting, bayCrates, errands]);
+  }, [invalidate, rooms, sessions, selectedRoomId, packages, waiting, bayCrates, smokeUntil, errands]);
 
   return null;
 }

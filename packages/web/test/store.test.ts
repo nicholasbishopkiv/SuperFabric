@@ -9,6 +9,7 @@ import {
   agentStatus,
   beltDirections,
   beltFan,
+  beltFlow,
   crateDirections,
   errandDirections,
   DEFAULT_PACKAGE_MS,
@@ -23,6 +24,8 @@ import {
   ROLE_NONE_LABEL,
   roomPosition,
   roomStatusMap,
+  nextSmokeUntil,
+  SMOKE_FADE_MS,
   TASK_STATUS_ORDER,
   tasksByStatus,
   unassignedTasks,
@@ -37,7 +40,7 @@ beforeEach(() => {
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
     selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
-    bayCrates: [], errands: [],
+    bayCrates: [], errands: [], smokeUntil: {},
     projects: [], activeProjectId: null, accounts: [], usage: [], roles: [], roleProblems: [],
     chronicle: { asked: "", answered: null, hits: [] },
   });
@@ -1138,7 +1141,7 @@ describe("bus messages on the belts", () => {
 });
 
 describe("hasMotion", () => {
-  const still = { sessions: [], packages: [], drag: null, errands: [] };
+  const still = { sessions: [], packages: [], drag: null, errands: [], smokeUntil: {} };
 
   it("is false for an empty factory", () => {
     expect(hasMotion(still)).toBe(false);
@@ -1421,6 +1424,79 @@ describe("agents fetching a crate from the bay", () => {
   });
 });
 
+describe("which way a belt is running", () => {
+  const flying = (from: string, to: string) => ({
+    id: `${from}>${to}`, from, to, startedAt: 0, durationMs: 100,
+  });
+
+  it("is still on an empty belt", () => {
+    expect(beltFlow([], "a", "b")).toBe(0);
+  });
+
+  it("runs along the belt as drawn, or against it, depending on where the box is going", () => {
+    expect(beltFlow([flying("a", "b")], "a", "b")).toBe(1);
+    expect(beltFlow([flying("b", "a")], "a", "b")).toBe(-1);
+  });
+
+  it("ignores traffic on other belts", () => {
+    expect(beltFlow([flying("c", "d")], "a", "b")).toBe(0);
+  });
+});
+
+describe("chimney smoke", () => {
+  const state = () => useFabric.getState();
+
+  it("gives a room that has stopped working a deadline to fade towards", () => {
+    apply({ kind: "rooms", rooms: [room({ id: "r1" })] });
+    apply({ kind: "sessions", sessions: [session({ id: "a1", roomId: "r1", status: "working" })] });
+    // Working: it is smoking now, and a working agent already counts as motion.
+    expect(state().smokeUntil).toEqual({});
+    expect(hasMotion(state())).toBe(true);
+
+    apply({ kind: "sessions", sessions: [session({ id: "a1", roomId: "r1", status: "idle" })] });
+    const until = state().smokeUntil["r1"];
+    expect(until).toBeGreaterThan(Date.now());
+    // The one thing frameloop="demand" will not give for free: frames after the work stopped.
+    expect(hasMotion(state())).toBe(true);
+    expect(hasMotion(state(), until + 1)).toBe(false);
+
+    state().reapSmoke(until + 1);
+    expect(state().smokeUntil).toEqual({});
+    expect(hasMotion(state())).toBe(false);
+  });
+
+  it("does not fade under a room that has started working again", () => {
+    apply({ kind: "rooms", rooms: [room({ id: "r1" })] });
+    apply({ kind: "sessions", sessions: [session({ id: "a1", roomId: "r1", status: "working" })] });
+    apply({ kind: "sessions", sessions: [session({ id: "a1", roomId: "r1", status: "idle" })] });
+    expect(state().smokeUntil["r1"]).toBeGreaterThan(0);
+
+    apply({ kind: "sessions", sessions: [session({ id: "a1", roomId: "r1", status: "working" })] });
+    expect(state().smokeUntil).toEqual({});
+  });
+
+  it("gives an idle room that never worked no plume at all", () => {
+    apply({ kind: "rooms", rooms: [room({ id: "r1" })] });
+    apply({ kind: "sessions", sessions: [session({ id: "a1", roomId: "r1", status: "idle" })] });
+    expect(state().smokeUntil).toEqual({});
+    expect(hasMotion(state())).toBe(false);
+  });
+
+  it("keeps its own map identity when nothing changed, so a beacon does not repaint for free", () => {
+    const previous = { r1: 9_000 };
+    expect(nextSmokeUntil(previous, { r1: "idle" }, { r1: "idle" }, 1_000)).toBe(previous);
+  });
+
+  it("forgets a room that has left the floor", () => {
+    expect(nextSmokeUntil({ r1: 9_000 }, {}, {}, 1_000)).toEqual({});
+  });
+
+  it("prices the fade from the moment the work stopped", () => {
+    const next = nextSmokeUntil({}, { r1: "working" }, { r1: "idle" }, 1_000);
+    expect(next).toEqual({ r1: 1_000 + SMOKE_FADE_MS });
+  });
+});
+
 // ---- M1b: switching factories ----
 
 describe("projects", () => {
@@ -1451,10 +1527,12 @@ describe("projects", () => {
     useFabric.getState().setConnected(true);
     apply({ kind: "messages", messages: [message({ id: "m1", deliveredAt: null })] });
     apply({ kind: "event", sessionId: "s1", seq: 1, event: { type: "agent_text", text: "working" } });
-    // …a crate nobody collected and an agent walking to fetch another, so the switch has them to lose.
+    // …a crate nobody collected, an agent walking to fetch another, and a chimney that has just
+    // stopped smoking: everything M5 added, so the switch has all of it to lose.
     useFabric.getState().sendPackage("p", "r2", 40);
     useFabric.getState().reapPackages(Date.now() + 80);
     useFabric.getState().sendPackage("p", "r1", 40);
+    apply({ kind: "sessions", sessions: [session({ id: "s1", roomId: "r1", status: "idle" })] });
   }
 
   it("records the list and the active project the server says this socket is on", () => {
@@ -1483,6 +1561,7 @@ describe("projects", () => {
     expect(before.events["s1"]).toHaveLength(1);
     expect(before.bayCrates).toHaveLength(1);
     expect(before.errands).toHaveLength(1);
+    expect(Object.keys(before.smokeUntil)).toEqual(["r1"]);
 
     apply({ kind: "projects", projects: [project(), other], activeProjectId: "p2" });
 
@@ -1495,9 +1574,10 @@ describe("projects", () => {
     expect(s.waiting).toEqual([]);
     expect(s.packages).toEqual([]);
     // A crate stands at a bay of a room on the floor we just left, and an errand is a figure walking
-    // across it. Neither has anywhere to be on the new one.
+    // across it; a plume belongs to a chimney that is no longer on screen.
     expect(s.bayCrates).toEqual([]);
     expect(s.errands).toEqual([]);
+    expect(s.smokeUntil).toEqual({});
     expect(s.conveyors).toEqual([]);
     expect(s.packagedPairs).toEqual({});
     expect(s.animatedMessages).toEqual({});

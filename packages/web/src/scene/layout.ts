@@ -410,6 +410,30 @@ export function bayForDirection(
   return bays.find((b) => Math.hypot(b.x - x, b.z - z) < BAY_WIDTH);
 }
 
+// ---- roof plant ---------------------------------------------------------------------------------
+
+/**
+ * Where a workshop's extract vents stand on its roof, in the building's local frame, and how high
+ * their mouths are above the roof slab. Declared here rather than inline in `Building` because the
+ * chimney plume has to come out of the *same* pipe the roof draws — two independent sets of
+ * coordinates would put the smoke beside the vent.
+ *
+ * The project block has none: it has a pitched roof with a finial rather than plant, so it makes no
+ * smoke. Its beacon still says it is working.
+ */
+export const ROOF_VENT_X: readonly number[] = [-0.95, 0.55];
+export const ROOF_VENT_Z = -0.9;
+/** From the roof slab's top face to the lip of the cowl. */
+export const ROOF_VENT_HEIGHT = 0.47;
+
+/** The mouth of every vent on this building's roof, in its local frame. Empty for the project block. */
+export function ventMouths(kind: RoomInfo["kind"]): [x: number, y: number, z: number][] {
+  if (kind === "project") return [];
+  const { height } = buildingSize(kind);
+  const y = height + ROOM_ROOF_THICKNESS + ROOF_VENT_HEIGHT;
+  return ROOF_VENT_X.map((x) => [x, y, ROOF_VENT_Z]);
+}
+
 /**
  * Where each of a room's agents stands: on a short arc in *front* of the building, meaning the
  * +x/+z corner, which is the one the fixed isometric camera looks at. One agent stands in the

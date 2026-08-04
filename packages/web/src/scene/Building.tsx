@@ -12,10 +12,12 @@ import {
   useRoomCrates,
   useRoomHasOrchestrator,
   useRoomPosition,
+  useRoomSmokeUntil,
   useRoomStatus,
 } from "../store";
 import { Agents } from "./Agents";
 import { BayPile } from "./BayPile";
+import { Chimney } from "./Chimney";
 import { pilesByBay } from "./errands";
 import {
   BAY_WIDTH,
@@ -24,6 +26,8 @@ import {
   labelHeight,
   loadingBays,
   PROJECT_ROOF_HEIGHT,
+  ROOF_VENT_X,
+  ROOF_VENT_Z,
   ROOM_ROOF_THICKNESS,
 } from "./layout";
 import { DETAIL, PROJECT, ROOM, roomAccent, SANDBOX_COLOR, SELECT_COLOR } from "./palette";
@@ -75,6 +79,8 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
   // The crates standing at this room's own doors, and which belt each of them arrived on.
   const crates = useRoomCrates(roomId);
   const crateDirections = useRoomCrateDirections(roomId);
+  // When this room's plume has finished fading, for a room that has just stopped working.
+  const smokeUntil = useRoomSmokeUntil(roomId);
   const selectRoom = useFabric((s) => s.selectRoom);
   const beginRoomDrag = useFabric((s) => s.beginRoomDrag);
 
@@ -142,8 +148,15 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
         <meshStandardMaterial color={trim} roughness={0.7} />
       </mesh>
 
-      {/* Glazing, on the two walls the fixed camera can see. Faintly lit from inside — a factory
-          with the lights on. The glow is constant: decoration must never imply a status. */}
+      {/*
+        Glazing, on the two walls the fixed camera can see — **lit when somebody is in and dark when
+        nobody is**, which is the one atmospheric detail on this floor that is also a reading. It used
+        to glow constantly on the grounds that decoration must not imply a status, and that was right
+        as long as it was decoration; tied to whether the department has a live agent it stops being
+        decoration and answers "is this building occupied" from the roofline, with no label to read.
+        It is not a *status* — the beacon owns those five, and this is one bit, deliberately quiet
+        enough that a lit window can never be mistaken for the amber that means `blocked`.
+      */}
       {([[0, 1], [1, 0]] as const).map(([ax, az], i) => (
         <mesh
           key={i}
@@ -152,9 +165,9 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
         >
           <boxGeometry args={[width * 0.56, isProject ? 0.7 : 0.5, 0.06]} />
           <meshStandardMaterial
-            color={DETAIL.window}
+            color={agents > 0 ? DETAIL.window : DETAIL.windowDark}
             emissive={DETAIL.windowGlow}
-            emissiveIntensity={DETAIL.windowGlowIntensity}
+            emissiveIntensity={agents > 0 ? DETAIL.windowGlowIntensity : 0}
             roughness={0.25}
             metalness={0.1}
           />
@@ -162,6 +175,10 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
       ))}
 
       {isProject ? <ProjectRoof width={width} height={height} /> : <RoomRoof width={width} height={height} />}
+
+      {/* Smoke from the roof plant while the room works, thinning out when it stops. Positioned in the
+          building's own frame, from the same vent coordinates the roof draws its pipes at. */}
+      <Chimney kind={kind} working={status === "working"} smokeUntil={smokeUntil} />
 
       {bays.map((bay, i) => {
         const pile = piles.find((p) => p.bay.x === bay.x && p.bay.z === bay.z);
@@ -249,9 +266,10 @@ function RoomRoof({ width, height }: { width: number; height: number }) {
         <boxGeometry args={[over + 0.04, 0.1, over + 0.04]} />
         <meshStandardMaterial color={ROOM.fascia} roughness={0.9} />
       </mesh>
-      {/* Two extract vents, on the side the camera looks at. */}
-      {([-0.95, 0.55] as const).map((x, i) => (
-        <group key={i} position={[x, ROOM_ROOF_THICKNESS, -0.9]}>
+      {/* Two extract vents. Their coordinates are `layout.ts`' rather than this file's, because the
+          chimney plume has to come out of the *same* pipe — see `ventMouths`. */}
+      {ROOF_VENT_X.map((x, i) => (
+        <group key={i} position={[x, ROOM_ROOF_THICKNESS, ROOF_VENT_Z]}>
           <mesh castShadow position-y={0.2}>
             <cylinderGeometry args={[0.19, 0.22, 0.4, 8]} />
             <meshStandardMaterial color={DETAIL.vent} roughness={0.5} metalness={0.4} />

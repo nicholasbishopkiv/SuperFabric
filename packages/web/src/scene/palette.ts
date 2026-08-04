@@ -175,12 +175,29 @@ export const DETAIL = {
   /** Glazing. Dark, because a window is a hole with glass in it. */
   window: "#27303a",
   /**
-   * The lights are on inside. Kept *very* faint on purpose: warm glass is the scene's only warm
-   * accent on a building, and any brighter it starts reading as the amber that means `blocked`.
+   * The lights are on inside — drawn **only when a room actually has a live agent in it**, which is
+   * what turned this from decoration into a reading. An empty department is a dark building.
+   *
+   * Kept *very* faint on purpose: warm glass is the scene's only warm accent on a building, and any
+   * brighter it starts reading as the amber that means `blocked`. That constraint is the reason the
+   * lit/dark distinction is carried by **temperature as well as brightness** — `windowDark` below is
+   * a colder, deader glass, so the pair reads at a glance without the lit state having to shout.
    */
   windowGlow: "#ffd7a0",
-  /** How hard that glow burns. Tuned down from 0.28, where the strips read as amber bars. */
-  windowGlowIntensity: 0.09,
+  /**
+   * How hard that glow burns. Tuned down from 0.28, where the strips read as amber bars — and
+   * deliberately left where it was when the *constant* glow was signed off, give or take a hair.
+   * Making a room occupied readable is not a licence to make a lit window louder than the version
+   * that had already been judged against the beacons; the new reading is carried by the **dark**
+   * state, which is new, rather than by brightening the lit one, which was not.
+   */
+  windowGlowIntensity: 0.1,
+  /**
+   * Glazing with nobody behind it: colder and darker than `window`, and not lit at all. Cold rather
+   * than merely darker because value alone at this size is almost invisible from the reading
+   * distance, and temperature is the floor's established way of separating two neutrals.
+   */
+  windowDark: "#1a2028",
   vent: "#8d949c",
   /** Roof glazing, pale so it reads as sky rather than as a panel. */
   skylight: "#cfe0ea",
@@ -214,6 +231,22 @@ export function packageToneIndex(id: string): number {
   }
   return (hash >>> 8) % PACKAGE_COLORS.length;
 }
+
+/**
+ * Smoke from a roof vent, and what it fades towards as it rises and thins out.
+ *
+ * A **mid** grey rather than the white a plume is usually drawn as, and that is a decision about this
+ * particular floor: the camera looks *down*, so what is behind a workshop's roof is mostly the pale
+ * concrete slab, not sky. White smoke over `FLOOR.slab` is invisible. This sits between the slab and
+ * the project block's near-black walls, so the same plume reads against both — and it is a neutral, so
+ * it competes with nothing that means anything.
+ */
+export const SMOKE = {
+  /** Fresh from the pipe. */
+  fresh: "#8e969d",
+  /** Thinned out, on its way to nothing: lighter, so a plume dissolves upwards. */
+  thin: "#bcc2c7",
+} as const;
 
 /**
  * A message nobody has picked up yet, stacked at its sender's loading bay.
