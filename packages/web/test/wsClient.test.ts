@@ -108,6 +108,31 @@ describe("wsClient projects", () => {
   });
 });
 
+describe("wsClient chronicle", () => {
+  it("records the question before sending it, so the answer can be recognised", async () => {
+    const { client, store, sock } = await freshClient();
+    client.searchChronicle("webhook");
+    expect(sock.sent.at(-1)).toEqual({ kind: "search_chronicle", query: "webhook" });
+    expect(store.useFabric.getState().chronicle).toMatchObject({ asked: "webhook", answered: null });
+
+    sock.deliver({
+      kind: "chronicle",
+      query: "webhook",
+      hits: [{
+        kind: "decision", title: "Retries live in payments", snippet: "…", createdAt: 1_800_000_000,
+        ref: "d1", seq: 0, roomId: null, path: "/p/docs/decisions/0001-retries.md",
+      }],
+    });
+    expect(store.useFabric.getState().chronicle.hits).toHaveLength(1);
+  });
+
+  it("asks for the newest decisions with an empty query", async () => {
+    const { client, sock } = await freshClient();
+    client.searchChronicle("");
+    expect(sock.sent.at(-1)).toEqual({ kind: "search_chronicle", query: "" });
+  });
+});
+
 describe("wsClient gap handling", () => {
   it("does not resubscribe while the tail is contiguous", async () => {
     const { client, sock } = await freshClient();

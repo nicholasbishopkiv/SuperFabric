@@ -8,6 +8,7 @@ import {
   useIsSelected,
   useRoom,
   useRoomAgentCount,
+  useRoomHasOrchestrator,
   useRoomPosition,
   useRoomStatus,
 } from "../store";
@@ -25,6 +26,14 @@ import { DETAIL, PROJECT, ROOM, roomAccent, SELECT_COLOR } from "./palette";
 import { StatusBeacon } from "./StatusBeacon";
 
 const LABEL_COLOR = "#1c1c1c";
+
+/**
+ * The word "orchestrator" on a building's label, in the project block's own wall colour — the same
+ * slate the label's left stripe already uses for the central building, so the mark belongs to
+ * headquarters rather than introducing a colour of its own. (The label sits on white, so the *dark*
+ * end of the palette is what is legible here; the figure's standard is the light end, on the floor.)
+ */
+const ORCHESTRATOR_LABEL_COLOR = PROJECT.wall;
 
 /**
  * How far outside the building the selection rim is drawn. Small: a rim is a rim, and a thick one
@@ -54,6 +63,10 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
   const agents = useRoomAgentCount(roomId);
   const status = useRoomStatus(roomId);
   const selected = useIsSelected(roomId);
+  // Which building has the senior agent is a fact about the *factory*, so the label says it in words
+  // as well: the standard on the figure answers "which one of them", the label answers "does this
+  // factory have one at all" from a screenshot, with no figure to squint at.
+  const hasOrchestrator = useRoomHasOrchestrator(roomId);
   const beltDirections = useBeltDirections(roomId);
   const selectRoom = useFabric((s) => s.selectRoom);
   const beginRoomDrag = useFabric((s) => s.beginRoomDrag);
@@ -177,6 +190,9 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
               agent *can* be created in the project room, and then figures stand at the block; a
               label that stayed silent about them would contradict what the floor shows. */}
           {isProject && agents === 0 ? "" : ` · ${agents} agent${agents === 1 ? "" : "s"}`}
+          {hasOrchestrator && (
+            <span style={{ color: ORCHESTRATOR_LABEL_COLOR, fontWeight: 700 }}> · orchestrator</span>
+          )}
         </div>
       </Html>
     </group>

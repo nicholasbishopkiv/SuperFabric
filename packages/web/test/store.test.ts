@@ -1,4 +1,6 @@
-import type { MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo } from "@superfabric/shared";
+import type {
+  ChronicleHit, MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo,
+} from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   agentStatus,
@@ -9,6 +11,7 @@ import {
   initialFabricState,
   liveAgentCount,
   openTaskCount,
+  orchestratorSession,
   roomAgents,
   roomlessSessions,
   roomPosition,
@@ -26,6 +29,7 @@ beforeEach(() => {
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
     selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
     projects: [], activeProjectId: null,
+    chronicle: { asked: "", answered: null, hits: [] },
   });
 });
 
@@ -590,6 +594,124 @@ describe("roomlessSessions", () => {
 
   it("is empty once every session has a room", () => {
     expect(roomlessSessions([session({ roomId: "r1" })])).toEqual([]);
+  });
+});
+
+describe("the orchestrator", () => {
+  it("is whichever session carries the flag, and nothing else about it is special", () => {
+    const sessions = [
+      session({ id: "junior", roomId: "r1" }),
+      session({ id: "senior", roomId: "p", isOrchestrator: true }),
+    ];
+    expect(orchestratorSession(sessions)?.id).toBe("senior");
+    // …and it is still an ordinary agent of its room: the floor draws it with the others.
+    expect(roomAgents(sessions, "p").map((s) => s.id)).toEqual(["senior"]);
+  });
+
+  it("is undefined for a factory that has not been given one", () => {
+    expect(orchestratorSession([session({ id: "a" }), session({ id: "b" })])).toBeUndefined();
+  });
+
+  it("repaints the figure when an agent becomes the orchestrator", () => {
+    // `applySessions` preserves the identity of rows that did not change, so a field left out of
+    // `sameSession` is a field whose change never reaches the floor. This is that regression test.
+    apply({ kind: "sessions", sessions: [session({ id: "s1", roomId: "p" })] });
+    const before = useFabric.getState().sessions[0];
+    apply({ kind: "sessions", sessions: [session({ id: "s1", roomId: "p", isOrchestrator: true })] });
+    const after = useFabric.getState().sessions[0];
+    expect(after).not.toBe(before);
+    expect(after.isOrchestrator).toBe(true);
+  });
+
+  it("says which room it stands in, so the central building can mark itself", () => {
+    apply({ kind: "rooms", rooms: [room({ id: "p", name: "shop", kind: "project" }), room({ id: "r1" })] });
+    apply({ kind: "sessions", sessions: [session({ id: "s1", roomId: "p", isOrchestrator: true })] });
+    const { sessions } = useFabric.getState();
+    expect(orchestratorSession(sessions)?.roomId).toBe("p");
+  });
+});
+
+describe("the chronicle", () => {
+  const hit = (over: Partial<ChronicleHit> = {}): ChronicleHit => ({
+    kind: "decision", title: "Retries live in payments", snippet: "the webhook…",
+    createdAt: 1_800_000_000, ref: "d1", seq: 0, roomId: "r1",
+    path: "/p/docs/decisions/0001-retries.md", ...over,
+  });
+
+  it("shows the answer to the question that is being asked", () => {
+    useFabric.getState().askChronicle("webhook");
+    apply({ kind: "chronicle", query: "webhook", hits: [hit()] });
+    const { chronicle } = useFabric.getState();
+    expect(chronicle.answered).toBe("webhook");
+    expect(chronicle.hits.map((h) => h.title)).toEqual(["Retries live in payments"]);
+  });
+
+  it("drops an answer to a question the operator has already moved past", () => {
+    useFabric.getState().askChronicle("web");
+    useFabric.getState().askChronicle("webhook");
+    // The slower answer to the earlier prefix lands second. Showing it would put the results for a
+    // word that is no longer in the box under a box that says something else.
+    apply({ kind: "chronicle", query: "web", hits: [hit({ ref: "stale" })] });
+    expect(useFabric.getState().chronicle.hits).toEqual([]);
+    expect(useFabric.getState().chronicle.answered).toBeNull();
+
+    apply({ kind: "chronicle", query: "webhook", hits: [hit({ ref: "fresh" })] });
+    expect(useFabric.getState().chronicle.hits.map((h) => h.ref)).toEqual(["fresh"]);
+  });
+
+  it("keeps the hits on screen while the same question is re-asked", () => {
+    useFabric.getState().askChronicle("webhook");
+    apply({ kind: "chronicle", query: "webhook", hits: [hit()] });
+    const before = useFabric.getState().chronicle;
+    useFabric.getState().askChronicle("webhook");
+    // A genuine no-op: pressing Enter again must not blank the list being read.
+    expect(useFabric.getState().chronicle).toBe(before);
+  });
+
+  it("empties while a new question is outstanding, so stale hits are never read as fresh", () => {
+    useFabric.getState().askChronicle("webhook");
+    apply({ kind: "chronicle", query: "webhook", hits: [hit()] });
+    useFabric.getState().askChronicle("retries");
+    const { chronicle } = useFabric.getState();
+    expect(chronicle.asked).toBe("retries");
+    expect(chronicle.answered).toBeNull(); // the surface draws this as "searching…"
+  });
+
+  it("distinguishes a recorded decision from something an agent said", () => {
+    useFabric.getState().askChronicle("webhook");
+    apply({
+      kind: "chronicle",
+      query: "webhook",
+      hits: [hit(), hit({ kind: "event", ref: "s1", seq: 12, title: "agent_text", path: null })],
+    });
+    const { hits } = useFabric.getState().chronicle;
+    expect(hits.map((h) => h.kind)).toEqual(["decision", "event"]);
+    // Only a decision has a file; an event's record is the transcript.
+    expect(hits[1].path).toBeNull();
+  });
+
+  it("is dropped with the rest of the factory when the project changes", () => {
+    apply({
+      kind: "projects",
+      projects: [
+        { id: "p1", name: "shop", root: "/code/shop", lastOpenedAt: null },
+        { id: "p2", name: "vendor", root: "/code/vendor", lastOpenedAt: null },
+      ],
+      activeProjectId: "p1",
+    });
+    useFabric.getState().askChronicle("webhook");
+    apply({ kind: "chronicle", query: "webhook", hits: [hit()] });
+
+    apply({
+      kind: "projects",
+      projects: [
+        { id: "p1", name: "shop", root: "/code/shop", lastOpenedAt: null },
+        { id: "p2", name: "vendor", root: "/code/vendor", lastOpenedAt: null },
+      ],
+      activeProjectId: "p2",
+    });
+    // Those ADRs are files in a repository this floor is not looking at any more.
+    expect(useFabric.getState().chronicle).toEqual({ asked: "", answered: null, hits: [] });
   });
 });
 

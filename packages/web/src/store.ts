@@ -1,4 +1,5 @@
 import type {
+  ChronicleHit,
   MessageInfo,
   MessageKind,
   ProjectInfo,
@@ -112,6 +113,21 @@ export interface StagedAttachment {
   bytes: number;
 }
 
+/**
+ * What the chronicle surface is currently showing, and what it is showing it *for*.
+ *
+ * The query is kept beside the hits rather than only in the search box because the two have to be
+ * compared: answers arrive over the socket in no guaranteed order, so the only way to know a frame
+ * is still wanted is to check it against the question being asked. `asked` is what we last sent;
+ * `answered` is what the hits on screen are the answer to, and `null` means nothing has come back
+ * yet — which is the state the surface draws as "searching…".
+ */
+export interface ChronicleState {
+  asked: string;
+  answered: string | null;
+  hits: ChronicleHit[];
+}
+
 /** The edges an overlay panel can cover. The top is deliberately free: nothing lives there. */
 export type HudSide = "left" | "right" | "bottom";
 
@@ -183,6 +199,8 @@ export interface FabricState {
   packages: PackageInFlight[];
   /** The task board, newest first — the server's whole list, rebroadcast on every change. */
   tasks: TaskInfo[];
+  /** The chronicle surface's current question and its answer. See `ChronicleState`. */
+  chronicle: ChronicleState;
   /** Bus messages still queued at their sender, oldest first. See `WaitingMessage`. */
   waiting: WaitingMessage[];
   /**
@@ -239,6 +257,12 @@ export interface FabricState {
   setHudInset(side: HudSide, px: number): void;
   /** Ask the camera to frame the whole factory again. */
   requestCameraFit(): void;
+  /**
+   * Record that a chronicle search has been sent. The *sending* is `wsClient`'s job — the store
+   * never talks to the socket — but which question is outstanding is state the answer is checked
+   * against, so it is held here rather than in a component that could unmount mid-flight.
+   */
+  askChronicle(query: string): void;
   /**
    * Forget the last server error. The overlay shows `lastError` next to whatever the operator was
    * doing when it arrived, so a rejected room name has to stop being shown once they try again —
@@ -315,6 +339,9 @@ const EMPTY_PROJECT_STATE = {
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
   tasks: [] as TaskInfo[],
+  // Decisions belong to a project's own repository, so the hits from the factory we have just left
+  // describe files that are not on this floor at all.
+  chronicle: { asked: "", answered: null, hits: [] } as ChronicleState,
   waiting: [] as WaitingMessage[],
   animatedMessages: {} as Record<string, true>,
   // The next project's first `messages` snapshot is history, not news — the same reason a reconnect
@@ -349,6 +376,7 @@ export const initialFabricState = {
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
   tasks: [] as TaskInfo[],
+  chronicle: { asked: "", answered: null, hits: [] } as ChronicleState,
   waiting: [] as WaitingMessage[],
   animatedMessages: {} as Record<string, true>,
   messagesLoaded: false,
@@ -392,10 +420,16 @@ function sameWaiting(a: readonly WaitingMessage[], b: readonly WaitingMessage[])
   return a.length === b.length && a.every((w, i) => w === b[i]);
 }
 
-/** Every field a figure, a beacon or an agent row in the HUD draws from. */
+/**
+ * Every field a figure, a beacon or an agent row in the HUD draws from — **including
+ * `isOrchestrator`**, which the floor now marks. A field left out of this list is a field whose
+ * change is invisible: the row keeps its previous identity, the shallow comparison holds, and the
+ * figure never repaints.
+ */
 function sameSession(a: SessionInfo, b: SessionInfo): boolean {
   return a.state === b.state && a.status === b.status && a.blocked === b.blocked
     && a.autonomy === b.autonomy && a.model === b.model && a.roomId === b.roomId
+    && a.isOrchestrator === b.isOrchestrator
     && a.claudeSessionId === b.claudeSessionId && a.lastSeq === b.lastSeq;
 }
 
@@ -589,6 +623,13 @@ export const useFabric = create<FabricState>((set, get) => ({
       if (msg.kind === "sessions") return applySessions(s, msg.sessions);
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
       if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
+      // An answer to a question nobody is asking any more is dropped: the operator has typed on,
+      // and showing them the hits for a prefix of what is in the box would be worse than showing
+      // them nothing. See `ChronicleState`.
+      if (msg.kind === "chronicle") {
+        if (msg.query !== s.chronicle.asked) return s;
+        return { chronicle: { asked: s.chronicle.asked, answered: msg.query, hits: msg.hits } };
+      }
       if (msg.kind === "error") return { lastError: msg.message };
       // Not an error, and deliberately not stored with them: "saved to /p/attachments/a.png" is the
       // server confirming something worked, and painting it red would be a lie.
@@ -643,6 +684,14 @@ export const useFabric = create<FabricState>((set, get) => ({
     }),
 
   requestCameraFit: () => set((s) => ({ fitRequests: s.fitRequests + 1 })),
+
+  askChronicle: (query) =>
+    set((s) => {
+      // Re-asking the same question keeps the hits on screen: the operator pressing Enter again
+      // should not blank the list they are reading while the identical answer comes back.
+      if (s.chronicle.asked === query) return s;
+      return { chronicle: { asked: query, answered: null, hits: s.chronicle.hits } };
+    }),
 
   clearError: () => set((s) => (s.lastError === null ? s : { lastError: null })),
 
@@ -953,6 +1002,38 @@ export function roomlessSessions(sessions: readonly SessionInfo[]): SessionInfo[
 
 export const useRoomlessSessions = (): SessionInfo[] =>
   useFabric(useShallow((s) => roomlessSessions(s.sessions)));
+
+// ---- the orchestrator ----
+//
+// It is an ordinary session with a flag, so there is nothing here but selectors: no separate list,
+// no separate widget, no second source of truth about which agent is senior. At most one per
+// project — the server enforces that — so "the first flagged session" is "the orchestrator".
+
+/** This factory's senior agent, or `undefined` for a factory that has not been given one. */
+export function orchestratorSession(sessions: readonly SessionInfo[]): SessionInfo | undefined {
+  return sessions.find((s) => s.isOrchestrator);
+}
+
+export const useOrchestrator = (): SessionInfo | undefined =>
+  useFabric((s) => orchestratorSession(s.sessions));
+
+/**
+ * Whether this factory has one. A boolean, so the board's "route it" affordance does not re-render
+ * every time the orchestrator's status ticks — it only cares that it exists.
+ */
+export const useHasOrchestrator = (): boolean =>
+  useFabric((s) => orchestratorSession(s.sessions) !== undefined);
+
+/**
+ * Whether the orchestrator stands in this room. The building's label reads it, and it is a boolean
+ * for the same reason: the central building's label must not repaint on every token.
+ */
+export const useRoomHasOrchestrator = (roomId: string): boolean =>
+  useFabric((s) => orchestratorSession(s.sessions)?.roomId === roomId);
+
+// ---- the chronicle ----
+
+export const useChronicle = (): ChronicleState => useFabric((s) => s.chronicle);
 
 // ---- the task board ----
 

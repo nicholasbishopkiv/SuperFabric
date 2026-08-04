@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { AttachmentDrop } from "./hud/AttachmentDrop";
+import { ChroniclePanel } from "./hud/ChroniclePanel";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
 import { FitButton } from "./hud/FitButton";
 import { NoticeBar } from "./hud/NoticeBar";
@@ -30,6 +31,9 @@ export default function App() {
       <ConsoleDrawer />
       <TaskPanel />
       <ProjectSwitcher />
+      {/* The other end of the free top strip: the chronicle, on the same row as the switcher and
+          offset by the console's width. A popover rather than a fourth edge — see `ChroniclePanel`. */}
+      <ChroniclePanel />
       {/* The one place the server speaks: `error` and `notice`, centred in the strip the panels
           leave free. No panel renders either any more — see `NoticeBar`. */}
       <NoticeBar />
