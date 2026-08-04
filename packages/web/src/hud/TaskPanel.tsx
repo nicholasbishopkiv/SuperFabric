@@ -63,6 +63,22 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
 const STATUS_TINT: Partial<Record<TaskStatus, string>> = { blocked: "text-status-blocked" };
 
 /**
+ * What an empty column says.
+ *
+ * It used to say `—`, five times over, which is how a board with three tasks on it read as a board
+ * that was broken. A dash is not an empty state: it is the absence of one, and at this size it looks
+ * like a value that failed to load. Each of these is a small piece of good news — *nothing is
+ * blocked* is a thing an operator is glad to read — so they are worth the words.
+ */
+const EMPTY_LABEL: Record<TaskStatus, string> = {
+  open: "nothing open",
+  in_progress: "nobody working",
+  blocked: "nothing blocked",
+  review: "nothing to review",
+  done: "nothing finished yet",
+};
+
+/**
  * The unassigned card's affordance: ask the orchestrator where this belongs.
  *
  * **It asks; it never assigns.** `route_task` sends the orchestrator a message describing the task
@@ -167,10 +183,18 @@ function StatusGroup({ status, tasks }: { status: TaskStatus; tasks: TaskInfo[] 
         )}
       >
         {STATUS_LABEL[status]}
-        <span className="font-normal tabular-nums text-fg-faint">{tasks.length}</span>
+        {tasks.length > 0 && (
+          <Badge className="font-normal" variant={status === "blocked" ? "warn" : "neutral"}>
+            {tasks.length}
+          </Badge>
+        )}
       </h3>
+      {/* A dashed slot the size of a card, rather than a sentence floating beside four bordered ones:
+          the column keeps its shape, and the shape says "a card could go here". */}
       {tasks.length === 0 ? (
-        <div className="text-2xs text-fg-faint/60">—</div>
+        <div className="rounded-[4px] border border-dashed border-line-strong/70 px-2 py-1.5 text-2xs text-fg-faint">
+          {EMPTY_LABEL[status]}
+        </div>
       ) : (
         <ul className="space-y-1">
           {tasks.map((t) => (

@@ -28,6 +28,7 @@ import {
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 import { send } from "../wsClient";
 import { AccountSelect } from "./AccountSelect";
@@ -85,17 +86,20 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
         onClick={() => selectRoom(roomId)}
         title={room.path}
         className={cn(
-          "flex w-full items-center gap-2 rounded-[3px] border px-2 py-1 text-left text-sm",
+          "flex w-full items-center gap-2 rounded-[4px] border px-2 py-1.5 text-left text-sm",
           "outline-none transition-colors focus-visible:ring-1 focus-visible:ring-accent",
+          // A room is an entity, so it stands on a surface of its own rather than on the panel — the
+          // middle level of the hierarchy `ui/card.tsx` describes. Before this the list and the form
+          // above it were the same colour, and a department read as a line of text.
           // Selection is cyan everywhere, on the floor and in this list: the two are the same
           // `selectedRoomId`, so they must not be two different colours.
           selected
             ? "border-accent/70 bg-accent/12 text-accent"
-            : "border-transparent text-fg hover:border-line hover:bg-fg/5",
+            : "border-line/70 bg-panel-raised/55 text-fg hover:border-line-strong/70",
         )}
       >
         <StatusDot status={status} />
-        <span className={cn("truncate", selected && "font-semibold")}>{room.name}</span>
+        <span className={cn("truncate text-md", selected && "font-semibold")}>{room.name}</span>
         {room.kind === "project" && (
           <span className="shrink-0 text-2xs text-fg-faint">project</span>
         )}
@@ -807,21 +811,26 @@ export function RoomPanel() {
       <div className="px-3 pb-2">
         <form onSubmit={submit}>
           <div className="flex gap-1.5">
-            <Input
-              name="roomName"
-              value={name}
-              onChange={(e) => {
-                setName(e.target.value);
-                setProblem(null);
-              }}
-              placeholder="new room name…"
-            />
+            {/* The rule is a hint rather than a permanent note. It used to sit under the field as two
+                lines of grey text that were on screen whether or not anyone was typing — which is
+                how a panel ends up with its help weighing as much as its content. It is needed at
+                exactly one moment, and `nameProblem` already catches the moment it is broken. */}
+            <Hint text={`The name is the folder name: ${NAME_RULE}.`} side="bottom">
+              <Input
+                name="roomName"
+                value={name}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  setProblem(null);
+                }}
+                placeholder="new room name…"
+              />
+            </Hint>
             <Button type="submit" variant="accent" disabled={!connected} className="shrink-0">
               <PlusIcon />
               Create
             </Button>
           </div>
-          <FieldNote>The name is the folder name: {NAME_RULE}.</FieldNote>
           {/* The default is `<project>/<name>`, which is what "room = folder" means most of the
               time. A department that lives in a separate repository is the exception, so the field
               for it is out of the way until it is asked for. */}
