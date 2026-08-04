@@ -434,6 +434,75 @@ export const RoleProblem = z.object({
 });
 export type RoleProblem = z.infer<typeof RoleProblem>;
 
+// ---- M1c: onboarding ----
+
+/**
+ * The file whose presence at a project's root means the project has been onboarded.
+ *
+ * **This is the whole detection rule, and it is deliberately the only one.** Not "the folder looks
+ * empty", not "there are fewer than N files", not "no git history" — those are guesses about a
+ * repository the operator knows far better than we do, and a factory that offers to interview
+ * someone about a project they documented last year is a factory that has not read it. A missing
+ * `CLAUDE.md` is a fact, it is the file the interview produces, and an operator who wants the offer
+ * back can delete it.
+ *
+ * Named here rather than in the server because both sides talk about it: the server stats it and the
+ * UI explains it.
+ */
+export const PROJECT_CHARTER_FILE = "CLAUDE.md";
+
+/**
+ * A room the onboarding agent thinks this project should have — **a proposal, not a room**.
+ *
+ * The agent cannot create rooms. It records these, the operator reads them, edits the names it
+ * disagrees with and approves the ones it wants; only then does the ordinary `createRoom` path run,
+ * with every invariant it already has (name safety, containment, never overwriting a charter). A
+ * factory that reorganised itself on the say-so of an interview is not what anyone wants on first
+ * contact — so the suggestion is a durable row with a status rather than a side effect.
+ */
+export const RoomSuggestionStatus = z.enum(["proposed", "accepted", "dismissed"]);
+export type RoomSuggestionStatus = z.infer<typeof RoomSuggestionStatus>;
+
+export const RoomSuggestion = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  /** The folder this room would become. A `RoomName`, because that is what it has to survive being. */
+  name: RoomName,
+  /** One line: what this department would own. Goes into the new room's charter as its first line. */
+  charter: z.string().min(1).max(300),
+  status: RoomSuggestionStatus,
+  /**
+   * Why this one is not on the floor, when accepting it failed — the `createRoom` error, verbatim.
+   * A suggestion that could not be created stays `proposed` with this set, so the operator can fix
+   * the name and try again rather than watching one of five rooms silently not appear.
+   */
+  note: z.string().max(300).nullable().default(null),
+  createdAt: z.number().int(),
+});
+export type RoomSuggestion = z.infer<typeof RoomSuggestion>;
+
+/**
+ * Where one project stands with onboarding: whether it has been done, who is doing it, and what the
+ * interview has proposed so far.
+ *
+ * One message for the whole feature rather than a field bolted onto `ProjectInfo`, because it changes
+ * for reasons a project listing never does — an agent writing a file, a tool recording a proposal —
+ * and because the UI shows all three facts in one place or none of them.
+ */
+export const OnboardingState = z.object({
+  projectId: z.string(),
+  /** `CLAUDE.md` exists at the project root. See `PROJECT_CHARTER_FILE`. */
+  onboarded: z.boolean(),
+  /** The onboarding agent, while one is running. Null when none is. */
+  sessionId: z.string().nullable(),
+  /** Every proposal this project has, newest last. Accepted and dismissed ones stay for the record. */
+  suggestions: z.array(RoomSuggestion),
+});
+export type OnboardingState = z.infer<typeof OnboardingState>;
+
+/** How many rooms one `factory_suggest_rooms` call may propose. A first cut, not a department chart. */
+export const MAX_ROOM_SUGGESTIONS = 12;
+
 // ---- M3a: tasks and the factory bus ----
 
 /** The board's columns. `blocked` specifically means "waiting on another room", see `TaskInfo`. */
@@ -693,6 +762,39 @@ export const ClientMessage = z.discriminatedUnion("kind", [
     name: z.string().min(1).max(120).optional(),
   }),
   z.object({ kind: z.literal("open_project"), projectId: z.string() }),
+  // Onboarding. Four messages for one conversation with the factory itself: what is the state, start
+  // the interview, approve what it proposed, drop what it got wrong. All scoped to the asking
+  // socket's own project, like every other per-factory message here.
+  z.object({ kind: z.literal("list_onboarding") }),
+  /**
+   * Put an onboarding agent in the project room and set it going.
+   *
+   * Idempotent, like `ensure_orchestrator` and for the same reason: it is a button, and a second
+   * click must hand back the interview already in progress rather than start a rival one. It is
+   * **not** refused on an already-onboarded project — an operator who wants the interview again on a
+   * documented project is allowed to ask for it; what is missing then is only the prompting.
+   */
+  z.object({ kind: z.literal("start_onboarding") }),
+  /**
+   * Approve some of the rooms the interview proposed, optionally with the operator's own edits.
+   *
+   * The edits are the point: a proposal is something to correct, not a form to sign. Each accepted
+   * entry then goes through the ordinary `createRoom` path, so a name that is not a usable folder
+   * segment, or a room that already exists, fails *that* suggestion and says why — the others are
+   * still created.
+   */
+  z.object({
+    kind: z.literal("accept_room_suggestions"),
+    rooms: z.array(z.object({
+      id: z.string(),
+      /** Replaces the proposed name. Omitted => the name as proposed. */
+      name: RoomName.optional(),
+      /** Replaces the proposed one-line charter. Omitted => the charter as proposed. */
+      charter: z.string().min(1).max(300).optional(),
+    })).min(1).max(MAX_ROOM_SUGGESTIONS),
+  }),
+  /** Drop one proposal. Nothing is created and nothing is deleted; it stops being offered. */
+  z.object({ kind: z.literal("dismiss_room_suggestion"), suggestionId: z.string() }),
   // Tasks. `roomId` omitted on create means unassigned, which is the intended path: the
   // orchestrator routes it (M3b). On update, `null` is how the operator *clears* an assignment —
   // omitted means "leave it alone", so the two have to be distinguishable on the wire.
@@ -840,6 +942,12 @@ export const ServerMessage = z.discriminatedUnion("kind", [
    * has to design against.
    */
   z.object({ kind: z.literal("roles"), roles: z.array(RoleSpec), problems: z.array(RoleProblem) }),
+  /**
+   * Where this factory stands with onboarding. Per-project like `rooms` and `sessions`, and pushed
+   * rather than only answered: the fact it carries (`CLAUDE.md` exists now) is one an *agent* changes
+   * by writing a file, which no client request would ever be the cause of.
+   */
+  z.object({ kind: z.literal("onboarding"), onboarding: OnboardingState }),
   z.object({ kind: z.literal("tasks"), tasks: z.array(TaskInfo) }),
   /**
    * The bus's traffic. This is what drives the conveyor animation, so it carries `deliveredAt`:

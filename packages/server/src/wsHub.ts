@@ -5,6 +5,7 @@ import type { LimitMonitor } from "./limitMonitor.js";
 import type { Chronicle } from "./chronicle.js";
 import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
+import type { OnboardingManager } from "./onboarding.js";
 import { ensureOrchestrator } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
 import type { RoleLibrary } from "./roleLibrary.js";
@@ -26,7 +27,7 @@ const SESSION_SHAPE_EVENTS = new Set(["session_status", "approval_request", "app
 const BROADCAST_DEBOUNCE_MS = 250;
 
 /** State the server pushes on its own, as opposed to answering a query. */
-type PushedList = "sessions" | "tasks" | "messages" | "accounts" | "usage";
+type PushedList = "sessions" | "tasks" | "messages" | "accounts" | "usage" | "onboarding";
 
 export interface WsHubOptions {
   /** The task board. Absent => `create_task`/`update_task`/`list_tasks` are refused with an error. */
@@ -65,6 +66,13 @@ export interface WsHubOptions {
    * leave the operator looking for a feature that is right there.
    */
   roles?: RoleLibrary;
+  /**
+   * Onboarding. Absent => the four onboarding messages are refused with an error rather than answered
+   * with "already onboarded", for the same reason the chronicle is: "this server cannot onboard" and
+   * "this project needs no onboarding" are different facts, and a UI shown the second for the first
+   * would quietly hide the feature.
+   */
+  onboarding?: OnboardingManager;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -95,6 +103,7 @@ export class WsHub {
   private readonly logins: AccountLoginManager | undefined;
   private readonly limits: LimitMonitor | undefined;
   private readonly roles: RoleLibrary | undefined;
+  private readonly onboarding: OnboardingManager | undefined;
 
   constructor(
     private store: EventStore,
@@ -112,6 +121,7 @@ export class WsHub {
     this.logins = opts.logins;
     this.limits = opts.limits;
     this.roles = opts.roles;
+    this.onboarding = opts.onboarding;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -141,6 +151,14 @@ export class WsHub {
       // change pushes the whole session list to everyone — but only for the handful of event types
       // that can change it, and coalesced, because a working agent emits events continuously.
       if (SESSION_SHAPE_EVENTS.has(event.type)) this.scheduleBroadcast("sessions");
+      // Onboarding's central fact — `CLAUDE.md` now exists at the project root — is changed by an
+      // *agent writing a file*. No client request causes it and no event names it, so there is
+      // nothing to react to except the moment a writing agent stops: the turn boundary. Cheap (one
+      // `existsSync` per project, coalesced) and it means the offer disappears as soon as it is met
+      // rather than on the operator's next reload.
+      if (this.onboarding !== undefined && event.type === "turn_complete") {
+        this.scheduleBroadcast("onboarding");
+      }
     });
   }
 
@@ -190,6 +208,7 @@ export class WsHub {
     else if (kind === "tasks") this.broadcastTasks();
     else if (kind === "accounts") this.broadcastAccounts();
     else if (kind === "usage") this.broadcastUsage();
+    else if (kind === "onboarding") this.broadcastOnboarding();
     else this.broadcastMessages();
   }
 
@@ -432,6 +451,58 @@ export class WsHub {
           break;
         }
         case "open_project": this.openProject(sock, msg.projectId); break;
+        // Onboarding. A query, then three changes — and every one of them answers with the whole
+        // state rather than a delta, like the room list does, so a client can rebuild the surface
+        // from one frame and never has to merge.
+        case "list_onboarding":
+          this.safeSend(sock, {
+            kind: "onboarding",
+            onboarding: this.onboardingStore().state(this.activeProject(sock)),
+          });
+          break;
+        // Idempotent like `ensure_orchestrator`, and answered the same way: the notice is what tells
+        // the operator where the interview is happening, because the agent stands in the project room
+        // and its first question arrives in the console like any other turn.
+        case "start_onboarding": {
+          const projectId = this.activeProject(sock);
+          const { sessionId, created } = this.onboardingStore().start(projectId);
+          this.broadcastSessions();
+          this.broadcastRooms();
+          this.scheduleBroadcast("onboarding");
+          this.safeSend(sock, {
+            kind: "notice",
+            message: created
+              ? "an onboarding agent is in the project room — it will ask you one question at a "
+                + "time in the console, and write CLAUDE.md and README.md when it has enough"
+              : "onboarding is already running for this project — its questions are in the console",
+          });
+          this.subscribe(sock, sessionId, 0);
+          break;
+        }
+        // The proposal becomes rooms **here**, through `RoomManager.createRoom` — the same path the
+        // room panel's own form uses, with the same invariants. Nothing an agent said reached a
+        // folder until this message arrived.
+        case "accept_room_suggestions": {
+          const projectId = this.activeProject(sock);
+          const result = this.onboardingStore().accept(projectId, msg.rooms);
+          if (result.created.length > 0) this.broadcastRooms();
+          this.scheduleBroadcast("onboarding");
+          const made = result.created.map((r) => r.name).join(", ");
+          const refused = result.failed.map((f) => `${f.name} (${f.message})`).join("; ");
+          this.safeSend(sock, refused === ""
+            ? { kind: "notice", message: `created ${result.created.length} room(s): ${made}` }
+            : {
+              kind: "error",
+              message: result.created.length === 0
+                ? `no rooms were created — ${refused}`
+                : `created ${made}; not created — ${refused}`,
+            });
+          break;
+        }
+        case "dismiss_room_suggestion":
+          this.onboardingStore().dismiss(this.activeProject(sock), msg.suggestionId);
+          this.scheduleBroadcast("onboarding");
+          break;
         // Tasks. The board is global state like rooms are, so a change is broadcast — on the
         // coalescing path, because an agent driving `factory_task_update` can change it as fast as
         // it can call a tool. The broadcast is *not* scheduled here: the store announces its own
@@ -597,6 +668,23 @@ export class WsHub {
   }
 
   /**
+   * Where each floor stands with onboarding. Per project like the rooms, because that is what it is
+   * about — and because `onboarded` is a `CLAUDE.md` at *one* project's root.
+   */
+  private broadcastOnboarding(): void {
+    if (this.onboarding === undefined) return;
+    this.broadcastPerProject((p) => ({ kind: "onboarding", onboarding: this.onboarding!.state(p) }));
+  }
+
+  /**
+   * Public entry point for "onboarding changed for a reason that came from outside a socket" — a tool
+   * call recording a proposal. Coalesced like every other pushed list.
+   */
+  announceOnboarding(): void {
+    this.scheduleBroadcast("onboarding");
+  }
+
+  /**
    * Tell every tab on one factory floor that something worked.
    *
    * Used by the attachment endpoint, which has no socket of its own: an upload arrives over HTTP and
@@ -646,6 +734,11 @@ export class WsHub {
     }
     if (this.bus !== undefined) {
       this.safeSend(sock, { kind: "messages", messages: this.bus.list(project.id) });
+    }
+    // Onboarding is per project too, and it is the first thing this socket needs to know about a
+    // factory it has just switched to: an undocumented one should say so before anything else.
+    if (this.onboarding !== undefined) {
+      this.safeSend(sock, { kind: "onboarding", onboarding: this.onboarding.state(project.id) });
     }
     // Other tabs: the switcher gained (or re-ordered) an entry, and their `lastOpenedAt` changed.
     for (const other of [...this.subs.keys()]) {
@@ -710,6 +803,12 @@ export class WsHub {
   private roleStore(): RoleLibrary {
     if (this.roles === undefined) throw new Error("this server has no role library");
     return this.roles;
+  }
+
+  /** Likewise for onboarding: "this server cannot onboard" is not "this project is onboarded". */
+  private onboardingStore(): OnboardingManager {
+    if (this.onboarding === undefined) throw new Error("this server does not do onboarding");
+    return this.onboarding;
   }
 
   /** Likewise for the bus: "no factory bus here" is an answer, an empty list would be a lie. */

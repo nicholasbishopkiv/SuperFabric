@@ -10,6 +10,7 @@ import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
 import { LimitMonitor } from "./limitMonitor.js";
 import { FactoryBus } from "./factoryBus.js";
+import { OnboardingManager } from "./onboarding.js";
 import { ProjectManager } from "./projectManager.js";
 import { RoleLibrary, USER_ROLES_DIRNAME } from "./roleLibrary.js";
 import { RoomManager } from "./roomManager.js";
@@ -75,8 +76,16 @@ const router = new TaskRouter({
 // tell it about a 429 without knowing what it is. Declared before `mgr` and populated after, the
 // same one-way-callback shape the bus and the router use.
 let limits!: LimitMonitor;
+// First contact: an interview for a project nobody has written down, and the rooms it proposes — which
+// stay proposals until the operator approves them. Same one-way-callback shape again; it needs the
+// session runner (the onboarder is an ordinary session with a role) and the runner needs it (for the
+// one tool that records a proposal), so it is declared here and populated after.
+let onboarding!: OnboardingManager;
 mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
   bus, tasks, router, chronicle, accounts, roles, skills,
+  // A getter for the same reason `onRateLimited` below is a closure: it is read when an executor
+  // starts, which is long after both objects exist.
+  get onboarding() { return onboarding; },
   // A rate-limit error from any session marks that account at once, rather than waiting up to three
   // minutes for the poller to agree. A session on the ambient `~/.claude` has no row to mark.
   onRateLimited: (sessionId, accountId) => {
@@ -88,6 +97,9 @@ mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
 // hub turns that into a frame, rather than the two holding each other. `hub` exists before anything
 // can call back — nothing here runs until a socket sends something.
 let hub!: WsHub;
+onboarding = new OnboardingManager({
+  db, projects, rooms, sessions: mgr, onChange: () => hub.announceOnboarding(),
+});
 limits = new LimitMonitor(db, accounts, { onChange: () => hub.announceUsage() });
 // Utilisation into action: warn at 80 %, hold at 95 % (at a turn boundary, never mid-turn), and
 // bring everyone back when the window rolls. It never moves an agent to another subscription — see
@@ -100,7 +112,7 @@ const logins = new AccountLoginManager({ accounts, onChange: () => hub.announceA
 // its login has got to — rather than the UI joining two lists that can disagree.
 accounts.setLoginStateSource((id) => logins.stateOf(id));
 hub = new WsHub(store, mgr, rooms, projects, {
-  tasks, bus, router, chronicle, accounts, logins, limits, roles,
+  tasks, bus, router, chronicle, accounts, logins, limits, roles, onboarding,
 });
 
 // `.credentials.json` appearing is how the server learns a login finished — and it works whether the

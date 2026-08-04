@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { RoomName, ringPosition, type RoomInfo, type ScenePosition } from "@superfabric/shared";
+import {
+  PROJECT_CHARTER_FILE, RoomName, ringPosition, type RoomInfo, type ScenePosition,
+} from "@superfabric/shared";
 import type { Db } from "./db.js";
 import type { ProjectManager } from "./projectManager.js";
 
@@ -17,12 +19,19 @@ import type { ProjectManager } from "./projectManager.js";
  * has to survive being read once. An existing `CLAUDE.md` is never overwritten (see `createRoom`), so
  * a room adopted from a folder that already had one needs this paragraph added by hand.
  */
-function charter(name: string): string {
+function charter(name: string, summary?: string): string {
+  // The one line the operator (or an onboarding proposal they approved) has already written about
+  // this department, in the place the template otherwise asks for it. Absent, the placeholder stays:
+  // an empty section that says "replace this line" is a prompt, and inventing prose here would be
+  // the factory putting words in a department's mouth.
+  const responsibility = summary === undefined || summary.trim() === ""
+    ? "_What this department owns. Replace this line._"
+    : summary.trim();
   return `# ${name}
 
 ## Responsibility
 
-_What this department owns. Replace this line._
+${responsibility}
 
 ## Interfaces
 
@@ -101,6 +110,13 @@ export interface CreateRoomOptions {
    * separate repository, and that is the one case where containment does not apply.
    */
   path?: string;
+  /**
+   * One line for the charter's "Responsibility" section, used **only when the charter is written from
+   * scratch**. A folder that already has a `CLAUDE.md` is never touched, whatever this says — the
+   * never-overwrite rule is not negotiable, and this is exactly the path an approved onboarding
+   * proposal arrives on, where the temptation to "just add a line" would be strongest.
+   */
+  summary?: string;
 }
 
 /**
@@ -184,7 +200,7 @@ export class RoomManager {
       throw new Error(`room ${JSON.stringify(name)} already exists`);
     }
 
-    this.adoptFolder(dir, name);
+    this.adoptFolder(dir, name, opts.summary);
 
     const id = randomUUID();
     const pos = ringPosition((this.stmts.countRooms.get(projectId) as { c: number }).c);
@@ -296,13 +312,13 @@ export class RoomManager {
    * A room with no charter at all is worse than a surprising one — it is where an agent learns that
    * it is a department with a bus — so an adopted folder that has none gets ours.
    */
-  private adoptFolder(dir: string, name: string): void {
+  private adoptFolder(dir: string, name: string, summary?: string): void {
     if (existsSync(dir) && !statSync(dir).isDirectory()) {
       throw new Error(`room folder is not a directory: ${dir}`);
     }
     mkdirSync(dir, { recursive: true });
-    const claudeMd = path.join(dir, "CLAUDE.md");
-    if (!existsSync(claudeMd)) writeFileSync(claudeMd, charter(name));
+    const claudeMd = path.join(dir, PROJECT_CHARTER_FILE);
+    if (!existsSync(claudeMd)) writeFileSync(claudeMd, charter(name, summary));
   }
 
   private defaultProjectId(): string {

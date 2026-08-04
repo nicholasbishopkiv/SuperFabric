@@ -9,6 +9,7 @@ import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
 import { classifyExecutorError } from "./executors/claudeCode.js";
 import type { FactoryBus, RoomAgent } from "./factoryBus.js";
+import { ONBOARDING_ROLE_ID, type OnboardingManager } from "./onboarding.js";
 import { ORCHESTRATOR_SYSTEM_PROMPT } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
 import type { RoleLibrary } from "./roleLibrary.js";
@@ -112,6 +113,12 @@ export interface SessionManagerOptions {
    * not" is a better outcome than refusing the role.
    */
   skills?: SkillLibrary;
+  /**
+   * Onboarding. Absent => `factory_suggest_rooms` is in nobody's tool list, which is the pre-M1c
+   * shape and a valid server rather than a broken one — the same arrangement `roles` and `chronicle`
+   * have. Only a session wearing the onboarding role is offered it (see `busToolServers`).
+   */
+  onboarding?: OnboardingManager;
   /**
    * A session was refused with a rate-limit error.
    *
@@ -236,6 +243,12 @@ export class SessionManager {
       // unassigned task and by `ensure_orchestrator`, so it rides `sessions_orchestrator`.
       orchestratorOf: db.prepare(
         "SELECT id FROM sessions WHERE project_id = ? AND is_orchestrator = 1 ORDER BY created_at, rowid LIMIT 1",
+      ),
+      // "Is an interview running on this factory?" — the newest *live* one, because onboarding is a
+      // one-shot job and a finished one is history rather than an agent to hand a second click to.
+      onboarderOf: db.prepare(
+        "SELECT id FROM sessions WHERE project_id = ? AND role_id = ? AND state = 'active'"
+        + " ORDER BY created_at DESC, rowid DESC LIMIT 1",
       ),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       setModel: db.prepare("UPDATE sessions SET model = ? WHERE id = ?"),
@@ -436,6 +449,19 @@ export class SessionManager {
   orchestratorFor(projectId: string): string | undefined {
     // `== null`, not `=== undefined`: "no such row" is `null` for the driver db.ts uses.
     const row = this.stmts.orchestratorOf.get(projectId) as { id: string } | null;
+    return row == null ? undefined : row.id;
+  }
+
+  /**
+   * The live agent interviewing the operator about this project, or `undefined`.
+   *
+   * Read off the row's `role_id` rather than off a flag of its own: the onboarder *is* an agent
+   * wearing a role, and a second column saying the same thing could disagree with it. Only an active
+   * session counts — a finished interview is history, and `start_onboarding` on a project whose
+   * onboarder has stopped should stand up a new one rather than hand back a corpse.
+   */
+  onboarderFor(projectId: string): string | undefined {
+    const row = this.stmts.onboarderOf.get(projectId, ONBOARDING_ROLE_ID) as { id: string } | null;
     return row == null ? undefined : row.id;
   }
 
@@ -677,6 +703,7 @@ export class SessionManager {
     sessionId: string,
     roomId: string | null,
     isOrchestrator: boolean,
+    isOnboarder: boolean,
   ): Record<string, ReturnType<typeof busTools>> {
     const { bus, tasks } = this.opts;
     if (roomId === null || bus === undefined || tasks === undefined) return {};
@@ -688,9 +715,13 @@ export class SessionManager {
         // ordinary agent's tool list simply does not contain the routing tools. (Calling one anyway
         // is still refused inside the handler — see `busTools`.)
         isOrchestrator,
+        // Same mechanism, same source: the session's own row. It buys the one extra tool an
+        // interview needs — proposing rooms — and nothing else about what this agent may do.
+        isOnboarder,
         sessionId,
         ...(this.opts.router !== undefined ? { router: this.opts.router } : {}),
         ...(this.opts.chronicle !== undefined ? { chronicle: this.opts.chronicle } : {}),
+        ...(this.opts.onboarding !== undefined ? { onboarding: this.opts.onboarding } : {}),
         // factory_report_status is a line in this session's own log: the operator reads the agent's
         // own words next to everything else it did, rather than in a separate channel.
         reportStatus: (summary) => {
@@ -732,7 +763,9 @@ export class SessionManager {
     // outside-facing (stdio/http/sse), so it stays gated by `canUseTool` like every other outside tool.
     const mcpServers: Record<string, McpServerConfig> = {
       ...(role?.mcpServers ?? {}),
-      ...this.busToolServers(id, roomId, isOrchestrator),
+      // The role, not the id off the wire: a stored `role_id` whose file has gone resolves to no role
+      // at all (see `roleOf`), and an agent that is no longer an onboarder must not keep the tool.
+      ...this.busToolServers(id, roomId, isOrchestrator, role?.id === ONBOARDING_ROLE_ID),
     };
 
     const handle = this.executor.start(

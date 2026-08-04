@@ -220,6 +220,31 @@ const MIGRATIONS: readonly Migration[] = [
   `
     ALTER TABLE sessions ADD COLUMN role_id TEXT;
   `,
+  // 13 — M1c onboarding: the rooms an interview *proposed*, which are not rooms.
+  //
+  // A table rather than a field on a session, because a proposal outlives the agent that made it: the
+  // operator may close the tab, come back tomorrow and approve four of the five, and the interview
+  // will be long over. `status` is what keeps the offer honest — an accepted row is the record of a
+  // room that exists, a dismissed one is the record of an offer refused, and neither is ever silently
+  // deleted, so "the agent suggested a docs room and I said no" stays answerable.
+  //
+  // No foreign keys, like everything else here: a suggestion names a project and a session, and it
+  // must survive whatever happens to either. `name` is not UNIQUE — two interviews of the same project
+  // proposing the same room is a real thing, and `createRoom` is what refuses the duplicate at the
+  // moment it matters.
+  `
+    CREATE TABLE IF NOT EXISTS room_suggestions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      session_id TEXT,                        -- the agent that proposed it; NULL if it has gone
+      name TEXT NOT NULL,
+      charter TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'proposed',-- proposed | accepted | dismissed
+      note TEXT,                              -- why accepting it failed, verbatim
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS room_suggestions_project ON room_suggestions (project_id, created_at);
+  `,
 ];
 
 /**

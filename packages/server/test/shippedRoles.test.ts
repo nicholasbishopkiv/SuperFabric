@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AGENT_MODELS } from "@superfabric/shared";
+import { ONBOARDING_ROLE_ID } from "../src/onboarding.js";
 import { RoleLibrary } from "../src/roleLibrary.js";
 import { SkillLibrary } from "../src/skills.js";
 
@@ -42,16 +43,31 @@ const VERIFIED_SKILLS = new Set([
   "impeccable",
 ]);
 
-/** The ids the product promises. A rename is a breaking change for anyone's stored `role_id`. */
+/**
+ * The ids the product promises. A rename is a breaking change for anyone's stored `role_id` — and
+ * `onboarding` is load-bearing twice over, because `start_onboarding` looks the role up by that id.
+ */
 const SHIPPED_IDS = [
   "architect", "backend", "data", "designer", "devops",
-  "frontend", "generalist", "qa", "security", "tech-writer",
+  "frontend", "generalist", "onboarding", "qa", "security", "tech-writer",
 ];
 
 describe("the shipped roles", () => {
   it("all parse, with nothing reported broken", () => {
     expect(new RoleLibrary().problems()).toEqual([]);
     expect(shipped.map((r) => r.id)).toEqual(SHIPPED_IDS);
+  });
+
+  it("the onboarding role exists and tells the agent to ask one question at a time", () => {
+    // Not a stylistic preference: an agent that dumps twelve questions into one turn has failed the
+    // job the role exists for, and this instruction is the only thing standing between it and that.
+    const onboarding = shipped.find((r) => r.id === ONBOARDING_ROLE_ID);
+    expect(onboarding).toBeDefined();
+    expect(onboarding!.promptAppend).toMatch(/one question per turn/i);
+    // And it must know what it produces: two files, and rooms it only *proposes*.
+    expect(onboarding!.promptAppend).toContain("CLAUDE.md");
+    expect(onboarding!.promptAppend).toContain("README.md");
+    expect(onboarding!.promptAppend).toContain("factory_suggest_rooms");
   });
 
   it("every one has a summary and a charter, and both are short enough to read", () => {
@@ -65,8 +81,12 @@ describe("the shipped roles", () => {
       // A charter, not an essay. Every turn that agent ever takes pays for this text; the
       // orchestrator's own prompt — the worked example — is about 1,700 characters, and a role says
       // less than the factory's senior agent does.
+      //
+      // `onboarding` is the one exception and it is a stated one: it is a *procedure* (interview,
+      // then write two named files, then propose rooms) rather than a standing brief, and it is worn
+      // for one short-lived session rather than for the life of an agent. It still has a ceiling.
       expect(role.promptAppend.length).toBeGreaterThan(200);
-      expect(role.promptAppend.length).toBeLessThanOrEqual(1_500);
+      expect(role.promptAppend.length).toBeLessThanOrEqual(role.id === ONBOARDING_ROLE_ID ? 2_000 : 1_500);
     }
   });
 
