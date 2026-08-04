@@ -56,10 +56,23 @@ const SHELL: Record<HudSide, string> = {
   bottom: "fixed bottom-0 flex flex-col",
 };
 
+/**
+ * The edge a panel presents to the scene.
+ *
+ * The hairline is the border; the inset highlight is what makes the panel read as *glass laid over*
+ * the floor rather than as a hole cut into it. Before this, a cool near-black rectangle met the warm
+ * concrete slab at a hard edge and the two halves of the screen looked like different applications.
+ * The floor is not repainted for this — `scene/palette.ts` argues at length for its temperature, and
+ * it is right; what was wrong was the junction.
+ *
+ * The outer shadow is combined here rather than left on the element, because two `shadow-[…]`
+ * utilities on one element do not merge — the second wins, and the drop shadow would have been
+ * silently lost.
+ */
 const OPEN_SKIN: Record<HudSide, string> = {
-  left: "border-r border-line",
-  right: "border-l border-line",
-  bottom: "border-t border-line",
+  left: "border-r border-line shadow-[inset_-1px_0_0_rgba(255,255,255,0.06),0_0_40px_rgba(0,0,0,0.35)]",
+  right: "border-l border-line shadow-[inset_1px_0_0_rgba(255,255,255,0.06),0_0_40px_rgba(0,0,0,0.35)]",
+  bottom: "border-t border-line shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(0,0,0,0.35)]",
 };
 
 export interface EdgePanelProps {
@@ -112,11 +125,7 @@ export function EdgePanel({
           SHELL[side],
           "z-30 text-sm text-fg",
           open
-            ? cn(
-                "bg-panel/80 shadow-[0_0_40px_rgba(0,0,0,0.35)] backdrop-blur-xl",
-                OPEN_SKIN[side],
-                className,
-              )
+            ? cn("bg-panel/80 backdrop-blur-xl", OPEN_SKIN[side], className)
             : "pointer-events-none bg-transparent",
         )}
       >
