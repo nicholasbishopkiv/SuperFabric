@@ -7,6 +7,12 @@ milestone is a self-contained sub-project with its own "spec → plan → implem
 cycle and a **working result at the end**. The order is chosen to burn down the biggest
 risks first.
 
+**All of M0–M5 are complete as of 2026-08-04.** Each section keeps the acceptance evidence
+for that milestone as it was recorded at the time, including the test counts of that day —
+those are deliberately not rewritten, because a milestone's record is a record. The current
+count is at the end of M5. **[What is not built](#what-is-not-built) is at the bottom, and it
+is the section to read before assuming a feature exists.**
+
 ## M0 — Core: one server-managed session ✅ **complete** (2026-08-03)
 
 Removes the main technical risk: a steerable long-lived session.
@@ -25,7 +31,7 @@ transcript from the event log, and the agent answered the secret word correctly
 afterwards — conversation context genuinely survived the restart. Event `seq` values were
 contiguous. 44 tests green (+1 live-quota test, run manually).
 
-## M1 — The floor: 3D factory, project block, rooms
+## M1 — The floor: 3D factory, project block, rooms ✅ **complete**
 
 **M1a is complete (2026-08-03)** — rooms as folders and the 3D floor:
 
@@ -53,7 +59,7 @@ Still open for M1:
 - [x] Onboarding agent for an empty project (interview → CLAUDE.md / README) — delivered with M1c
       below.
 
-## M1b — Projects, folders, files and a real UI
+## M1b — Projects, folders, files and a real UI ✅ **complete** (2026-08-04)
 
 Four capabilities the operator asked for once the floor existed. They are grouped because
 they all reshape the same surface: what the browser is looking at, and how a human puts
@@ -468,23 +474,148 @@ real server) leaves them untouched.
 1092 → **1159 tests green** (shared 82, server 762 + 1 skipped live-quota test, web 285,
 agent-runner 30).
 
-## M5 — Polish and the "living factory"
+## M5 — The living factory, metrics and portability ✅ **complete** (2026-08-04)
 
-- Small animated agent characters in the workshops (glTF, reflecting real session
-  activity), living-factory details (smoke, lights, movement).
-- Direct chat with any agent from the UI (partially in M0 already), notifications
-  (phone push desirable), event history/search.
-- Roles library expansion (50+ presets; the format and user-defined overrides shipped in M1c).
-- Metrics: per-account burn rate, cost-equivalent analytics (ccusage math).
-- Factory export/import (multi-project moved up to M1b).
+The last milestone. The floor stops looking like a diagram that updates and starts looking
+like a place where work happens; plus the two remaining utilities.
 
-## Planned after v1
+**A deliberate change from this roadmap's own earlier text.** M5 was going to buy glTF
+characters. It ships **procedural motion tied to real state** instead. The value the operator
+asked for is in the *doing*, animation driven by the event log is both more informative and
+more impressive than a static purchased mesh, and it avoids sourcing and licensing
+third-party character assets into an MIT repository. The figures already had legs, a torso,
+arms and a hard hat; this milestone made them act.
 
-- **Multi-provider executors**: Codex / ChatGPT agents, Antigravity (Gemini), and
-  others behind the `Executor` interface (which exists from M0) — assign different
-  providers/strengths to different tasks and rooms.
+- [x] **Agents that do something.** A package arriving on a belt sends a free agent in that
+      room from its post to the loading bay the belt enters and back, carrying the crate at
+      its side, turned to face the direction of travel. **A room with nobody free visibly
+      piles up** at its bay — which is information, not a missing feature. An agent blocked
+      on an approval faces the operator's camera and stands still, distinct from idle. The
+      scheduling and the path are pure functions (`scene/errands.ts`) and are tested as
+      such — nothing mounts a `<Canvas>` in jsdom.
+- [x] **A factory that looks inhabited.** Chimney plumes while a room works (instanced,
+      fading out after it stops — which is what needs frames *after* the work ends), windows
+      lit only when a room has a live agent, belt slats crawling only while a package is on
+      that belt, per-room props that reflect the work, and a thought bubble over a working
+      figure carrying the same one-line tool summary the console shows (one summariser, so
+      the two cannot disagree). All of it loses to the status beacons, the packages and the
+      belts in the reading order; `hasMotion` accounts for every one of them, and an idle
+      factory still does **zero** `requestAnimationFrame` calls.
+- [x] **Burn-rate metrics** (`metricsStore.ts`, `hud/BurnRate.tsx`). The number an operator
+      acts on is a duration: *"at this rate you have about two hours"*, taken from the
+      least-squares slope of the utilisation history M2 has been persisting, projected to the
+      95 % line the scheduler acts on, for whichever window runs out **soonest**. A window
+      that rolled breaks the series rather than flattening it. **A projection nobody can make
+      says "unknown" and says why** — under two readings, under fifteen minutes of span, or a
+      window that is not filling. Cost sits beside it as a *cost-equivalent*, marked
+      approximate, per account and per room and separately for the ambient `~/.claude`.
+      **There is no pricing table anywhere in SuperFabric**: the figure is the CLI's own.
+- [x] **Export and import a factory** (`factoryPortability.ts`, `hud/FactoryTransfer.tsx`).
+      One JSON file: rooms with their positions, runtimes and account bindings **by label**,
+      the agents that staffed them, the board, and the decision index. **No credentials, no
+      config-dir contents, and no absolute path at all.** Import goes through the ordinary
+      `createRoom`, so every invariant still applies because it is the same code path, and it
+      **reports what it could not do** rather than skipping it.
+- [x] **This documentation pass.** Every document read end to end against the code for the
+      first time since M0, and the list below written.
+
+**Acceptance, run on 2026-08-04** (throwaway server on 4733, throwaway data dir, Vite on
+5199; the operator's own ports untouched; **no agent was prompted and no quota was spent** —
+sessions, costed turns and the snapshot history were written straight into a throwaway
+SQLite, exactly as M1b's and M2's acceptance runs did, because `create_session` would spawn a
+real CLI):
+
+- **A populated floor**: four buildings (`proj`, `backend` sandboxed, `docs`, `payments`),
+  six agents, three tasks, two accounts on throwaway config dirs.
+- **The metrics, beside the meters.** The `work` account showed hatched (estimated) bars at
+  `≈59 %` / `≈29 %` and, under them, *"at this **estimated** rate · **about 3 h** · 5-hour
+  (estimated) · ≈12 pts/h"* with `cost-equivalent ≈$1.93 / 24 h  ≈$2.73 / 7 d`. Checked
+  against the arithmetic: 31 readings spanning 90 minutes at 12.33 points/hour ending at
+  58.5 %, so (95 − 58.5) / 12.33 = 2.96 h. The cost reconstruction was checked the same way —
+  one seeded agent reported the cumulative series 0.08 → 0.19 → 0.05 → 0.14 (a restarted
+  executor in the middle of it) and was counted as **$0.33**, not the $0.46 a naive sum gives.
+- **The unknown case, in the same place the figure would have been.** The second account had
+  one reading, and read *"Time left: unknown — only 1 reading of 5-hour (estimated) so far —
+  a rate needs two"*.
+- **"This factory's spend, by room"**: payments `≈$1.05 / 24 h`, backend `≈$0.88`, docs
+  `≈$0.11`, most expensive first, with rooms that cost nothing absent — plus a line for the
+  $0.09 spent by an agent on the ambient `~/.claude`, which has no account row to hang it on.
+- **A round trip through the UI.** `Export this factory` downloaded
+  `proj-factory-2026-08-04.json`; grepping those bytes for `sk-ant-`, `whsec_`,
+  `.credentials.json`, `/home/` and `/tmp/` found **nothing**, and the file refers to both
+  accounts only as `"work"` and `"other"`. Importing it into an empty folder created the
+  project, three rooms with their positions and `backend`'s `container` runtime, three tasks
+  with the assigned ones in the right rooms, and reported *"5 agent(s) were described in the
+  file and none were started"*. No session row was created.
+- **A collision, reported.** Importing the same file into the same root a second time
+  answered `0 rooms · 3 tasks · 0 decisions indexed` with three amber lines — `room "backend"
+  was not created: room "backend" already exists`, and the same for `docs` and `payments` —
+  and **no error frame**, because a reported collision is an outcome rather than a failure.
+- **The frameloop gate is intact**: `requestAnimationFrame` fired **0** times in 3 s with
+  every agent idle.
+
+1159 → **1344 tests green** (shared 88, server 807 + 1 skipped live-quota test, web 419,
+agent-runner 30).
+
+## What is not built
+
+Stated here rather than left as an absence a reader has to discover. Everything in this list
+is a deliberate stop, not an oversight — but none of it exists, and the docs above are written
+so that nothing implies otherwise.
+
+- **Phone push notifications.** Named as "desirable" in the original M5 sketch and never
+  built. There is no notification surface at all beyond the browser tab: no push, no email, no
+  webhook, no desktop notification. An operator who closes the tab learns nothing until they
+  open it again. The pieces a later milestone would need are all present (the event log is the
+  source of truth, and `usage`/`sessions` broadcasts already carry every state change worth
+  telling someone about) — what is missing is a transport and the operator's consent for it.
+- **The roles library at 50+ presets.** **Eleven ship** (ten job roles plus `onboarding`).
+  What M1c actually delivered is the *format* — plain YAML, `<data dir>/roles/` overriding by
+  id, an edited file picked up without a restart, and a malformed one reported next to the
+  list rather than dropped from it — and that is the extensible half. Eleven presets that each
+  state a real boundary are worth more than fifty written to hit a number, but fifty is not
+  what is here.
+- **Multi-provider executors.** The `Executor` interface has existed since M0 and now has two
+  implementations — `ClaudeCodeExecutor` and `ContainerExecutor` — and **both drive Claude
+  Code.** There is no Codex, ChatGPT-agent, Antigravity or Gemini executor, and nothing has
+  been probed about what one would need. Post-v1 by design; the seam is real, the second
+  provider is not.
+- **A folder picker.** Every place the operator names a directory — a project root, a room's
+  folder, the root to import a factory into — is a text field wanting an absolute path, and
+  each one says so. The browser cannot hand a server a real directory path: the File System
+  Access API is Chromium-only and returns a handle rather than a path, so a real picker needs
+  a server-side browse endpoint that does not exist.
+- **Token counts per turn.** The event log records the provider's `costUsd` and **not** token
+  counts, so there is no token-level analytics (the "ccusage math" the M5 sketch mentioned).
+  Adding them means changing `sdkEvents.ts` and both hosts of a session, and the field they
+  would come from has the same per-query-versus-per-turn ambiguity that `costUsd` did — it was
+  not worth shipping a number that could not be verified. The burn rate does not need them:
+  it is sourced from real utilisation readings instead, which is a better instrument.
+- **Serialised OAuth refresh within one account.** One config directory is one account, which
+  *is* enforced. Several sessions of the same account share one credentials file that the CLI
+  rewrites in place, and SuperFabric does not serialise that. See the risk table in
+  `ARCHITECTURE.md` §6 — the row used to claim a lock that was never written.
+- **Any authentication.** The server binds `127.0.0.1`, allow-lists browser origins, and
+  otherwise trusts whoever can reach it. That is the documented posture, not a gap to be
+  filled quietly, but it does mean SuperFabric must not go on a shared host.
+- **An eight-hour unattended run across three accounts.** The first of the v1 success criteria
+  in `VISION.md`, and the only one nothing has demonstrated. Every part is built and tested;
+  the run has never happened.
+- **Editing a role from the UI, deleting a project, and removing a room.** Roles are edited by
+  editing the file (which is the design). Projects and rooms are never deleted by the product
+  — a delete that left sessions, tasks and history pointing at a missing row would be a worse
+  state than any it fixed, and nothing yet does the cleanup properly.
+
+## After v1
+
+- **Multi-provider executors** behind the `Executor` interface (see the list above for exactly
+  how far that seam has actually been taken).
+- **Notifications off the tab**, which is what would make an eight-hour unattended run
+  something an operator could walk away from.
+- **A directory-browse endpoint**, so the path fields can become a picker.
 
 ## Out of scope for v1
 - Multi-tenancy, cloud deployment, team access.
 - Automatic account rotation to dodge limits — deliberately NOT doing this (ToS risk);
-  only pause/resume of your own accounts.
+  only pause/resume of your own accounts. **This one is a line, not a backlog item**: a PR
+  adding it would be rejected.
