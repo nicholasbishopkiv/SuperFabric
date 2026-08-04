@@ -490,6 +490,100 @@ describe("db", () => {
     }
   });
 
+  // ---- migration 7: the orchestrator flag ----
+
+  it("adds sessions.is_orchestrator, defaulting every existing agent to 'ordinary'", () => {
+    const db = openDb(":memory:");
+    const cols = db.prepare("SELECT name, \"notnull\", dflt_value FROM pragma_table_info('sessions')")
+      .all() as { name: string; notnull: number; dflt_value: string | null }[];
+    const flag = cols.find(c => c.name === "is_orchestrator");
+    expect(flag).toBeDefined();
+    expect(flag!.notnull).toBe(1);
+    expect(flag!.dflt_value).toBe("0");
+    // an insert that says nothing about the role creates an ordinary agent
+    db.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("s1", "/tmp");
+    expect(db.prepare("SELECT is_orchestrator FROM sessions WHERE id = 's1'").get())
+      .toEqual({ is_orchestrator: 0 });
+  });
+
+  it("indexes 'does this factory have an orchestrator', which routing asks per task", () => {
+    const db = openDb(":memory:");
+    const indexes = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='sessions'")
+      .all() as { name: string }[]).map(i => i.name);
+    expect(indexes).toContain("sessions_orchestrator");
+    const plan = db.prepare(
+      "EXPLAIN QUERY PLAN SELECT id FROM sessions WHERE project_id = ? AND is_orchestrator = 1",
+    ).all("p1") as { detail: string }[];
+    expect(plan.map(p => p.detail).join(" ")).toMatch(/sessions_orchestrator|sessions_project/);
+  });
+
+  it("upgrades a user_version = 6 database, leaving every agent an ordinary one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-v6-"));
+    try {
+      const path = join(dir, "v6.db");
+      // A database exactly as migration 6 left it.
+      const v6 = new Database(path);
+      v6.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, claude_session_id TEXT,
+          state TEXT NOT NULL DEFAULT 'active', cwd TEXT NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          autonomy TEXT NOT NULL DEFAULT 'auto', room_id TEXT, project_id TEXT, model TEXT
+        );
+        CREATE TABLE events (
+          session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          ts INTEGER NOT NULL DEFAULT (unixepoch()),
+          type TEXT NOT NULL, payload TEXT NOT NULL,
+          PRIMARY KEY (session_id, seq)
+        );
+        CREATE TABLE projects (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()), last_opened_at INTEGER
+        );
+        CREATE TABLE rooms (
+          id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'room',
+          pos_x REAL NOT NULL DEFAULT 0, pos_z REAL NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()), UNIQUE (project_id, name)
+        );
+      `);
+      v6.exec("PRAGMA user_version = 6");
+      v6.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
+      v6.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
+        .run("r1", "p1", "payments", "/code/shop/payments");
+      v6.prepare("INSERT INTO sessions (id, cwd, autonomy, room_id, project_id, model) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("s1", "/code/shop/payments", "bypass", "r1", "p1", "claude-haiku-4-5");
+      v6.close();
+
+      const db = openDb(path);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(7);
+      // The existing agent is untouched, and it is not promoted: a factory that had no orchestrator
+      // before this column must still have none, rather than acquiring one by accident.
+      expect(db.prepare("SELECT autonomy, room_id, project_id, model, is_orchestrator FROM sessions WHERE id = 's1'").get())
+        .toEqual({ autonomy: "bypass", room_id: "r1", project_id: "p1", model: "claude-haiku-4-5", is_orchestrator: 0 });
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the orchestrator flag across a reopen, which is what resume re-applies", () => {
+    const dir = mkdtempSync(join(tmpdir(), "superfabric-db-orchestrator-"));
+    try {
+      const path = join(dir, "test.db");
+      const first = openDb(path);
+      first.prepare("INSERT INTO sessions (id, cwd, is_orchestrator) VALUES (?, ?, 1)").run("s1", "/tmp");
+      first.close();
+      const second = openDb(path);
+      expect(second.prepare("SELECT is_orchestrator FROM sessions WHERE id = 's1'").get())
+        .toEqual({ is_orchestrator: 1 });
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("indexes the project scope of every list the operator looks at", () => {
     const db = openDb(":memory:");
     const indexes = (table: string) =>

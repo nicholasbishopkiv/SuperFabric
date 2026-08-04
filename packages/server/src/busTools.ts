@@ -24,6 +24,11 @@ export interface BusToolsDeps {
   roomId: string;
   /** Append a human-readable status line to the calling session's log. */
   reportStatus: (summary: string) => void;
+  /**
+   * This tool set belongs to the factory's orchestrator, so it carries the orchestrator-only tools
+   * as well as the room tools. Comes from the session row (like `roomId`), never from tool input.
+   */
+  isOrchestrator?: boolean;
 }
 
 /** How many delivered messages `factory_inbox` shows alongside the queue. */

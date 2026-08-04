@@ -9,6 +9,7 @@ import {
 const SESSION_INFO = {
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
   autonomy: "auto", model: null, roomId: null, status: "idle", blocked: false,
+  isOrchestrator: false,
 } as const;
 
 describe("protocol", () => {
@@ -103,6 +104,27 @@ describe("protocol", () => {
         .toMatchObject({ sessions: [{ model: "claude-haiku-4-5" }] });
       expect(ServerMessage.parse({ kind: "sessions", sessions: [SESSION_INFO] }))
         .toMatchObject({ sessions: [{ model: null }] });
+    });
+  });
+
+  // ---- M3b: the orchestrator is a flag on an ordinary session ----
+
+  describe("the orchestrator", () => {
+    it("parses ensure_orchestrator, which takes no arguments at all", () => {
+      expect(ClientMessage.parse({ kind: "ensure_orchestrator" }).kind).toBe("ensure_orchestrator");
+      // Deliberately argument-free: the room, the role and the tool surface are the server's to
+      // decide, so there is nothing here for a client to get wrong.
+      expect(ClientMessage.parse({ kind: "ensure_orchestrator", roomId: "r1" }))
+        .toEqual({ kind: "ensure_orchestrator" });
+    });
+
+    it("requires isOrchestrator on SessionInfo, as a flag and not a separate kind of session", () => {
+      const { isOrchestrator: _omitted, ...info } = SESSION_INFO;
+      expect(() => ServerMessage.parse({ kind: "sessions", sessions: [info] })).toThrow();
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...info, isOrchestrator: true }] }))
+        .toMatchObject({ sessions: [{ isOrchestrator: true }] });
+      expect(() => ServerMessage.parse({ kind: "sessions", sessions: [{ ...info, isOrchestrator: "yes" }] }))
+        .toThrow();
     });
   });
 

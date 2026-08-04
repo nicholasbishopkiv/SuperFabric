@@ -1,6 +1,7 @@
 import { ClientMessage, type ServerMessage } from "@superfabric/shared";
 import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
+import { ensureOrchestrator } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
 import type { RoomManager } from "./roomManager.js";
 import type { SessionManager } from "./sessionManager.js";
@@ -196,6 +197,29 @@ export class WsHub {
         case "list_sessions":
           this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions(this.activeProject(sock)) });
           break;
+        // The factory's senior agent. Idempotent, so the UI can call it from a button without first
+        // asking whether one exists; the answer is the same fresh `sessions` list either way, and the
+        // socket is subscribed to it so the operator can watch it work. It stands in the project room,
+        // so the central building's agent count changes too.
+        case "ensure_orchestrator": {
+          const projectId = this.activeProject(sock);
+          const { sessionId, created } = ensureOrchestrator(
+            { sessions: this.mgr, rooms: this.rooms }, projectId,
+          );
+          if (created) {
+            this.broadcastSessions();
+            this.broadcastRooms();
+            this.safeSend(sock, {
+              kind: "notice",
+              message: "the orchestrator is on the floor, in the project room — give it a task with "
+                + "no room and it will route it",
+            });
+          } else {
+            this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions(projectId) });
+          }
+          this.subscribe(sock, sessionId, 0);
+          break;
+        }
         // Rooms: each case answers with the whole room list rather than a delta, so a client can
         // rebuild the floor from one message and never has to merge. A failure (duplicate name,
         // unknown id) throws into the catch below and is reported as an error instead.

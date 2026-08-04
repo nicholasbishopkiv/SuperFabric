@@ -5,6 +5,7 @@ import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
 import type { FactoryBus, RoomAgent } from "./factoryBus.js";
+import { ORCHESTRATOR_SYSTEM_PROMPT } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
 import type { RoomManager } from "./roomManager.js";
 import type { TaskStore } from "./taskStore.js";
@@ -36,6 +37,13 @@ export interface CreateSessionOptions {
    * the default project, which is where a roomless (M0-shaped) session lands.
    */
   projectId?: string;
+  /**
+   * Make this session the project's orchestrator: the `is_orchestrator` flag, the role prompt, and
+   * the larger tool surface. At most one per project — a second attempt throws rather than quietly
+   * demoting the first. Go through `ensureOrchestrator` (orchestrator.ts) rather than setting this
+   * by hand; it is the thing that also puts the session in the project room.
+   */
+  isOrchestrator?: boolean;
 }
 
 /**
@@ -77,12 +85,18 @@ export class SessionManager {
   ) {
     this.stmts = {
       insertSession: db.prepare(
-        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator)"
+        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
       ),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
-      activeSessions: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id, model FROM sessions WHERE state = 'active'"),
+      activeSessions: db.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE state = 'active'`),
       markError: db.prepare("UPDATE sessions SET state = 'error' WHERE id = ? AND state = 'active'"),
-      session: db.prepare("SELECT id, cwd, claude_session_id, autonomy, room_id, model FROM sessions WHERE id = ?"),
+      session: db.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE id = ?`),
+      // "Does this factory have an orchestrator, and which session is it?" — asked by every
+      // unassigned task and by `ensure_orchestrator`, so it rides `sessions_orchestrator`.
+      orchestratorOf: db.prepare(
+        "SELECT id FROM sessions WHERE project_id = ? AND is_orchestrator = 1 ORDER BY created_at, rowid LIMIT 1",
+      ),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       setModel: db.prepare("UPDATE sessions SET model = ? WHERE id = ?"),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
@@ -129,11 +143,32 @@ export class SessionManager {
     catch { throw new Error(`cwd does not exist: ${cwd}`); }
     if (!isDir) throw new Error(`cwd is not a directory: ${cwd}`);
 
+    // One orchestrator per factory, enforced here rather than by a schema constraint (see migration
+    // 7). A second attempt throws: silently returning the first would make `createSession` lie about
+    // what it created, and silently demoting it would take the role away from a live agent mid-turn.
+    const isOrchestrator = opts.isOrchestrator === true;
+    if (isOrchestrator && this.orchestratorFor(projectId) !== undefined) {
+      throw new Error(`project ${projectId} already has an orchestrator`);
+    }
+
     const id = randomUUID();
     const model = opts.model ?? null;
-    this.stmts.insertSession.run(id, projectId, cwd, autonomy, roomId, model);
-    this.startExecutor(id, cwd, null, autonomy, roomId, model);
+    this.stmts.insertSession.run(id, projectId, cwd, autonomy, roomId, model, isOrchestrator ? 1 : 0);
+    this.startExecutor(id, cwd, null, autonomy, roomId, model, isOrchestrator);
     return id;
+  }
+
+  /**
+   * The session that is this factory's orchestrator, or `undefined` when it has none.
+   *
+   * `undefined` is a real and *expected* answer, not a failure: a project without an orchestrator
+   * routes nothing, and the board says so. Nothing in the server may invent an assignment to cover
+   * for it.
+   */
+  orchestratorFor(projectId: string): string | undefined {
+    // `== null`, not `=== undefined`: "no such row" is `null` for the driver db.ts uses.
+    const row = this.stmts.orchestratorOf.get(projectId) as { id: string } | null;
+    return row == null ? undefined : row.id;
   }
 
   /**
@@ -177,7 +212,7 @@ export class SessionManager {
     // now would leak a CLI subprocess past the server's exit; the stored mode still applies on the
     // next boot.
     if (this.stopping) return;
-    this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id, row.model);
+    this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id, row.model, isOrchestratorRow(row));
   }
 
   /**
@@ -216,7 +251,9 @@ export class SessionManager {
     this.denyPendingApprovals(id);
     await this.stopWithTimeout(handle, 5000).catch(() => {});
     if (this.stopping) return;
-    this.startExecutor(id, row.cwd, row.claude_session_id, asAutonomy(row.autonomy), row.room_id, model);
+    this.startExecutor(
+      id, row.cwd, row.claude_session_id, asAutonomy(row.autonomy), row.room_id, model, isOrchestratorRow(row),
+    );
   }
 
   /**
@@ -230,8 +267,12 @@ export class SessionManager {
       if (this.handles.has(r.id)) continue;
       // The stored mode and the stored model are what a session comes back as: a bypass agent stays
       // bypass across a restart, an attended one stays attended, and an agent pinned to a model
-      // comes back on that model rather than on the CLI's default.
-      this.startExecutor(r.id, r.cwd, r.claude_session_id, asAutonomy(r.autonomy), r.room_id, r.model);
+      // comes back on that model rather than on the CLI's default. The role is stored the same way,
+      // so the factory's orchestrator comes back as the orchestrator — with its charter and its
+      // routing tools — rather than as an ordinary agent standing in the central building.
+      this.startExecutor(
+        r.id, r.cwd, r.claude_session_id, asAutonomy(r.autonomy), r.room_id, r.model, isOrchestratorRow(r),
+      );
       started.push(r.id);
     }
     return started;
@@ -243,12 +284,21 @@ export class SessionManager {
    * actually works in. A roomless session gets no bus tools at all: it has no department to speak
    * for, and a tool that would have to guess one is worse than an absent tool.
    */
-  private busToolServers(sessionId: string, roomId: string | null): Record<string, ReturnType<typeof busTools>> {
+  private busToolServers(
+    sessionId: string,
+    roomId: string | null,
+    isOrchestrator: boolean,
+  ): Record<string, ReturnType<typeof busTools>> {
     const { bus, tasks } = this.opts;
     if (roomId === null || bus === undefined || tasks === undefined) return {};
     return {
       [FACTORY_MCP_SERVER_NAME]: busTools({
         bus, tasks, rooms: this.rooms, roomId,
+        // The tool surface is per session, which is the whole mechanism behind "orchestrator-only
+        // tools": the MCP server is built once per `query()` from this session's own row, so an
+        // ordinary agent's tool list simply does not contain the routing tools. (Calling one anyway
+        // is still refused inside the handler — see `busTools`.)
+        isOrchestrator,
         // factory_report_status is a line in this session's own log: the operator reads the agent's
         // own words next to everything else it did, rather than in a separate channel.
         reportStatus: (summary) => {
@@ -265,9 +315,17 @@ export class SessionManager {
     autonomy: AutonomyMode,
     roomId: string | null,
     model: string | null,
+    isOrchestrator = false,
   ) {
     const handle = this.executor.start(
-      { cwd, resumeSessionId: resume, autonomy, model, mcpServers: this.busToolServers(id, roomId) },
+      {
+        cwd, resumeSessionId: resume, autonomy, model,
+        mcpServers: this.busToolServers(id, roomId, isOrchestrator),
+        // The role, as a system-prompt append. This — plus the flag and the extra tools — is the
+        // entire difference between the orchestrator and any other session: same manager, same
+        // executor, same event log.
+        ...(isOrchestrator ? { appendSystemPrompt: ORCHESTRATOR_SYSTEM_PROMPT } : {}),
+      },
       {
         onEvent: (event) => {
           this.store.append(id, event);
@@ -403,7 +461,7 @@ export class SessionManager {
     return (rows as {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
       autonomy: string; model: string | null; room_id: string | null; last_seq: number;
-      status: string | null; blocked: number;
+      status: string | null; blocked: number; is_orchestrator: number;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
@@ -414,9 +472,17 @@ export class SessionManager {
       roomId: r.room_id,
       status: asStatus(r.status),
       blocked: r.blocked === 1,
+      isOrchestrator: r.is_orchestrator === 1,
     }));
   }
 }
+
+/**
+ * The columns a *running* session is rebuilt from — what `startExecutor` needs to bring an agent
+ * back exactly as it was. One list, used by every statement that reads a session row, so adding a
+ * per-session property cannot be remembered in `resumeAll` and forgotten in `setModel`.
+ */
+const SESSION_COLUMNS = "id, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator";
 
 /**
  * The session listing, with a caller-chosen `WHERE`. The clause is a literal from the two call sites
@@ -426,6 +492,7 @@ function sessionListSql(where: string): string {
   return `
     SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
            s.autonomy AS autonomy, s.model AS model, s.room_id AS room_id,
+           s.is_orchestrator AS is_orchestrator,
            COALESCE(MAX(e.seq), 0) AS last_seq,
            -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
            (SELECT json_extract(st.payload, '$.status')
@@ -456,6 +523,17 @@ interface SessionRow {
   /** NULL is "the CLI's own default", not a missing value. */
   model: string | null;
   room_id: string | null;
+  /** SQLite has no boolean: 1 is the factory's orchestrator, 0 is every other agent. */
+  is_orchestrator: number;
+}
+
+/**
+ * Read the role off a stored row. A hand-edited or downgraded database could hold anything in an
+ * INTEGER column, and only an exact 1 promotes a session — "not obviously an orchestrator" must
+ * resolve to "ordinary agent", never the other way round.
+ */
+function isOrchestratorRow(row: SessionRow): boolean {
+  return Number(row.is_orchestrator) === 1;
 }
 
 /**

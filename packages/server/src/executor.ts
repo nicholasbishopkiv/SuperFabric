@@ -33,6 +33,15 @@ export interface ExecutorStartOptions {
    * so nothing about the seam's runtime independence changes.
    */
   mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * Text appended to this agent's system prompt — its *role*, as opposed to its instructions.
+   *
+   * Per session for the same reason `autonomy` and `model` are: one executor instance serves the
+   * whole factory, and the orchestrator differs from an ordinary room agent by exactly this string
+   * plus a flag and a larger tool set. A role that lived on the executor's constructor would mean a
+   * second executor instance per role, i.e. a parallel runtime for what is one session with a job.
+   */
+  appendSystemPrompt?: string;
 }
 
 export interface ExecutorHandle {

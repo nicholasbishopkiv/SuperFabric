@@ -240,6 +240,16 @@ export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("set_model"), sessionId: z.string(), model: ModelId.nullable() }),
   z.object({ kind: z.literal("list_sessions") }),
   /**
+   * Give this factory its orchestrator, or hand back the one it already has.
+   *
+   * Idempotent by design and deliberately argument-free: the orchestrator's room (the project room),
+   * its role prompt and its tool surface are the server's to decide, not a client's — an operator
+   * hand-building a session and hoping it lands in the right room with the right append is exactly
+   * the failure this message exists to prevent. Answered with the fresh `sessions` list, in which
+   * exactly one entry carries `isOrchestrator`.
+   */
+  z.object({ kind: z.literal("ensure_orchestrator") }),
+  /**
    * `path` is the room's working folder. Omitted, the room is `<project root>/<name>` and must stay
    * inside the root; given, it is used as-is and may point anywhere — a department is allowed to
    * live in a separate repository. See `RoomManager.createRoom`.
@@ -308,6 +318,13 @@ export const SessionInfo = z.object({
   model: z.string().nullable(),
   /** The room this agent works in, or null for a roomless session (every M0 session). */
   roomId: z.string().nullable(),
+  /**
+   * This agent is the factory's orchestrator: the senior agent that routes work, unblocks rooms and
+   * decides direction. It is an ordinary session in every other respect — same runtime, same event
+   * log, same room (the project room) — so this is a flag on `SessionInfo` rather than a separate
+   * kind of thing the client has to model. At most one per project.
+   */
+  isOrchestrator: z.boolean(),
   /**
    * Derived from the session's own event log: the latest `session_status`, or `idle` when it has
    * none. The 3D floor needs the *current* status of every agent, and subscribing to every session

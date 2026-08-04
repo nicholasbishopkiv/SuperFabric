@@ -110,6 +110,20 @@ const MIGRATIONS: readonly Migration[] = [
   `
     ALTER TABLE sessions ADD COLUMN model TEXT;
   `,
+  // 7 — M3b, the orchestrator. A senior agent is an ordinary session with a role, not a new kind of
+  // row: one flag, and everything else about it — its room, its model, its event log — is exactly
+  // what every other session has. INTEGER because SQLite has no boolean; NOT NULL DEFAULT 0 so every
+  // session written before this column stays what it always was, an ordinary agent.
+  //
+  // **At most one orchestrator per project is enforced in code**, in `SessionManager.createSession`,
+  // not by a partial unique index here. A UNIQUE index would also make it impossible to ever replace
+  // an orchestrator whose session row is dead — a policy question for a later milestone, and not one
+  // the schema should settle now. The index below is what makes "does this factory have one?" a
+  // lookup rather than a scan, which is the question routing asks on every unassigned task.
+  `
+    ALTER TABLE sessions ADD COLUMN is_orchestrator INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX IF NOT EXISTS sessions_orchestrator ON sessions (project_id, is_orchestrator);
+  `,
 ];
 
 /**

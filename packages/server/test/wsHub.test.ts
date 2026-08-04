@@ -281,6 +281,90 @@ describe("WsHub", () => {
     });
   });
 
+  // ---- M3b: the orchestrator over the wire ----
+
+  describe("ensure_orchestrator", () => {
+    /** A hub whose project room stands on a throwaway root, removed afterwards. */
+    function withRoot<T>(fn: (ctx: ReturnType<typeof makeHub> & { root: string }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-orchestrator-"));
+      const ctx = makeHub({ root });
+      ctx.rooms.ensureProjectRoom();
+      try {
+        return fn({ ...ctx, root });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    const lastSessions = (sent: any[]) => sent.filter(m => m.kind === "sessions").at(-1)?.sessions as any[];
+
+    it("creates the orchestrator in the project room and reports it on the session list", () => {
+      withRoot(({ hub, rooms, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+
+        const projectRoom = rooms.listRooms().find(r => r.kind === "project")!;
+        const sessions = lastSessions(sent);
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]).toMatchObject({ isOrchestrator: true, roomId: projectRoom.id });
+        // the central building's agent count changed, so the floor is refreshed too
+        expect(sent.filter(m => m.kind === "rooms").at(-1)!.rooms.find((r: any) => r.kind === "project"))
+          .toMatchObject({ agentCount: 1 });
+        // and the operator is told what it is for
+        expect(sent.some(m => m.kind === "notice" && /orchestrator/.test(m.message))).toBe(true);
+      });
+    });
+
+    it("subscribes the asking socket to it, so the operator can watch it work", () => {
+      withRoot(({ hub, mgr, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        const id = mgr.listSessions().find(s => s.isOrchestrator)!.id;
+        expect(subsFor(hub).get(sock)!.has(id)).toBe(true);
+        expect(sent.some(m => m.kind === "event" && m.sessionId === id)).toBe(true);
+      });
+    });
+
+    it("is idempotent over the wire: a second call creates nothing and still answers", () => {
+      withRoot(({ hub, mgr, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        const first = mgr.listSessions().find(s => s.isOrchestrator)!.id;
+        sent.length = 0;
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+        expect(mgr.listSessions().filter(s => s.isOrchestrator).map(s => s.id)).toEqual([first]);
+        expect(lastSessions(sent).filter((s: any) => s.isOrchestrator)).toHaveLength(1);
+      });
+    });
+
+    it("gives each factory its own, and never the other floor's", () => {
+      const a = mkdtempSync(join(tmpdir(), "superfabric-hub-orch-a-"));
+      const b = mkdtempSync(join(tmpdir(), "superfabric-hub-orch-b-"));
+      try {
+        const { hub, rooms, projects, mgr, sock, sent } = makeHub({ root: a });
+        rooms.ensureProjectRoom();
+        const other = projects.create({ root: b });
+        rooms.ensureProjectRoom(other.id);
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        const mine = mgr.listSessions().find(s => s.isOrchestrator)!.id;
+
+        hub.handleMessage(sock, JSON.stringify({ kind: "open_project", projectId: other.id }));
+        sent.length = 0;
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+
+        const theirs = mgr.listSessions(other.id).find(s => s.isOrchestrator)!.id;
+        expect(theirs).not.toBe(mine);
+        // the answer this socket got holds its own floor's agent and nobody else's
+        expect(lastSessions(sent).map((s: any) => s.id)).toEqual([theirs]);
+        expect(mgr.listSessions().map(s => s.id)).toEqual([mine]);
+      } finally {
+        rmSync(a, { recursive: true, force: true });
+        rmSync(b, { recursive: true, force: true });
+      }
+    });
+  });
+
   // ---- M1a: rooms over the wire ----
 
   describe("rooms", () => {
