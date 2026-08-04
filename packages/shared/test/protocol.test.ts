@@ -781,4 +781,66 @@ describe("protocol", () => {
 
   });
 
+  /**
+   * M5: moving a factory.
+   *
+   * The wire's job here is to make an export refuse to be anything but an export, and to keep an
+   * account a *label* rather than an id all the way across.
+   */
+  describe("exporting and importing a factory", () => {
+    const EXPORT = {
+      format: FACTORY_EXPORT_FORMAT,
+      version: FACTORY_EXPORT_VERSION,
+      exportedAt: 1_800_000_000,
+      note: FACTORY_EXPORT_NOTE,
+      project: { name: "payments-platform" },
+      accountLabels: ["work"],
+      rooms: [{
+        name: "backend", kind: "room", relativePath: "backend", position: { x: 1, z: 2 },
+        runtime: "container", accountLabel: "work",
+        agents: [{
+          roleId: "architect", model: "claude-opus-5", autonomy: "auto", accountLabel: "work",
+          isOrchestrator: false,
+        }],
+      }],
+      tasks: [{ title: "Ship it", detail: "", status: "open", roomName: "backend" }],
+      decisions: [{
+        number: 1, title: "Retries", relativePath: "docs/decisions/0001-retries.md",
+        roomName: "backend", createdAt: 1_800_000_000,
+      }],
+    } as const;
+
+    it("round-trips an export, and refuses a file that is not one", () => {
+      const parsed = FactoryExport.parse(EXPORT);
+      expect(parsed.rooms[0]!.agents[0]!.accountLabel).toBe("work");
+      // An account is a *label* on the wire, never an id: the whole re-binding story depends on it.
+      expect(JSON.stringify(parsed)).not.toContain("accountId");
+      expect(() => FactoryExport.parse({ ...EXPORT, format: "something-else" })).toThrow();
+      expect(() => FactoryExport.parse({ ...EXPORT, version: 99 })).toThrow();
+      // A room name has to survive being a folder segment on the importing machine too.
+      expect(() => FactoryExport.parse({
+        ...EXPORT, rooms: [{ ...EXPORT.rooms[0], name: "../escape" }],
+      })).toThrow();
+    });
+
+    it("takes a factory in as unparsed, so a bad file is refused by name rather than as a bad frame", () => {
+      const msg = ClientMessage.parse({ kind: "import_factory", root: "/srv/x", factory: { junk: 1 } });
+      expect(msg.kind).toBe("import_factory");
+      // The handler parses it with `FactoryExport` and says what is wrong; the frame itself is valid,
+      // which is what lets the operator be told "this is not an export" instead of "bad message".
+      expect(() => ClientMessage.parse({ kind: "import_factory", factory: {} })).toThrow();
+    });
+
+    it("carries an import's problems as a list, not as one string", () => {
+      const msg = ServerMessage.parse({
+        kind: "factory_import",
+        result: {
+          projectId: "p1", projectName: "payments-platform", projectCreated: true,
+          roomsCreated: ["frontend"], tasksCreated: 3, decisionsIndexed: 1, agentsDescribed: 4,
+          problems: ['room "backend" was not created: room "backend" already exists'],
+        },
+      });
+      expect(msg).toMatchObject({ kind: "factory_import", result: { problems: [expect.any(String)] } });
+    });
+  });
 });

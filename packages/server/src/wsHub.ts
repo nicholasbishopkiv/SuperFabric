@@ -1,6 +1,7 @@
 import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@superfabric/shared";
 import type { AccountLoginManager } from "./accountLogin.js";
 import type { AccountManager } from "./accountManager.js";
+import type { FactoryPortability } from "./factoryPortability.js";
 import type { LimitMonitor } from "./limitMonitor.js";
 import type { MetricsStore } from "./metricsStore.js";
 import type { Chronicle } from "./chronicle.js";
@@ -80,6 +81,11 @@ export interface WsHubOptions {
    * nothing" are different facts, and the second one is the dangerous one to show.
    */
   metrics?: MetricsStore;
+  /**
+   * Exporting and importing a factory. Absent => the two messages are refused with an error, which is
+   * the shape of every other optional collaborator here.
+   */
+  portability?: FactoryPortability;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -112,6 +118,7 @@ export class WsHub {
   private readonly roles: RoleLibrary | undefined;
   private readonly onboarding: OnboardingManager | undefined;
   private readonly metrics: MetricsStore | undefined;
+  private readonly transfer: FactoryPortability | undefined;
 
   constructor(
     private store: EventStore,
@@ -131,6 +138,7 @@ export class WsHub {
     this.roles = opts.roles;
     this.onboarding = opts.onboarding;
     this.metrics = opts.metrics;
+    this.transfer = opts.portability;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -620,6 +628,35 @@ export class WsHub {
           this.safeSend(sock, { kind: "chronicle", query: msg.query, hits });
           break;
         }
+        // Portability. An export is a read of this socket's own floor — answered to the socket that
+        // asked, never broadcast, because it is a file the operator started downloading.
+        case "export_project": {
+          const projectId = msg.projectId ?? this.activeProject(sock);
+          // A client holding another project's id must not be able to read that factory's shape
+          // through this socket, for the same reason `requireRoomOnFloor` exists.
+          if (projectId !== this.activeProject(sock)) {
+            throw new Error("a factory can only be exported from the floor this tab is looking at");
+          }
+          this.safeSend(sock, { kind: "factory_export", factory: this.portability().export(projectId) });
+          break;
+        }
+        // An import changes the world: a project may appear, rooms and a board certainly do. So the
+        // switcher is refreshed for everybody, this socket is moved onto the floor it just built (an
+        // operator who imports a factory wants to be looking at it), and the *result* — including
+        // everything the import could not do — goes back as its own message rather than as a notice.
+        case "import_factory": {
+          const result = this.portability().import({
+            root: msg.root,
+            ...(msg.name !== undefined ? { name: msg.name } : {}),
+            factory: msg.factory,
+          });
+          this.safeSend(sock, { kind: "factory_import", result });
+          this.openProject(sock, result.projectId);
+          for (const other of [...this.subs.keys()]) {
+            if (other !== sock) this.sendProjects(other);
+          }
+          break;
+        }
       }
     } catch (err) {
       this.safeSend(sock, { kind: "error", message: String(err) });
@@ -884,6 +921,14 @@ export class WsHub {
   private metricStore(): MetricsStore {
     if (this.metrics === undefined) throw new Error("this server does not compute metrics");
     return this.metrics;
+  }
+
+  /** Likewise for portability: "this server cannot move a factory" is not an empty export. */
+  private portability(): FactoryPortability {
+    if (this.transfer === undefined) {
+      throw new Error("this server cannot export or import a factory");
+    }
+    return this.transfer;
   }
 
   /** Likewise for roles: a server that ships none says so rather than answering with an empty picker. */

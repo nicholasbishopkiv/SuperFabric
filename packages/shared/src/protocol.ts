@@ -779,6 +779,149 @@ export const FactoryMetrics = z.object({
 });
 export type FactoryMetrics = z.infer<typeof FactoryMetrics>;
 
+// ---- M5: exporting and importing a factory ----
+
+/**
+ * The `format` marker every export carries. Checked on import before anything else: a JSON file that
+ * is not one of ours is refused by name rather than half-applied.
+ */
+export const FACTORY_EXPORT_FORMAT = "superfabric.factory";
+
+/** The export schema's version. Bumped when the shape changes in a way an older reader would misread. */
+export const FACTORY_EXPORT_VERSION = 1;
+
+/**
+ * The sentence the export file carries about itself, so someone reading the JSON — or receiving it
+ * from a colleague — learns the two things that matter without opening the docs.
+ */
+export const FACTORY_EXPORT_NOTE =
+  "This file describes a SuperFabric factory: its rooms, the agents that staffed them, its task "
+  + "board and the index of its recorded decisions. It contains NO credentials: accounts appear only "
+  + "as the labels you gave them, and importing this file asks you to re-bind each label to an "
+  + "account on the importing machine. Agents are described, not started — an import rebuilds the "
+  + "floor and leaves the staffing to you.";
+
+/**
+ * One agent as the export describes it: what it *was*, not a session that can be resumed.
+ *
+ * A session's `claude_session_id` is meaningless on another machine (the conversation lives in that
+ * account's transcripts), so nothing here tries to carry one. This is the staffing of a room —
+ * "there was an architect on Opus here" — which is the part worth moving.
+ */
+export const ExportedAgent = z.object({
+  roleId: z.string().nullable(),
+  model: z.string().nullable(),
+  autonomy: AutonomyMode,
+  /** The **label** of the account it ran on, or null for the ambient `~/.claude`. Never an id. */
+  accountLabel: z.string().nullable(),
+  isOrchestrator: z.boolean(),
+});
+export type ExportedAgent = z.infer<typeof ExportedAgent>;
+
+export const ExportedRoom = z.object({
+  name: RoomName,
+  /** "project" is the central building, which an import never creates twice. */
+  kind: z.enum(["project", "room"]),
+  /**
+   * The room's folder **relative to the project root**, POSIX-style — or null when the room's folder
+   * was outside the root on the exporting machine.
+   *
+   * **No absolute path is exported, ever.** Not because a path is a secret, but because it is not
+   * portable and because the operator's home directory is nobody else's business: a factory shared
+   * with a colleague should describe a shape, not a filesystem. A room whose folder was outside the
+   * root therefore cannot be reproduced, and the import says so instead of guessing.
+   */
+  relativePath: z.string().nullable(),
+  position: ScenePosition,
+  runtime: RoomRuntime,
+  /** The **label** of the account new agents here defaulted to, or null. Re-bound on import. */
+  accountLabel: z.string().nullable(),
+  agents: z.array(ExportedAgent),
+});
+export type ExportedRoom = z.infer<typeof ExportedRoom>;
+
+export const ExportedTask = z.object({
+  title: z.string().min(1).max(200),
+  detail: z.string().max(4000),
+  status: TaskStatus,
+  /** The room's **name**, or null for an unassigned card. Names are how an export refers to rooms. */
+  roomName: z.string().nullable(),
+});
+export type ExportedTask = z.infer<typeof ExportedTask>;
+
+/**
+ * One entry of the decision index — **not** the decision.
+ *
+ * The ADR is a file in the repository (`docs/decisions/NNNN-<slug>.md`) and the row is an index over
+ * it; that invariant does not stop being true because the factory moved. So the export carries the
+ * index and the import re-creates rows only for files that are actually there, reporting the ones
+ * that are not. Copying the ADR bodies in here would create a second source of truth for the one
+ * thing in the product that is emphatically repo-native.
+ */
+export const ExportedDecision = z.object({
+  number: z.number().int().positive(),
+  title: z.string().min(1),
+  /** The ADR's path relative to the project root, POSIX-style. */
+  relativePath: z.string().min(1),
+  /** The room it was recorded in, by name, or null. */
+  roomName: z.string().nullable(),
+  createdAt: z.number().int(),
+});
+export type ExportedDecision = z.infer<typeof ExportedDecision>;
+
+/**
+ * A whole factory, portably.
+ *
+ * **What is deliberately not in here**: any token, any path into an account's `CLAUDE_CONFIG_DIR`,
+ * any absolute path at all, and any account id. `test/factoryPortability.test.ts` greps the serialised
+ * bytes for the token shapes and for every configured config directory and fails if it finds one —
+ * because a promise in a document is not a test.
+ */
+export const FactoryExport = z.object({
+  format: z.literal(FACTORY_EXPORT_FORMAT),
+  version: z.literal(FACTORY_EXPORT_VERSION),
+  /** Unix seconds. */
+  exportedAt: z.number().int(),
+  /** What this file is and what it does not contain. See `FACTORY_EXPORT_NOTE`. */
+  note: z.string(),
+  project: z.object({ name: z.string().min(1).max(120) }),
+  /**
+   * Every account label this factory refers to, de-duplicated. The import's re-binding list: the
+   * operator sees these names and either has an account with that label or is told which one is
+   * missing.
+   */
+  accountLabels: z.array(z.string()),
+  rooms: z.array(ExportedRoom),
+  tasks: z.array(ExportedTask),
+  decisions: z.array(ExportedDecision),
+});
+export type FactoryExport = z.infer<typeof FactoryExport>;
+
+/**
+ * What an import actually did, and — the half that matters — what it could not.
+ *
+ * **A partial import that claims to be complete is worse than a refused one.** Every room that
+ * already existed, every account label this machine does not have, every ADR file that is not in this
+ * repository and every agent that was described rather than started is named in `problems`. Nothing
+ * is silently skipped.
+ */
+export const FactoryImportResult = z.object({
+  projectId: z.string(),
+  /** The project's name, so the UI can say where the factory landed without a second lookup. */
+  projectName: z.string(),
+  /** Whether the project row was created by this import or already existed for that root. */
+  projectCreated: z.boolean(),
+  /** Room names created, in the order they were created. */
+  roomsCreated: z.array(z.string()),
+  tasksCreated: z.number().int().nonnegative(),
+  decisionsIndexed: z.number().int().nonnegative(),
+  /** Agents the file described. Import never starts one — see `FACTORY_EXPORT_NOTE`. */
+  agentsDescribed: z.number().int().nonnegative(),
+  /** Everything the import could not do, one readable sentence each. */
+  problems: z.array(z.string()),
+});
+export type FactoryImportResult = z.infer<typeof FactoryImportResult>;
+
 // ---- client -> server ----
 export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("subscribe"), sessionId: z.string(), afterSeq: z.number().int().nonnegative() }),
@@ -1030,6 +1173,37 @@ export const ClientMessage = z.discriminatedUnion("kind", [
     query: z.string().max(500).default(""),
     limit: z.number().int().min(1).max(50).optional(),
   }),
+  // Portability. Two messages, and the asymmetry between them is deliberate: an export is a *read* of
+  // the asking socket's own floor, while an import has to be told which folder to build in — a
+  // factory arriving from elsewhere has no root of its own, and guessing one would create rooms in
+  // whatever directory this server happened to be started from.
+  /**
+   * Hand back this factory as a portable file. Omitted `projectId` => the socket's active project.
+   *
+   * **No secrets are in the answer.** Accounts appear as labels, no absolute path is included, and
+   * nothing from any `CLAUDE_CONFIG_DIR` is read. See `FactoryExport`.
+   */
+  z.object({ kind: z.literal("export_project"), projectId: z.string().optional() }),
+  /**
+   * Rebuild a factory from an exported file, in a folder the operator names.
+   *
+   * `root` must be an absolute path to an existing directory. A project already registered for that
+   * root is used; otherwise one is created. Rooms are created through the ordinary
+   * `RoomManager.createRoom`, so name safety, root containment and never-overwriting-a-charter all
+   * still apply *because it is the same code path* — and everything the import could not do comes
+   * back in `FactoryImportResult.problems` rather than being skipped in silence.
+   *
+   * `factory` is `unknown` on the wire on purpose: it is parsed with `FactoryExport` inside the
+   * handler so a file that is not one of ours is refused with a message naming what is wrong with it,
+   * rather than failing the whole frame as "bad message".
+   */
+  z.object({
+    kind: z.literal("import_factory"),
+    root: z.string().min(1),
+    /** Display name for a project this import creates. Ignored when the root already has one. */
+    name: z.string().min(1).max(120).optional(),
+    factory: z.unknown(),
+  }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -1195,5 +1369,16 @@ export const ServerMessage = z.discriminatedUnion("kind", [
    * on a turn boundary, because a turn is what changes the cost half.
    */
   z.object({ kind: z.literal("metrics"), metrics: FactoryMetrics }),
+  /**
+   * This factory, portably — the answer to one `export_project`, to the socket that asked. Not
+   * broadcast: it is a download the operator started, and it is large.
+   */
+  z.object({ kind: z.literal("factory_export"), factory: FactoryExport }),
+  /**
+   * What an import did and did not do. A message of its own rather than a `notice`, because the
+   * *problems* list is the important half and a one-line string could not carry it — an import that
+   * created four of five rooms has to be able to say which one it refused and why.
+   */
+  z.object({ kind: z.literal("factory_import"), result: FactoryImportResult }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;
