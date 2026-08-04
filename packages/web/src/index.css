@@ -1,0 +1,100 @@
+@import "tailwindcss";
+
+/**
+ * The HUD's design tokens.
+ *
+ * Two halves, and the split is the point:
+ *
+ * - **Chrome** (panel, line, foreground) is declared here. It is neutral by construction — a HUD
+ *   that floats over a live factory floor may not have an opinion of its own about colour, or it
+ *   competes with the thing it is describing. Cool near-black against the floor's warm concrete,
+ *   so a panel reads as *over* the scene rather than as a hole in it.
+ * - **Semantics** (the four statuses, selection, bypass) are **not declared here**. They are
+ *   `var(--sf-…)` references to variables written onto `:root` at boot by `hud/tokens.ts`,
+ *   straight out of `scene/palette.ts`. A room's dot in the panel and its beacon on the roof read
+ *   the same constant, so they cannot drift apart. Re-typing a hex here would be exactly the bug.
+ */
+@theme {
+  /* Panels. Always used with an alpha and a blur — see `hud/Panel.tsx`. */
+  --color-panel: #10151b;
+  --color-panel-raised: #19212b;
+  --color-panel-sunken: #090d12;
+  --color-line: #28323d;
+  --color-line-strong: #3d4a58;
+  --color-fg: #dee6ed;
+  --color-fg-muted: #8d99a6;
+  --color-fg-faint: #626f7c;
+
+  /* Generated from scene/palette.ts. Never given a literal fallback: a missing token must fail
+     loudly rather than quietly show a colour the floor does not agree with. */
+  --color-status-idle: var(--sf-status-idle);
+  --color-status-working: var(--sf-status-working);
+  --color-status-blocked: var(--sf-status-blocked);
+  --color-status-error: var(--sf-status-error);
+  --color-accent: var(--sf-accent);
+  --color-bypass: var(--sf-bypass);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+  /* An instrument panel's own scale: everything is one or two steps below web-page size. */
+  --text-2xs: 0.6875rem; /* 11px — meta, counts, ids */
+  --text-2xs--line-height: 1rem;
+  --text-xs: 0.75rem; /* 12px — labels and secondary rows */
+  --text-xs--line-height: 1.0625rem;
+  --text-sm: 0.8125rem; /* 13px — the HUD's body size */
+  --text-sm--line-height: 1.15rem;
+
+  --animate-pop: pop 110ms ease-out;
+}
+
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: translateY(-3px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@layer base {
+  :root {
+    /* Dark by nature: this makes the browser's own scrollbars, focus rings and form widgets dark
+       too, so a native control never flashes white over the floor. */
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    /* No background: the WebGL canvas *is* the background, and a body colour behind it would only
+       show through as a flash before the first frame. */
+    font-family: var(--font-sans);
+    color: var(--color-fg);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Panels scroll a lot and are small; the platform scrollbar is too wide and too bright for one. */
+  .hud-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+  .hud-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .hud-scroll::-webkit-scrollbar-thumb {
+    background: var(--color-line-strong);
+    border-radius: 4px;
+  }
+  .hud-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}

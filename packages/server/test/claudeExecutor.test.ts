@@ -1,8 +1,16 @@
 import { describe, it, expect } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { Options, Query, SDKAssistantMessage, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionEvent } from "@superfabric/shared";
-import { ClaudeCodeExecutor, sdkPermissionMode, type ClaudeCodeExecutorOptions, type QueryFn } from "../src/executors/claudeCode.js";
+import type { ExecutorStartOptions } from "../src/executor.js";
+import {
+  ClaudeCodeExecutor,
+  inProcessToolPrefixes,
+  sdkPermissionMode,
+  type ClaudeCodeExecutorOptions,
+  type QueryFn,
+} from "../src/executors/claudeCode.js";
 
 // ---------------------------------------------------------------------------
 // scripted SDKMessage builders
@@ -168,14 +176,14 @@ async function until(pred: () => boolean, ms = 2000): Promise<void> {
   }
 }
 
-function harness(defaults: ClaudeCodeExecutorOptions = {}) {
+function harness(defaults: ClaudeCodeExecutorOptions = {}, start: Partial<ExecutorStartOptions> = {}) {
   const fq = makeFakeQuery();
   const events: SessionEvent[] = [];
   const approvals: { toolName: string; input: unknown }[] = [];
   let decision: "allow" | "deny" = "allow";
   const exec = new ClaudeCodeExecutor({ ...defaults, query: fq.fn });
   const handle = exec.start(
-    { cwd: "/tmp/work", resumeSessionId: null },
+    { cwd: "/tmp/work", resumeSessionId: null, ...start },
     {
       onEvent: (e) => events.push(e),
       requestApproval: async (toolName, input) => {
@@ -468,6 +476,54 @@ describe("ClaudeCodeExecutor", () => {
     });
   });
 
+  // ---- per-session model (ExecutorStartOptions.model) ----
+
+  describe("model", () => {
+    it("passes a session's model straight through to the SDK's Options.model", () => {
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: fq.fn })
+        .start({ cwd: "/repo", model: "claude-haiku-4-5" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      expect(fq.options()!.model).toBe("claude-haiku-4-5");
+    });
+
+    it("lets a session override the process-wide default", () => {
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ model: "claude-opus-5", query: fq.fn })
+        .start({ cwd: "/repo", model: "claude-haiku-4-5" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      expect(fq.options()!.model).toBe("claude-haiku-4-5");
+    });
+
+    it("falls back to the process-wide default for a session that pinned nothing", () => {
+      for (const model of [undefined, null]) {
+        const fq = makeFakeQuery();
+        new ClaudeCodeExecutor({ model: "claude-opus-5", query: fq.fn })
+          .start({ cwd: "/repo", model }, { onEvent: () => {}, requestApproval: async () => "deny" });
+        expect(fq.options()!.model).toBe("claude-opus-5");
+      }
+    });
+
+    it("leaves Options.model unset when nobody chose one, rather than guessing an id", () => {
+      // An id the installed CLI does not know is a 404 mid-turn, so "no choice" has to stay "no
+      // choice" all the way down to the SDK.
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: fq.fn })
+        .start({ cwd: "/repo", model: null }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      expect(fq.options()!.model).toBeUndefined();
+    });
+
+    it("does not disturb the rest of the session's configuration", () => {
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: fq.fn }).start(
+        { cwd: "/repo", model: "claude-sonnet-5", autonomy: "bypass", resumeSessionId: "prev" },
+        { onEvent: () => {}, requestApproval: async () => "deny" },
+      );
+      const o = fq.options()!;
+      expect(o.model).toBe("claude-sonnet-5");
+      expect(o.permissionMode).toBe("bypassPermissions");
+      expect(o.resume).toBe("prev");
+    });
+  });
+
   it("omits optional Options when no defaults are given", () => {
     const fq = makeFakeQuery();
     const exec = new ClaudeCodeExecutor({ query: fq.fn });
@@ -477,5 +533,107 @@ describe("ClaudeCodeExecutor", () => {
     expect(o.model).toBeUndefined();
     expect(o.systemPrompt).toBeUndefined();
     expect(o.env).toBeUndefined();
+    expect(o.mcpServers).toBeUndefined();
+  });
+
+  // ---- M3a: in-process MCP tool servers (the factory bus) ----
+
+  describe("mcpServers", () => {
+    it("threads a per-session in-process server into Options under the SDK's own field name", () => {
+      const fq = makeFakeQuery();
+      const server = createSdkMcpServer({
+        name: "factory",
+        tools: [tool("factory_ping", "test tool", {}, async () => ({ content: [{ type: "text", text: "pong" }] }))],
+      });
+      new ClaudeCodeExecutor({ query: fq.fn })
+        .start({ cwd: "/repo", mcpServers: { factory: server } }, { onEvent: () => {}, requestApproval: async () => "deny" });
+
+      const o = fq.options()!;
+      expect(o.mcpServers).toEqual({ factory: server });
+      // an in-process server carries a live instance, so it must be passed by reference
+      expect(o.mcpServers!.factory).toBe(server);
+      expect((o.mcpServers!.factory as { type?: string }).type).toBe("sdk");
+    });
+
+    it("omits mcpServers entirely for a session with no tool servers", () => {
+      const fq = makeFakeQuery();
+      new ClaudeCodeExecutor({ query: fq.fn })
+        .start({ cwd: "/repo", mcpServers: {} }, { onEvent: () => {}, requestApproval: async () => "deny" });
+      // an empty record would tell the CLI "this session has MCP servers"; a roomless session has none
+      expect(fq.options()!.mcpServers).toBeUndefined();
+    });
+  });
+
+  // ---- M3a: the factory's own bus tools are never gated (ADR 0002) ----
+
+  describe("the factory's own tools are not gated", () => {
+    const factoryServer = () =>
+      createSdkMcpServer({
+        name: "factory",
+        tools: [tool("factory_send", "test tool", {}, async () => ({ content: [{ type: "text", text: "sent" }] }))],
+      });
+    /** What the CLI hands `canUseTool` besides the tool name and its input. */
+    const ctx = (toolUseID: string) => ({
+      signal: new AbortController().signal,
+      toolUseID,
+      requestId: `req_${toolUseID}`,
+    });
+
+    it("derives the ungated prefixes from the session's own in-process servers", () => {
+      expect(inProcessToolPrefixes(undefined)).toEqual([]);
+      expect(inProcessToolPrefixes({ factory: factoryServer() })).toEqual(["mcp__factory__"]);
+      // A stdio/http server is a third party reaching outside this process; it stays gated.
+      expect(inProcessToolPrefixes({
+        factory: factoryServer(),
+        github: { type: "stdio", command: "gh-mcp" },
+      })).toEqual(["mcp__factory__"]);
+    });
+
+    it("allows an attended agent's factory_send without ever asking the operator", async () => {
+      const { fq, approvals } = harness({}, { autonomy: "attended", mcpServers: { factory: factoryServer() } });
+      const res = await fq.options()!.canUseTool!(
+        "mcp__factory__factory_send",
+        { to_room: "payments", kind: "request", body: "need a webhook" },
+        ctx("tu_bus"),
+      );
+      expect(res).toEqual({
+        behavior: "allow",
+        updatedInput: { to_room: "payments", kind: "request", body: "need a webhook" },
+      });
+      // The whole point: no approval card, in the mode where every gated call raises one.
+      expect(approvals).toEqual([]);
+    });
+
+    it("still records the ungated call in the log, exactly once", async () => {
+      const { fq, events } = harness({}, { autonomy: "attended", mcpServers: { factory: factoryServer() } });
+      fq.emit(initMsg("sess-bus"));
+      await fq.options()!.canUseTool!("mcp__factory__factory_send", { body: "hi" }, ctx("tu_1"));
+      // The assistant message reporting the same call must not double it up in the transcript.
+      fq.emit(assistantMsg([{ type: "tool_use", id: "tu_1", name: "mcp__factory__factory_send", input: { body: "hi" } }]));
+      fq.emit(userMsg([{ type: "tool_result", tool_use_id: "tu_1", content: "Message m1 delivered." }]));
+      await until(() => events.some((e) => e.type === "tool_result"));
+      expect(events.filter((e) => e.type === "tool_use")).toEqual([
+        { type: "tool_use", toolName: "mcp__factory__factory_send", input: { body: "hi" } },
+      ]);
+      // …and the result still correlates to the name the operator saw.
+      expect(events.at(-1)).toEqual({
+        type: "tool_result", toolName: "mcp__factory__factory_send", isError: false,
+        output: "Message m1 delivered.",
+      });
+    });
+
+    it("keeps gating everything else in the same session", async () => {
+      const { fq, approvals } = harness({}, { autonomy: "attended", mcpServers: { factory: factoryServer() } });
+      const res = await fq.options()!.canUseTool!("Bash", { command: "rm -rf /" }, ctx("tu_2"));
+      expect(approvals).toEqual([{ toolName: "Bash", input: { command: "rm -rf /" } }]);
+      expect(res?.behavior).toBe("allow"); // the harness's operator said yes; the point is it was asked
+    });
+
+    it("gates a factory-looking tool name in a session that was given no bus", async () => {
+      const { fq, approvals } = harness({}, { autonomy: "attended" });
+      await fq.options()!.canUseTool!("mcp__factory__factory_send", { body: "hi" }, ctx("tu_3"));
+      // A roomless session has no factory server, so nothing about it is ours to auto-allow.
+      expect(approvals).toEqual([{ toolName: "mcp__factory__factory_send", input: { body: "hi" } }]);
+    });
   });
 });

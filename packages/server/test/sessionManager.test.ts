@@ -5,17 +5,39 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
+import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
+import { FactoryBus } from "../src/factoryBus.js";
+import { TaskStore } from "../src/taskStore.js";
 import type { Executor, ExecutorEvents, ExecutorHandle, ExecutorStartOptions } from "../src/executor.js";
+import type { SessionEvent } from "@superfabric/shared";
 
 function make(db = openDb(":memory:")) {
   const store = new EventStore(db);
   const exec = new FakeExecutor();
-  const rooms = new RoomManager(db, tmpdir());
-  const mgr = new SessionManager(db, store, exec, rooms);
-  return { db, store, exec, rooms, mgr };
+  const { projects, rooms } = factory(db);
+  const mgr = new SessionManager(db, store, exec, rooms, projects);
+  return { db, store, exec, projects, rooms, mgr };
+}
+
+/**
+ * The project- and room-scoped managers, built together because they share one `ProjectManager`.
+ * `root` is the default project's root, so a call that names no project lands there.
+ */
+function factory(db: ReturnType<typeof openDb>, root: string = tmpdir()) {
+  const projects = new ProjectManager(db, root);
+  return { projects, rooms: new RoomManager(db, projects) };
+}
+
+/**
+ * The last two `SessionManager` arguments (`rooms`, `projects`) for a case that does not care about
+ * either — spread, so a construction stays one line.
+ */
+function manager(db: ReturnType<typeof openDb>): [RoomManager, ProjectManager] {
+  const { projects, rooms } = factory(db);
+  return [rooms, projects];
 }
 
 describe("SessionManager", () => {
@@ -34,7 +56,7 @@ describe("SessionManager", () => {
     const db = openDb(":memory:");
     const store = new EventStore(db);
     const exec = new FakeExecutor({ script: [{ tool: "Bash", input: {} }] });
-    const mgr = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+    const mgr = new SessionManager(db, store, exec, ...manager(db));
     const id = mgr.createSession({ cwd: "/tmp" });
     mgr.prompt(id, "run it");
     // wait until the approval_request event lands in the store
@@ -58,7 +80,7 @@ describe("SessionManager", () => {
     mgr.prompt(id, "hi");
     await exec.settle();
     // new manager over the same db simulates a server restart
-    const mgr2 = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+    const mgr2 = new SessionManager(db, store, exec, ...manager(db));
     const resumed = mgr2.resumeAll();
     expect(resumed).toEqual([id]);
     mgr2.prompt(id, "again");
@@ -93,7 +115,7 @@ describe("SessionManager", () => {
       const db = openDb(":memory:");
       const store = new EventStore(db);
       const exec = new FakeExecutor({ script: [{ tool: "Bash", input: {} }] });
-      const mgr = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+      const mgr = new SessionManager(db, store, exec, ...manager(db));
       const id = mgr.createSession({ cwd: "/tmp" });
       mgr.prompt(id, "run it");
       await waitFor(() => {
@@ -140,7 +162,7 @@ describe("SessionManager", () => {
       const { db, store, exec, id, approvalId } = await withPendingApproval();
       // A fresh manager over the same db: the log still holds approval_request, but the resolver
       // died with the previous process.
-      const revived = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+      const revived = new SessionManager(db, store, exec, ...manager(db));
       revived.resumeAll();
       expect(() => revived.approve(id, approvalId, "allow")).toThrow(/expired with the previous process/);
       const rows = resolutions(store, id);
@@ -166,11 +188,11 @@ describe("SessionManager", () => {
     }
     const db = openDb(":memory:");
     const store = new EventStore(db);
-    const mgr = new SessionManager(db, store, new FailingExecutor(), new RoomManager(db, tmpdir()));
+    const mgr = new SessionManager(db, store, new FailingExecutor(), ...manager(db));
     const id = mgr.createSession({ cwd: "/tmp" });
     expect(mgr.listSessions()[0]).toMatchObject({ id, state: "error" });
     // a fresh manager (server restart) must not re-spawn a known-broken session
-    expect(new SessionManager(db, store, new FailingExecutor(), new RoomManager(db, tmpdir())).resumeAll()).toEqual([]);
+    expect(new SessionManager(db, store, new FailingExecutor(), ...manager(db)).resumeAll()).toEqual([]);
   });
 
   it("resumeAll reports only the sessions it actually started", async () => {
@@ -179,7 +201,7 @@ describe("SessionManager", () => {
     const id = mgr.createSession({ cwd: "/tmp" });
     // the same manager already holds a live handle for it
     expect(mgr.resumeAll()).toEqual([]);
-    const mgr2 = new SessionManager(db, store, exec, new RoomManager(db, tmpdir()));
+    const mgr2 = new SessionManager(db, store, exec, ...manager(db));
     expect(mgr2.resumeAll()).toEqual([id]);
     expect(mgr2.resumeAll()).toEqual([]);
   });
@@ -209,7 +231,7 @@ describe("SessionManager", () => {
     const cwd = mkdtempSync(join(tmpdir(), "superfabric-resume-"));
 
     const exec1 = new RecordingExecutor(providerId);
-    const mgr = new SessionManager(db, store, exec1, new RoomManager(db, tmpdir()));
+    const mgr = new SessionManager(db, store, exec1, ...manager(db));
     const id = mgr.createSession({ cwd });
     expect(exec1.starts).toHaveLength(1);
     expect(exec1.starts[0].cwd).toBe(cwd);
@@ -223,7 +245,7 @@ describe("SessionManager", () => {
 
     // restart: a second manager over the same db must hand the stored id back to the executor
     const exec2 = new RecordingExecutor(providerId);
-    const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
+    const mgr2 = new SessionManager(db, store, exec2, ...manager(db));
     expect(mgr2.resumeAll()).toEqual([id]);
     expect(exec2.starts).toHaveLength(1);
     expect(exec2.starts[0].resumeSessionId).toBe(providerId);
@@ -254,7 +276,7 @@ describe("SessionManager", () => {
     const setup = (db = openDb(":memory:")) => {
       const store = new EventStore(db);
       const exec = new RecordingExecutor();
-      return { db, store, exec, mgr: new SessionManager(db, store, exec, new RoomManager(db, tmpdir())) };
+      return { db, store, exec, mgr: new SessionManager(db, store, exec, ...manager(db)) };
     };
 
     const stored = (db: ReturnType<typeof openDb>, id: string) =>
@@ -347,7 +369,7 @@ describe("SessionManager", () => {
 
       // a second manager over the same db simulates a server restart
       const exec2 = new RecordingExecutor();
-      const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
+      const mgr2 = new SessionManager(db, store, exec2, ...manager(db));
       expect(mgr2.resumeAll()).toEqual([id]);
       expect(exec2.starts[0].autonomy).toBe("bypass");
       expect(mgr2.listSessions().find(s => s.id === id)!.autonomy).toBe("bypass");
@@ -360,9 +382,152 @@ describe("SessionManager", () => {
       db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?").run("nonsense", id);
       expect(mgr.listSessions()[0].autonomy).toBe("auto");
       const exec2 = new RecordingExecutor();
-      const mgr2 = new SessionManager(db, store, exec2, new RoomManager(db, tmpdir()));
+      const mgr2 = new SessionManager(db, store, exec2, ...manager(db));
       mgr2.resumeAll();
       expect(exec2.starts[0].autonomy).toBe("auto");
+    });
+  });
+
+  // ---- per-agent model: persisted, passed to the executor, survives resume ----
+
+  describe("model", () => {
+    /** Records every start() so a test can assert the model the executor was handed. */
+    class RecordingExecutor implements Executor {
+      readonly name = "recording";
+      readonly starts: ExecutorStartOptions[] = [];
+      readonly stops: number[] = [];
+      constructor(private readonly providerId = "claude-session-model") {}
+      start(opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
+        this.starts.push(opts);
+        ev.onEvent({ type: "session_status", status: "idle" });
+        return {
+          providerSessionId: Promise.resolve(this.providerId),
+          send: () => {},
+          interrupt: async () => {},
+          stop: async () => { this.stops.push(Date.now()); },
+        };
+      }
+    }
+
+    const setup = (db = openDb(":memory:")) => {
+      const store = new EventStore(db);
+      const exec = new RecordingExecutor();
+      return { db, store, exec, mgr: new SessionManager(db, store, exec, ...manager(db)) };
+    };
+
+    const stored = (db: ReturnType<typeof openDb>, id: string) =>
+      (db.prepare("SELECT model FROM sessions WHERE id = ?").get(id) as { model: string | null }).model;
+
+    it("pins nothing by default, so the CLI's own default applies", () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      expect(stored(db, id)).toBeNull();
+      expect(exec.starts[0].model).toBeNull();
+      expect(mgr.listSessions()[0].model).toBeNull();
+    });
+
+    it("createSession with a model persists it and hands it to the executor", () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp", model: "claude-haiku-4-5" });
+      expect(stored(db, id)).toBe("claude-haiku-4-5");
+      expect(exec.starts).toHaveLength(1);
+      expect(exec.starts[0].model).toBe("claude-haiku-4-5");
+      expect(mgr.listSessions()[0].model).toBe("claude-haiku-4-5");
+    });
+
+    it("setModel persists, restarts the live executor on the new model, and logs it", async () => {
+      const { db, store, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp", model: "claude-sonnet-5" });
+      // the provider session id lands asynchronously; the restart must resume from it
+      await waitFor(() => {
+        const row = db.prepare("SELECT claude_session_id c FROM sessions WHERE id = ?").get(id) as { c: string | null };
+        if (row.c === null) throw new Error("not persisted yet");
+      });
+
+      await mgr.setModel(id, "claude-opus-5");
+
+      expect(stored(db, id)).toBe("claude-opus-5");
+      expect(mgr.listSessions().find(s => s.id === id)!.model).toBe("claude-opus-5");
+      // the stored model and the running one cannot disagree: the old executor is stopped and a new
+      // one resumes the same provider session on the new model
+      expect(exec.stops).toHaveLength(1);
+      expect(exec.starts).toHaveLength(2);
+      expect(exec.starts[1].model).toBe("claude-opus-5");
+      expect(exec.starts[1].resumeSessionId).toBe("claude-session-model");
+      // the autonomy the session was created with survives the model change
+      expect(exec.starts[1].autonomy).toBe("auto");
+      const detail = store.listAfter(id, 0)
+        .map(e => e.event)
+        .filter(e => e.type === "session_status")
+        .map(e => (e as { detail?: string }).detail)
+        .find(d => d !== undefined && d.includes("model"));
+      expect(detail).toContain("model: claude-opus-5");
+      expect(() => mgr.prompt(id, "still here")).not.toThrow();
+    });
+
+    it("un-pins a session back to the CLI default with null", async () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp", model: "claude-haiku-4-5" });
+      await mgr.setModel(id, null);
+      expect(stored(db, id)).toBeNull();
+      expect(exec.starts[1].model).toBeNull();
+      expect(mgr.listSessions()[0].model).toBeNull();
+    });
+
+    it("persists without restarting when the session is not live", async () => {
+      const { db, store, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      await mgr.stopAll();
+      const startsBefore = exec.starts.length;
+
+      await mgr.setModel(id, "claude-haiku-4-5");
+
+      expect(stored(db, id)).toBe("claude-haiku-4-5");
+      expect(exec.starts).toHaveLength(startsBefore);
+      const statuses = store.listAfter(id, 0).map(e => e.event).filter(e => e.type === "session_status");
+      expect((statuses.at(-1) as { detail?: string }).detail).toContain("claude-haiku-4-5");
+    });
+
+    it("does not spawn a replacement executor when shutdown starts mid-switch", async () => {
+      const { db, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      const switching = mgr.setModel(id, "claude-haiku-4-5");
+      await mgr.stopAll();
+      await switching;
+      expect(exec.starts).toHaveLength(1);
+      expect(stored(db, id)).toBe("claude-haiku-4-5");
+    });
+
+    it("rejects an unknown session instead of persisting anything", async () => {
+      const { db, mgr } = setup();
+      await expect(mgr.setModel("nope", "claude-opus-5")).rejects.toThrow(/unknown session/);
+      expect((db.prepare("SELECT COUNT(*) c FROM sessions").get() as { c: number }).c).toBe(0);
+    });
+
+    it("resumeAll restarts a session on its stored model, so a restart changes nothing", async () => {
+      const db = openDb(":memory:");
+      const { store, mgr } = setup(db);
+      const pinned = mgr.createSession({ cwd: "/tmp", model: "claude-haiku-4-5" });
+      const unpinned = mgr.createSession({ cwd: "/tmp" });
+      await mgr.stopAll();
+
+      // a second manager over the same db simulates a server restart
+      const exec2 = new RecordingExecutor();
+      const mgr2 = new SessionManager(db, store, exec2, ...manager(db));
+      expect(mgr2.resumeAll().sort()).toEqual([pinned, unpinned].sort());
+      const byModel = new Map(exec2.starts.map(o => [o.model ?? "default", o]));
+      expect([...byModel.keys()].sort()).toEqual(["claude-haiku-4-5", "default"]);
+      expect(mgr2.listSessions().find(s => s.id === pinned)!.model).toBe("claude-haiku-4-5");
+      expect(mgr2.listSessions().find(s => s.id === unpinned)!.model).toBeNull();
+    });
+
+    it("reports whatever id is stored, including one this build has never heard of", () => {
+      // Model ids are Anthropic's release schedule, not our schema: an id we do not know about is
+      // a valid choice by an operator with a newer CLI, not a row to sanitise.
+      const { db, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      db.prepare("UPDATE sessions SET model = ? WHERE id = ?").run("claude-something-7", id);
+      expect(mgr.listSessions()[0].model).toBe("claude-something-7");
     });
   });
 
@@ -388,17 +553,21 @@ describe("SessionManager", () => {
     /** A project root with one real room folder, plus a manager wired to it. */
     function withRoom<T>(fn: (ctx: {
       db: ReturnType<typeof openDb>; store: EventStore; exec: RecordingExecutor;
-      rooms: RoomManager; mgr: SessionManager; room: ReturnType<RoomManager["createRoom"]>;
+      rooms: RoomManager; projects: ProjectManager; mgr: SessionManager;
+      room: ReturnType<RoomManager["createRoom"]>;
     }) => T): T {
       const root = mkdtempSync(join(tmpdir(), "superfabric-session-room-"));
       const db = openDb(":memory:");
       try {
         const store = new EventStore(db);
         const exec = new RecordingExecutor();
-        const rooms = new RoomManager(db, root);
+        const { projects, rooms } = factory(db, root);
         rooms.ensureProjectRoom();
         const room = rooms.createRoom("backend");
-        return fn({ db, store, exec, rooms, mgr: new SessionManager(db, store, exec, rooms), room });
+        return fn({
+          db, store, exec, rooms, projects, room,
+          mgr: new SessionManager(db, store, exec, rooms, projects),
+        });
       } finally {
         // The db is in-memory and deliberately left open: a session's providerSessionId lands on a
         // later microtask, and closing underneath it turns a passing test into a stray rejection.
@@ -440,10 +609,10 @@ describe("SessionManager", () => {
     });
 
     it("keeps the room across a restart", () => {
-      withRoom(({ db, store, rooms, mgr, room }) => {
+      withRoom(({ db, store, rooms, projects, mgr, room }) => {
         const id = mgr.createSession({ roomId: room.id });
         const exec2 = new RecordingExecutor();
-        const revived = new SessionManager(db, store, exec2, rooms);
+        const revived = new SessionManager(db, store, exec2, rooms, projects);
         expect(revived.resumeAll()).toEqual([id]);
         expect(exec2.starts[0].cwd).toBe(room.path);
         expect(revived.listSessions().find((s) => s.id === id)!.roomId).toBe(room.id);
@@ -468,6 +637,270 @@ describe("SessionManager", () => {
     });
   });
 
+  // ---- M3a: the factory bus as a per-session tool set ----
+
+  describe("bus tools", () => {
+    /** Records every start(), so a test can assert the tool servers the executor was handed. */
+    class RecordingExecutor implements Executor {
+      readonly name = "recording";
+      readonly starts: ExecutorStartOptions[] = [];
+      start(opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
+        this.starts.push(opts);
+        ev.onEvent({ type: "session_status", status: "idle" });
+        return {
+          providerSessionId: Promise.resolve("claude-session-bus"),
+          send: () => {},
+          interrupt: async () => {},
+          stop: async () => {},
+        };
+      }
+    }
+
+    /** A manager wired to a real bus and task store over two real rooms. */
+    function withBus<T>(fn: (ctx: {
+      db: ReturnType<typeof openDb>; store: EventStore; exec: RecordingExecutor; rooms: RoomManager;
+      projects: ProjectManager; mgr: SessionManager; bus: FactoryBus; tasks: TaskStore;
+      chat: ReturnType<RoomManager["createRoom"]>; payments: ReturnType<RoomManager["createRoom"]>;
+      delivered: { sessionId: string; text: string }[];
+    }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-session-bus-"));
+      const db = openDb(":memory:");
+      try {
+        const store = new EventStore(db);
+        const exec = new RecordingExecutor();
+        const { projects, rooms } = factory(db, root);
+        rooms.ensureProjectRoom();
+        const chat = rooms.createRoom("chat");
+        const payments = rooms.createRoom("payments");
+        const delivered: { sessionId: string; text: string }[] = [];
+        const tasks = new TaskStore(db, projects);
+        const bus = new FactoryBus({
+          db, rooms, projects,
+          deliver: (sessionId, text) => { delivered.push({ sessionId, text }); },
+          roomAgents: () => [],
+        });
+        const mgr = new SessionManager(db, store, exec, rooms, projects, { bus, tasks });
+        return fn({ db, store, exec, rooms, projects, mgr, bus, tasks, chat, payments, delivered });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    /** A tool as the MCP server holds it: what the SDK will actually offer the model. */
+    interface Registered {
+      handler: (args: unknown, extra: unknown) => Promise<unknown>;
+    }
+
+    /**
+     * The tools registered on the in-process MCP server a start() was handed. `_registeredTools` is
+     * the MCP SDK's own private map; reaching into it is the only way to assert what the *server*
+     * carries rather than what our builder returned, which is the point of these cases.
+     */
+    function registeredTools(opts: ExecutorStartOptions): Record<string, Registered> {
+      const server = opts.mcpServers?.factory as { instance?: { _registeredTools?: Record<string, Registered> } };
+      return server?.instance?._registeredTools ?? {};
+    }
+
+    function toolsOf(opts: ExecutorStartOptions): string[] {
+      return Object.keys(registeredTools(opts));
+    }
+
+    it("gives a session in a room the factory MCP server", () => {
+      withBus(({ exec, mgr, chat }) => {
+        mgr.createSession({ roomId: chat.id });
+        const opts = exec.starts[0]!;
+        expect(Object.keys(opts.mcpServers ?? {})).toEqual(["factory"]);
+        expect(toolsOf(opts)).toEqual([
+          "factory_send", "factory_inbox", "factory_task_update", "factory_report_status",
+        ]);
+      });
+    });
+
+    it("gives a roomless session no bus tools: it has no department to speak for", () => {
+      withBus(({ exec, mgr }) => {
+        mgr.createSession({ cwd: tmpdir() });
+        expect(exec.starts[0]!.mcpServers).toEqual({});
+      });
+    });
+
+    it("gives no bus tools at all when the manager was built without a bus", () => {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-session-nobus-"));
+      try {
+        const db = openDb(":memory:");
+        const store = new EventStore(db);
+        const exec = new RecordingExecutor();
+        const { projects, rooms } = factory(db, root);
+        rooms.ensureProjectRoom();
+        const room = rooms.createRoom("chat");
+        // an M0-shaped server: no bus, no task store, and rooms that simply have no tools
+        new SessionManager(db, store, exec, rooms, projects).createSession({ roomId: room.id });
+        expect(exec.starts[0]!.mcpServers).toEqual({});
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("scopes the tool set to the session's own room, not to one an agent could name", async () => {
+      await withBus(async ({ exec, mgr, bus, chat, payments }) => {
+        mgr.createSession({ roomId: chat.id });
+        const send = registeredTools(exec.starts[0]!).factory_send!;
+
+        // the arguments claim to be the payments room; the message must still come from chat
+        await send.handler(
+          { to_room: "payments", kind: "request", body: "who is speaking?", from_room: "payments" },
+          {},
+        );
+        expect(bus.list()[0]).toMatchObject({ fromRoomId: chat.id, toRoomId: payments.id });
+      });
+    });
+
+    it("keeps the tool set across a restart, built from the stored room", () => {
+      withBus(({ db, store, rooms, projects, bus, tasks, mgr, chat }) => {
+        mgr.createSession({ roomId: chat.id });
+        const exec2 = new RecordingExecutor();
+        const mgr2 = new SessionManager(db, store, exec2, rooms, projects, { bus, tasks });
+        expect(mgr2.resumeAll()).toHaveLength(1);
+        expect(Object.keys(exec2.starts[0]!.mcpServers ?? {})).toEqual(["factory"]);
+      });
+    });
+
+    it("rebuilds the tool set when a live session's autonomy is switched", async () => {
+      await withBus(async ({ exec, mgr, chat }) => {
+        const id = mgr.createSession({ roomId: chat.id });
+        await mgr.setAutonomy(id, "bypass");
+        expect(exec.starts).toHaveLength(2);
+        // the restarted executor must still have the bus, or a mode toggle would silently mute an agent
+        expect(Object.keys(exec.starts[1]!.mcpServers ?? {})).toEqual(["factory"]);
+      });
+    });
+
+    /**
+     * The wiring `index.ts` builds: a bus whose `deliver`/`roomAgents` point at the manager, and a
+     * manager that holds the bus. A scripted `FakeExecutor` supplies the turn boundaries, which is
+     * the whole subject of these cases.
+     */
+    function withWiredBus<T>(fn: (ctx: {
+      store: EventStore; exec: FakeExecutor; mgr: SessionManager; bus: FactoryBus;
+      chat: ReturnType<RoomManager["createRoom"]>; payments: ReturnType<RoomManager["createRoom"]>;
+    }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-session-flush-"));
+      const db = openDb(":memory:");
+      try {
+        const store = new EventStore(db);
+        const { projects, rooms } = factory(db, root);
+        rooms.ensureProjectRoom();
+        const chat = rooms.createRoom("chat");
+        const payments = rooms.createRoom("payments");
+        const exec = new FakeExecutor();
+        const tasks = new TaskStore(db, projects);
+        // `mgr` is only read inside the callbacks, which cannot run before it is assigned — the same
+        // knot index.ts unties, and the reason the bus takes callbacks at all.
+        let mgr!: SessionManager;
+        const bus = new FactoryBus({
+          db, rooms, projects,
+          deliver: (sessionId, text) => mgr.prompt(sessionId, text),
+          roomAgents: (roomId) => mgr.roomAgents(roomId),
+        });
+        mgr = new SessionManager(db, store, exec, rooms, projects, { bus, tasks });
+        return fn({ store, exec, mgr, bus, chat, payments });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    it("reports a room's live agents to the bus, and only the live ones", async () => {
+      await withWiredBus(async ({ exec, mgr, chat, payments }) => {
+        const id = mgr.createSession({ roomId: chat.id });
+
+        expect(mgr.roomAgents(chat.id)).toEqual([{ sessionId: id, status: "idle" }]);
+        expect(mgr.roomAgents(payments.id)).toEqual([]);
+
+        mgr.prompt(id, "get to work");
+        expect(mgr.roomAgents(chat.id)).toEqual([{ sessionId: id, status: "working" }]);
+        await exec.settle();
+        expect(mgr.roomAgents(chat.id)).toEqual([{ sessionId: id, status: "idle" }]);
+
+        // a session whose executor is gone cannot carry anything, so it must not be offered
+        await mgr.stopAll();
+        expect(mgr.roomAgents(chat.id)).toEqual([]);
+      });
+    });
+
+    it("delivers a message queued for a busy room at that room's next turn boundary", async () => {
+      await withWiredBus(async ({ store, exec, mgr, bus, chat, payments }) => {
+        const id = mgr.createSession({ roomId: payments.id });
+
+        mgr.prompt(id, "get to work");
+        const queued = bus.send({
+          fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "Please expose a webhook",
+        });
+        // mid-turn: persisted, not injected
+        expect(queued.deliveredAt).toBeNull();
+
+        await exec.settle();
+        expect(bus.get(queued.id)!.deliveredAt).not.toBeNull();
+        // the injected turn is queued into the executor by the flush, so it runs one turn later
+        await exec.settle();
+        const prompts = store.listAfter(id, 0)
+          .map((e) => e.event)
+          .filter((e): e is Extract<SessionEvent, { type: "user_prompt" }> => e.type === "user_prompt");
+        expect(prompts.some((p) => p.text.includes("Please expose a webhook"))).toBe(true);
+        expect(prompts.some((p) => p.text.includes("chat"))).toBe(true);
+      });
+    });
+
+    it("does not deliver the same message again at the next turn boundary", async () => {
+      await withWiredBus(async ({ store, exec, mgr, bus, chat, payments }) => {
+        const id = mgr.createSession({ roomId: payments.id });
+
+        mgr.prompt(id, "get to work");
+        bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "exactly once" });
+        await exec.settle();
+        await exec.settle();
+        mgr.prompt(id, "another turn");
+        await exec.settle();
+        await exec.settle();
+
+        const carried = store.listAfter(id, 0)
+          .map((e) => e.event)
+          .filter((e) => e.type === "user_prompt" && e.text.includes("exactly once"));
+        expect(carried).toHaveLength(1);
+      });
+    });
+
+    it("does not flush anything for a roomless session's turn boundary", async () => {
+      await withWiredBus(async ({ store, exec, mgr, bus, chat, payments }) => {
+        // an agent standing in payments, but busy, so the message stays queued
+        const busyAgent = mgr.createSession({ roomId: payments.id });
+        mgr.prompt(busyAgent, "busy");
+        bus.send({ fromRoomId: chat.id, toRoomId: payments.id, kind: "request", body: "for payments only" });
+
+        const roomless = mgr.createSession({ cwd: tmpdir() });
+        mgr.prompt(roomless, "hello");
+        await exec.settle();
+
+        // the roomless session's boundary must not have carried payments' mail
+        const gotIt = store.listAfter(roomless, 0)
+          .map((e) => e.event)
+          .some((e) => e.type === "user_prompt" && e.text.includes("for payments only"));
+        expect(gotIt).toBe(false);
+      });
+    });
+
+    it("factory_report_status lands in the session's own log", async () => {
+      await withBus(async ({ exec, mgr, store, chat }) => {
+        const id = mgr.createSession({ roomId: chat.id });
+        await registeredTools(exec.starts[0]!).factory_report_status!
+          .handler({ summary: "reading the charter" }, {});
+
+        const reported = store.listAfter(id, 0)
+          .map((e) => e.event)
+          .find((e) => e.type === "session_status" && e.detail === "reading the charter");
+        expect(reported).toBeTruthy();
+      });
+    });
+  });
+
   // ---- M1a: the derived status and blocked flag the 3D floor reads off listSessions() ----
 
   describe("derived status", () => {
@@ -487,7 +920,7 @@ describe("SessionManager", () => {
     function silent() {
       const db = openDb(":memory:");
       const store = new EventStore(db);
-      const mgr = new SessionManager(db, store, new SilentExecutor(), new RoomManager(db, tmpdir()));
+      const mgr = new SessionManager(db, store, new SilentExecutor(), ...manager(db));
       return { db, store, mgr };
     }
 
@@ -622,7 +1055,7 @@ describe("SessionManager", () => {
       }
       const db = openDb(":memory:");
       const store = new EventStore(db);
-      const mgr = new SessionManager(db, store, new HangingExecutor(), new RoomManager(db, tmpdir()));
+      const mgr = new SessionManager(db, store, new HangingExecutor(), ...manager(db));
       const id = mgr.createSession({ cwd: "/tmp" });
 
       const start = Date.now();
@@ -636,6 +1069,81 @@ describe("SessionManager", () => {
       mgr.createSession({ cwd: "/tmp" });
       await mgr.stopAll();
       await expect(mgr.stopAll()).resolves.toBeUndefined();
+    });
+  });
+
+  // ---- M1b: agents belong to a factory ----
+
+  describe("projects", () => {
+    /** Two factories over one db, each with a room called "backend". */
+    function twoFactories<T>(fn: (ctx: {
+      mgr: SessionManager;
+      rooms: RoomManager;
+      home: string;
+      away: string;
+      homeRoom: ReturnType<RoomManager["createRoom"]>;
+      awayRoom: ReturnType<RoomManager["createRoom"]>;
+    }) => T): T {
+      const homeRoot = mkdtempSync(join(tmpdir(), "superfabric-session-home-"));
+      const awayRoot = mkdtempSync(join(tmpdir(), "superfabric-session-away-"));
+      const db = openDb(":memory:");
+      try {
+        const store = new EventStore(db);
+        const { projects, rooms } = factory(db, homeRoot);
+        const home = projects.defaultProject().id;
+        const away = projects.create({ root: awayRoot }).id;
+        rooms.ensureProjectRoom(home);
+        rooms.ensureProjectRoom(away);
+        return fn({
+          mgr: new SessionManager(db, store, new FakeExecutor(), rooms, projects),
+          rooms, home, away,
+          homeRoom: rooms.createRoom("backend", { projectId: home }),
+          awayRoom: rooms.createRoom("backend", { projectId: away }),
+        });
+      } finally {
+        rmSync(homeRoot, { recursive: true, force: true });
+        rmSync(awayRoot, { recursive: true, force: true });
+      }
+    }
+
+    it("lists only one factory's agents", () => {
+      twoFactories(({ mgr, home, away, homeRoom, awayRoom }) => {
+        const here = mgr.createSession({ roomId: homeRoom.id });
+        const there = mgr.createSession({ roomId: awayRoom.id });
+        // and a roomless agent, which still belongs to whichever floor created it
+        const loose = mgr.createSession({ cwd: homeRoom.path, projectId: away });
+
+        expect(mgr.listSessions(home).map((s) => s.id)).toEqual([here]);
+        expect(mgr.listSessions(away).map((s) => s.id).sort()).toEqual([there, loose].sort());
+      });
+    });
+
+    it("takes the project from the room, and refuses a room on another floor", () => {
+      twoFactories(({ mgr, home, away, homeRoom, awayRoom }) => {
+        // No project named: the room decides, so an agent can never end up on a floor its own
+        // building does not stand on.
+        mgr.createSession({ roomId: awayRoom.id });
+        expect(mgr.listSessions(away)).toHaveLength(1);
+        expect(mgr.listSessions(home)).toHaveLength(0);
+
+        // Both named and disagreeing: refused rather than silently believing one of them.
+        expect(() => mgr.createSession({ roomId: awayRoom.id, projectId: home }))
+          .toThrow(/belongs to another project/);
+        expect(() => mgr.createSession({ roomId: homeRoom.id, projectId: away }))
+          .toThrow(/belongs to another project/);
+        expect(mgr.listSessions(away)).toHaveLength(1);
+        expect(mgr.listSessions(home)).toHaveLength(0);
+      });
+    });
+
+    it("reports a room's agents from that room alone, not from a same-named room elsewhere", () => {
+      twoFactories(({ mgr, homeRoom, awayRoom }) => {
+        const here = mgr.createSession({ roomId: homeRoom.id });
+        mgr.createSession({ roomId: awayRoom.id });
+        // The bus asks this at every turn boundary; a room id is unique, so the answer must be too.
+        expect(mgr.roomAgents(homeRoom.id).map((a) => a.sessionId)).toEqual([here]);
+        expect(mgr.roomAgents(awayRoom.id).map((a) => a.sessionId)).not.toContain(here);
+      });
     });
   });
 });

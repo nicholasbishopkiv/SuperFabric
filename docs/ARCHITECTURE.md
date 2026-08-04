@@ -48,15 +48,32 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   Source of truth for the UI; the WebSocket is a lossy tail. Client reconnect sends
   `{sessionId, afterSeq}` and replays. (Pattern proven by Vibe Kanban's MsgStore and
   Crystal's SQLite buffering.)
-- **Factory Bus** — inter-room messaging. Implemented as **in-process MCP servers**
-  (`createSdkMcpServer`) injected into every session with tools:
-  `factory_send(to_room, kind, body)`, `factory_inbox()`, `factory_report_status(...)`,
-  `factory_ask_orchestrator(...)`, `factory_task_update(...)`. Messages persist in SQLite
-  (`messages` table). **Delivery is push**: when a message targets an idle agent, the
-  server injects a turn into that agent's input stream; busy agents get it queued and
-  delivered at next turn boundary. No polling loops burning tokens.
-- **TaskStore** — `tasks(id, room, title, status, assignee, blocked_on, ...)`. Agents
-  mutate via bus tools; UI renders board + canvas badges.
+- **Factory Bus** (`src/factoryBus.ts`, built in M3a) — inter-room messaging. Messages persist in
+  SQLite (`messages`, migration 4) **before** anything is delivered, so a message survives a crash
+  mid-delivery. **Delivery is push**: a message for an available agent is injected as a turn
+  immediately; one for a busy agent waits until `SessionManager` calls `flushRoom` at that room's
+  next `turn_complete`. No polling loops burning tokens. One message drains per boundary, so a
+  queue of N takes N boundaries. The bus knows nothing about `SessionManager` — it takes a
+  `deliver(sessionId, text)` callback and a `roomAgents(roomId)` lookup, which keeps the
+  dependency one-way and the delivery rules unit-testable without a session runner.
+  - The tool surface is separate (`src/busTools.ts`): an **in-process MCP server**
+    (`createSdkMcpServer`) built **per session from that session's room** and passed through
+    `ExecutorStartOptions.mcpServers`. Tools: `factory_send(to_room, kind, body, task_id?)`,
+    `factory_inbox()`, `factory_task_update(task_id, status?, detail?)`,
+    `factory_report_status(summary)`. `factory_ask_orchestrator` arrives with the orchestrator
+    (M3b). The model sees them namespaced as `mcp__factory__*`.
+  - **The sending room is never read from tool input** — it comes from the session row, so an
+    agent cannot send a message *as* another department. A roomless session gets no bus tools.
+  - These tools are **not gated**: `canUseTool` allows anything belonging to this session's own
+    in-process servers without asking the operator, and records the call as a `tool_use` event.
+    Everything else still raises a card. See `docs/decisions/0002-factory-tools-are-not-gated.md`.
+- **TaskStore** (`src/taskStore.ts`) — `tasks(id, title, detail, status, room_id, agent_id,
+  blocked_on_message_id, …)`, migration 4. Refuses a card that would lie: an unknown room, or an
+  assignee who does not work in the task's room. Agents mutate it through the bus tools and the
+  operator through `create_task`/`update_task`; either way the store announces its own changes and
+  the hub broadcasts the board, because most changes never pass through the hub. The UI renders a
+  bottom-edge board plus per-room badges. A task with no room is **unassigned**, which is the
+  intended state until the orchestrator (M3b) can route it.
 - **LimitMonitor** — per account: polls `GET https://api.anthropic.com/api/oauth/usage`
   (bearer from that account's `.credentials.json`, `anthropic-beta: oauth-2025-04-20`,
   claude-code User-Agent, ~180s interval). Reads `five_hour`, `seven_day`,
@@ -120,10 +137,17 @@ Two layers, by explicit product decision — the factory must *look like a facto
   (`CatmullRomCurve3` splines) with package meshes animating along them when messages
   flow. Agent status renders on the buildings (lights/smoke/badges); later milestones
   add small animated agent characters (glTF + AnimationMixer) working inside rooms.
-  Camera: orthographic isometric with `MapControls` (pan/zoom). Perf discipline:
+  Camera: orthographic, opening on an isometric view, with `MapControls` — pan, zoom
+  (2…400), orbit and tilt, the tilt clamped just above the horizon so the camera can
+  never go under the floor. Perf discipline:
   instanced meshes for packages, zustand per-object selectors (never re-render the
   scene tree on a status tick), frameloop="demand" when idle.
-- **2D overlay (DOM)** — plain React above the canvas: **task panel** (manual task
+- **2D overlay (DOM)** — React above the canvas, on Tailwind v4 and Radix primitives vendored into
+  `packages/web/src/ui/` (see `docs/decisions/0003-ui-library.md`). Dark, translucent and blurred,
+  because it floats over a live floor; each of the three edge panels is the same collapsible shell
+  (`hud/Panel.tsx`) and reports its own size into `hudInsets`, which is what the camera frames into.
+  Semantic colour is not the overlay's to invent: `hud/tokens.ts` publishes `scene/palette.ts` as
+  CSS variables, so a panel and a beacon cannot disagree. Surfaces: **task panel** (manual task
   entry; leaving "department" empty routes the task to the orchestrator, which
   analyzes it, picks the room and assignee, and dispatches it), limit meters (per
   account: 5h + weekly + per-model, reset timers), approval cards, agent chat drawer,
@@ -151,14 +175,19 @@ turned out to be different problems, and the second one is easy to lose one comm
    a ground ring and a label border. Repainting it destroys the information it was selected to read.
 4. **The frameloop gate is absolute.** `hasMotion` (any working agent, any package in flight, any
    drag) is the only thing that may put the canvas on `"always"`. Anything decorative must either
-   be gated by it or need no frames at all — which is why the beacons' glow is a quad at a
-   *constant* orientation (the camera cannot rotate) rather than a `<Billboard>`, and why soft
-   shadows are a shadow-map property rather than a per-frame pass.
+   be gated by it or need no frames at all — which is why the beacons' glow is a `THREE.Sprite`
+   (billboarded by the renderer, correct at every camera angle, zero per-frame JavaScript) rather
+   than a `<Billboard>`, and why soft shadows are a shadow-map property rather than a per-frame
+   pass. Camera input is the one thing outside `hasMotion` that needs frames, and it asks for them
+   itself: the controls' `change` event calls `invalidate()`, one frame per change.
 
 The camera frames the floor itself (`isoFraming`: the screen-space bounding box of every building,
 fitted into the rectangle the HUD panels leave uncovered, whose widths the panels report into the
-store) and **stops the first time the operator pans or zooms**. The `fit` control (and `f`) is the
-one documented way to hand it back.
+store) and **stops the first time the operator touches the camera** — pan, zoom, orbit or tilt. The
+`fit` control (and `f`) is the one documented way to hand it back, and it restores the opening
+*orientation* as well as the framing: `isoFraming` solves the fit for the default isometric angle,
+so fitting is deliberately "put the floor plan back" rather than "keep my angle". The ground plane
+and the slab are sized for the widest zoom, so the edge of the world is never the thing on screen.
 
 ### 2.3 Shared (`packages/shared`)
 Protocol types: WS envelopes, event payloads, bus message schema, task schema. Zod.
@@ -173,15 +202,57 @@ Protocol types: WS envelopes, event payloads, bus message schema, task schema. Z
   PidsLimit` caps, `--dangerously-skip-permissions` becomes safe inside the sandbox.
   Runner speaks WS back to the server (same event protocol).
 
+### 2.5 Projects, room folders and attachments (M1b)
+
+- **ProjectManager** — a `projects` table (`id`, `name`, `root`, `last_opened_at`) and a
+  `project_id` on rooms, sessions, tasks and messages. One SuperFabric serves many
+  factories; switching is a client-side scope change plus a re-scoped set of broadcasts,
+  not a server restart. `SUPERFABRIC_PROJECT` seeds the first project and stops being the
+  only one that can exist. Everything the operator sees — floor, board, chronicle — is
+  filtered by the active project.
+- **Room folders are settable.** A room still defaults to `<project>/<name>/`, but its
+  `path` may point anywhere, so a department can live in a separate repository. The
+  containment check that protects the default case does not apply to an explicitly chosen
+  folder; adopting one never overwrites an existing `CLAUDE.md`.
+- **AttachmentStore** — files arrive from the browser by paste, drop or upload and are
+  written into `<project or room folder>/attachments/`. **The agent is given the path, never
+  the bytes**: an attachment becomes a line in the injected turn (`Attached file: <absolute
+  path>`) pointing at a file on disk, which is what an agent with file tools actually wants
+  and what keeps the event log small. Clipboard images get a generated name
+  (`pasted-<timestamp>.<ext>`) with a real extension taken from the declared MIME type.
+  Details that are decisions, not implementation:
+  - **Transport is `POST /attachments`, not the WebSocket.** The socket's protocol is JSON
+    and its `maxPayload` is deliberately 1 MiB, so binary there would mean base64 in one
+    giant frame. Fastify is already listening on the same port.
+  - **The endpoint is gated exactly as hard as the WebSocket handshake**: the same
+    `origin.ts` allow-list (403 on a disallowed browser `Origin`, checked in `onRequest`
+    before the body is read), a 25 MB per-file cap enforced three times (`content-length`,
+    the streaming multipart limit, the real byte count), an untrusted filename folded to one
+    safe path segment, the resolved path re-checked against the destination root, and no
+    overwriting ever — a taken name is uniquified (`shot-2.png`).
+  - **Containment is against the room's own root.** A room folder may live outside the
+    project root, so there is no single directory to validate against; each write is checked
+    against the root it is going into.
+  - **Multipart is parsed by `@fastify/multipart`**, not by Bun's own `Request.formData()`:
+    Bun's discards each part's `Content-Type` and re-derives it from the filename extension,
+    which is exactly backwards for a clipboard image (no filename, type is all there is).
+- **`notice` on the wire.** The protocol had one channel for talking to the operator —
+  `error` — so every "this worked, here is what happened" either travelled on it (a
+  successful `set_room_path` once did, painted red) or was guessed at by the UI. A
+  `notice {message}` server message now carries both that and "attachment saved to `<path>`".
+  Not persisted: it is a fact about the request that just completed, not an event in a log.
+
 ## 3. Filesystem contract
 
 ```
 <project-root>/
   CLAUDE.md                  # project-wide context (Onboarder creates if missing)
   .fabrica/                  # factory state: fabrica.db (SQLite), layout.json, accounts.json (no secrets)
+  attachments/               # files the operator pasted, dropped or uploaded at the project
   backend/                   # a room
     CLAUDE.md                # room charter: responsibility, interfaces, conventions
     .claude/agents/*.md      # room subagents, skills
+    attachments/             # …or at this room, when it was the selected one
     ...code...
   frontend/ ...
 ```
@@ -191,11 +262,14 @@ room folder and `--add-dir` for explicitly shared paths.
 
 ## 4. Key flows
 
-**Inter-room request**: chat-agent calls `factory_send("payments", "request", "need
-webhook X for push notifications")` → row in `messages` → server injects turn into
-payments-agent input → payments agent works, replies `factory_send("chat", "response",
-...)` → a package mesh travels the conveyor chat→payments→chat, task panel links the
-two tasks.
+**Inter-room request** (built and run live in M3a): chat-agent calls
+`factory_send("payments", "request", "need webhook X for push notifications")` → row in
+`messages` → server injects the turn into the payments agent's input (immediately if it is free,
+otherwise at its next turn boundary) → payments agent works and replies
+`factory_send("chat", "response", ...)` → each delivery is broadcast and the web store turns it
+into a package mesh travelling the conveyor, keyed by the message id; an undelivered message is
+drawn instead as a still crate stacked at the sender's door. A `request` naming a `task_id` sets
+that task `blocked` on the message and a `response` releases it.
 
 **Manual task with auto-routing**: user adds a task in the task panel without picking a
 room → server injects it into the orchestrator session → orchestrator analyzes it, calls

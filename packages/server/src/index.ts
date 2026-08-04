@@ -2,10 +2,14 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import Fastify from "fastify";
 import { WebSocketServer, type WebSocket } from "ws";
+import { registerAttachmentRoutes } from "./attachmentRoutes.js";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
+import { FactoryBus } from "./factoryBus.js";
+import { ProjectManager } from "./projectManager.js";
 import { RoomManager } from "./roomManager.js";
 import { SessionManager } from "./sessionManager.js";
+import { TaskStore } from "./taskStore.js";
 import { ClaudeCodeExecutor } from "./executors/claudeCode.js";
 import { isOriginAllowed } from "./origin.js";
 import { WsHub } from "./wsHub.js";
@@ -13,29 +17,67 @@ import { WsHub } from "./wsHub.js";
 const dataDir = process.env.SUPERFABRIC_DATA ?? path.join(process.cwd(), ".fabrica");
 mkdirSync(dataDir, { recursive: true });
 
-// The project the factory runs on: rooms are folders under this root, and the central building
-// stands for the root itself.
+// The project the server boots on: the first factory floor, and the fallback scope for anything that
+// does not name a project. It is no longer the only project there can be — the operator adds and
+// switches between them from the UI, and each is its own floor with its own rooms, agents and board.
 const projectRoot = path.resolve(process.env.SUPERFABRIC_PROJECT ?? process.cwd());
 
 const db = openDb(path.join(dataDir, "fabrica.db"));
 const store = new EventStore(db);
-const rooms = new RoomManager(db, projectRoot);
-const mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms);
-const hub = new WsHub(store, mgr, rooms);
+const projects = new ProjectManager(db, projectRoot);
+const rooms = new RoomManager(db, projects);
+const tasks = new TaskStore(db, projects);
+// The bus and the session runner need each other: the bus delivers *through* the runner, and the
+// runner hands every agent the bus as tools and flushes the bus at each turn boundary. The bus takes
+// callbacks rather than the runner itself, so the dependency stays one-way in the module graph — and
+// the callbacks are only ever invoked after `mgr` exists.
+let mgr!: SessionManager;
+const bus = new FactoryBus({
+  db,
+  rooms,
+  projects,
+  deliver: (sessionId, text) => mgr.prompt(sessionId, text),
+  roomAgents: (roomId) => mgr.roomAgents(roomId),
+});
+mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, { bus, tasks });
+const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus });
 
-const projectRoom = rooms.ensureProjectRoom();
-console.log(`project root: ${projectRoot} (project room "${projectRoom.name}", ${rooms.listRooms().length - 1} room(s))`);
+const bootProject = projects.defaultProject();
+// Every project needs its central building, including one that existed before this boot.
+for (const project of projects.list()) rooms.ensureProjectRoom(project.id);
+const projectRoom = rooms.ensureProjectRoom(bootProject.id);
+console.log(
+  `project root: ${projectRoot} (project room "${projectRoom.name}", `
+  + `${rooms.listRooms(bootProject.id).length - 1} room(s), ${projects.list().length} project(s))`,
+);
 
 const resumed = mgr.resumeAll();
 if (resumed.length > 0) console.log(`resumed sessions: ${resumed.join(", ")}`);
 else console.log("no sessions to resume");
 
-const app = Fastify();
-app.get("/healthz", async () => ({ ok: true }));
+// A message that was queued when the server went down is still queued now — that is the whole point
+// of persisting before delivering. Flush every room so a resumed agent gets its mail without the
+// operator having to prompt it first; delivery is idempotent, so a room with an empty queue costs
+// nothing, and a room with nobody available simply keeps waiting.
+const carried = projects.list().flatMap((p) => rooms.listRooms(p.id)).flatMap((r) => bus.flushRoom(r.id));
+if (carried.length > 0) console.log(`delivered ${carried.length} message(s) queued before the restart`);
 
 const port = Number(process.env.PORT ?? 4620);
 const host = "127.0.0.1";
 const wsPath = "/ws";
+
+const app = Fastify();
+app.get("/healthz", async () => ({ ok: true }));
+
+// Files in, paths out. The only endpoint that takes bytes, and it is gated by the same origin
+// allow-list as the WebSocket handshake — see attachmentRoutes.ts for why it is HTTP at all.
+registerAttachmentRoutes(app, {
+  projects,
+  rooms,
+  port,
+  allowedOrigins: process.env.SUPERFABRIC_ALLOWED_ORIGINS,
+  notify: (projectId, message) => hub.noticeProject(projectId, message),
+});
 
 await app.listen({ port, host });
 

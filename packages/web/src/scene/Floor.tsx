@@ -10,10 +10,14 @@ import { FLOOR } from "./palette";
  * diagram: nothing said where the factory ended, so the buildings looked like markers on graph paper
  * rather than plant standing in a building. What is here instead:
  *
- * - a **bounded poured slab**, warm-neutral concrete, thick enough to show a lip where it is
- *   edge-on. Its size is derived from the buildings (`slabHalf`), so the factory is always inside
- *   its own shell however many rings of rooms it grows;
- * - **darker, cooler ground** outside it, so the slab reads as a floor and not as the world;
+ * - a **poured slab**, warm-neutral concrete, thick enough to show a lip where it is edge-on. Its
+ *   size is derived from the buildings (`slabHalf`) with an apron that grows with the factory, so
+ *   the plant is always inside its own shell however many rings of rooms it grows — and the kerb is
+ *   always well outside the frame at the reading distance, so the edge is something you go looking
+ *   for rather than the first thing you see;
+ * - **darker, cooler ground** outside it, `FLOOR_SIZE` across, which at the widest zoom the controls
+ *   allow still runs past the horizon in every direction: the world does not end where the concrete
+ *   does;
  * - **painted markings**: a hazard line inset from the kerb, and a zone circle under each ring that
  *   has buildings on it — the paint describes the layout rather than decorating it;
  * - a **kerb** all the way round with steel stanchions at the corners, which is the thing at the
@@ -103,7 +107,7 @@ export function Floor() {
       })}
 
       {/* Steel stanchions: one at each corner and one at the middle of each run, tall enough to
-          register from the fixed camera angle without competing with a building. */}
+          register from a plan view without competing with a building. */}
       {stanchionSpots(half).map(([x, z], i) => (
         <group key={i} position={[x, 0, z]}>
           <mesh castShadow position-y={1.2}>

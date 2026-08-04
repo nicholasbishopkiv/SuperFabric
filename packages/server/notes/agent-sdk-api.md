@@ -594,6 +594,54 @@ it is one variant of the `McpServerConfig` union (`type: 'sdk'` + `instance: Mcp
 Tool calls through an in-process server are bounded by `MCP_TOOL_TIMEOUT` (env var, ms; "effectively
 unbounded by default").
 
+### In-process MCP, verified in practice (M3a, `src/busTools.ts`)
+
+Everything below was re-checked against the pinned 0.3.220 `.d.ts` **and** exercised at runtime
+under `bun test` while building the factory bus's tool set. It is the part of the SDK the plan
+called its biggest risk, so it is written down rather than re-derived.
+
+- **Which resolution is ours.** `packages/server/node_modules/@anthropic-ai/claude-agent-sdk`
+  symlinks to the **`zod@4.4.3`** variant in `node_modules/.pnpm` (a `zod@3.25.76` variant of the
+  same version also exists in the store — do not read that one's types by mistake). The workspace's
+  own `zod` is 4.x, and `AnyZodRawShape = ZodRawShape | ZodRawShape_2` (zod 3 *or* zod 4 raw shapes),
+  so plain `import { z } from "zod"` shapes type-check and work.
+- **`tool()` is a plain object factory.** It returns
+  `{ name, description, inputSchema, handler, annotations?, _meta? }` and does no validation and no
+  schema conversion. `searchHint`/`alwaysLoad` in `_extras` become `_meta['anthropic/searchHint']`
+  and `_meta['anthropic/alwaysLoad']`.
+- **`createSdkMcpServer()` returns `{ type: 'sdk', name, instance }`** where `instance` is an
+  `McpServer` from `@modelcontextprotocol/sdk` (v1.30.0 here) with every tool already
+  `registerTool`'d. `alwaysLoad: true` at the server level ORs into each tool's `_meta`. Tools are
+  reachable in tests via the MCP SDK's private `instance._registeredTools` map, whose entries carry
+  `handler` (**not** `callback` — `callback` is only a field of `RegisteredTool.update()`'s argument).
+- **Input schema is a zod raw shape, not a zod object and not JSON Schema.** Pass
+  `{ to_room: z.string(), kind: z.enum([...]) }`, never `z.object({...})`. `.describe()` on each field
+  is what the model reads; the SDK explicitly copies a field's `description` across into the
+  registered tool.
+- **Validation happens in the MCP layer, above the handler.** `registerTool` validates the incoming
+  arguments against `inputSchema` before the handler runs, so a handler called *directly* (from a
+  test, or from any in-process caller) gets whatever it was handed. If the handler is meant to be
+  callable directly, re-validate inside it — `busTools` does, with `z.object(shape).parse(raw)`, which
+  additionally strips undeclared fields.
+- **Handler return type.** `CallToolResult` is `{ content: [...], isError?: boolean, _meta?, ... }`
+  and is an **open** object type (it carries an index signature), so a hand-written interface for it
+  must include `[extra: string]: unknown` or it will not be assignable. `CallToolResult` itself lives
+  in `@modelcontextprotocol/sdk/types.js` — a transitive dependency, not one we declare, so state the
+  shape structurally instead of importing it.
+- **A throwing handler is invisible to the agent.** Return
+  `{ content: [{ type: "text", text }], isError: true }` instead: the model can read that and correct
+  itself.
+- **Tool names the model sees are namespaced**: `mcp__<serverName>__<toolName>`, e.g.
+  `mcp__factory__factory_send` for server `factory` and tool `factory_send`. Anything that names
+  tools (a room charter, an `allowedTools` entry, a `disallowedTools` entry) must use the full
+  namespaced form.
+- **`Options.mcpServers` is the exact field**, `Record<string, McpServerConfig>`; the `sdk` variant
+  must be passed **by reference** (it holds a live `McpServer`). Our executor omits the field entirely
+  when the record is empty, so a roomless session does not tell the CLI it has MCP servers.
+- **`Query.setMcpServers()` / `toggleMcpServer()` / `reconnectMcpServer()`** exist for changing
+  servers on a live query, but only in streaming-input mode. We do not use them: the tool set is
+  per-session and baked in at `query()` time, and an autonomy switch already restarts the executor.
+
 ---
 
 ## Implications for our ClaudeCodeExecutor

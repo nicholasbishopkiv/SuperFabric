@@ -5,7 +5,10 @@ import {
   agentSlots,
   beaconHeight,
   buildingSize,
+  CAMERA_FAR,
+  CAMERA_NEAR,
   draggedPosition,
+  FLOOR_SIZE,
   grabOffset,
   ISO_CAMERA_POSITION,
   ISO_ZOOM,
@@ -14,12 +17,18 @@ import {
   isoCameraTarget,
   isoFloorDelta,
   isoFraming,
+  isoPolarAngle,
   isoProject,
   labelHeight,
   loadingBays,
+  MAX_POLAR_ANGLE,
+  MIN_POLAR_ANGLE,
   PROJECT_ROOF_HEIGHT,
   ringPosition,
   roofTop,
+  SLAB_APRON_RATIO,
+  SLAB_MIN_HALF,
+  slabHalf,
 } from "../src/scene/layout";
 import {
   ACCENT_HUE_MAX,
@@ -34,8 +43,14 @@ import {
   STATUS_COLOR,
   STATUS_EMISSIVE,
   STATUS_HUE_BANDS,
+  WAITING_PACKAGE_COLOR,
 } from "../src/scene/palette";
-import { wallDistance } from "../src/scene/conveyorPath";
+import {
+  wallDistance,
+  waitingSlot,
+  waitingStackIndices,
+  WAITING_STACK_MAX,
+} from "../src/scene/conveyorPath";
 
 /**
  * jsdom has no WebGL, so a `<Canvas>` can never be mounted here. What is testable is every piece of
@@ -188,8 +203,8 @@ describe("isoFraming", () => {
   });
 
   it("never zooms in past the designed reading distance", () => {
-    // one small building could technically be fitted at zoom 90; a factory with room to grow is
-    // the truthful picture
+    // one small building could technically be fitted at the maximum zoom; a factory with room to
+    // grow is the truthful picture
     expect(isoFraming(floor(0), 1440, 900).zoom).toBe(ISO_ZOOM);
     expect(isoFraming(floor(1), 1440, 900).zoom).toBeLessThanOrEqual(ISO_ZOOM);
   });
@@ -244,17 +259,145 @@ describe("isoFraming", () => {
   it("keeps the target on the floor plane", () => {
     expect(isoFraming(floor(5), 1440, 900, 320, 560).target[1]).toBe(0);
   });
+
+  it("keeps every building clear of the task board along the bottom edge", () => {
+    const rooms = floor(8);
+    const bottom = 260;
+    const f = isoFraming(rooms, 1440, 900, 320, 560, bottom);
+    for (const [px, py] of cornersPx(rooms, f)) {
+      // canvas y measured from the top, from a canvas-centre-relative offset (screen +y is up)
+      const y = 900 / 2 - py;
+      expect(y).toBeGreaterThanOrEqual(0);
+      expect(y).toBeLessThanOrEqual(900 - bottom);
+      expect(Math.abs(px)).toBeLessThanOrEqual(1440 / 2);
+    }
+  });
+
+  it("lifts the view when the board opens instead of leaving the factory behind it", () => {
+    const rooms = floor(6);
+    const closed = isoFraming(rooms, 1440, 900, 320, 560);
+    const open = isoFraming(rooms, 1440, 900, 320, 560, 260);
+    // The uncovered strip's centre is higher up the screen, so the factory has to move up with it.
+    expect(isoProject(open.target[0], 0, open.target[2])[1])
+      .toBeLessThan(isoProject(closed.target[0], 0, closed.target[2])[1]);
+    // …and there is less room, so it also pulls back.
+    expect(open.zoom).toBeLessThanOrEqual(closed.zoom);
+  });
+
+  it("survives a board taller than the viewport", () => {
+    const f = isoFraming(floor(6), 600, 400, 0, 0, 900);
+    expect(Number.isFinite(f.zoom)).toBe(true);
+    expect(f.zoom).toBeGreaterThanOrEqual(ISO_ZOOM_MIN);
+  });
 });
 
 describe("camera contract", () => {
-  it("is the isometric orthographic setup the plan specifies", () => {
+  it("opens on the isometric orthographic view the plan specifies", () => {
     expect(ISO_CAMERA_POSITION).toEqual([24, 20, 24]);
     expect(ISO_ZOOM).toBe(38);
-    expect([ISO_ZOOM_MIN, ISO_ZOOM_MAX]).toEqual([12, 90]);
-    // equal x and z is what makes the view read as isometric rather than as an arbitrary angle
+    // equal x and z is what makes the opening view read as isometric rather than as an arbitrary
+    // angle — and it is what `fit` restores, so it is still a fixed point of the scene
     expect(ISO_CAMERA_POSITION[0]).toBe(ISO_CAMERA_POSITION[2]);
     expect(ISO_ZOOM).toBeGreaterThan(ISO_ZOOM_MIN);
     expect(ISO_ZOOM).toBeLessThan(ISO_ZOOM_MAX);
+  });
+
+  it("lets the operator get very close and very far", () => {
+    expect([ISO_ZOOM_MIN, ISO_ZOOM_MAX]).toEqual([2, 400]);
+    // At the near end an agent figure (~1.2 world units tall, see `Agents`) has to be inspectable,
+    // not a speck: 400 px/unit makes it most of a laptop's screen height.
+    expect(1.2 * ISO_ZOOM_MAX).toBeGreaterThan(300);
+  });
+
+  it("shows a whole 25-room factory at the widest zoom", () => {
+    const rooms = [
+      { position: { x: 0, z: 0 }, kind: "project" as const },
+      ...Array.from({ length: 25 }, (_, i) => ({ position: ringPosition(i), kind: "room" as const })),
+    ];
+    let spanX = 0;
+    let spanY = 0;
+    for (const r of rooms) {
+      const half = buildingSize(r.kind).width / 2;
+      for (const dx of [-half, half]) {
+        for (const dz of [-half, half]) {
+          const [sx, sy] = isoProject(r.position.x + dx, labelHeight(r.kind), r.position.z + dz);
+          spanX = Math.max(spanX, Math.abs(sx) * 2);
+          spanY = Math.max(spanY, Math.abs(sy) * 2);
+        }
+      }
+    }
+    // …with room to spare in a small window, even before the fit's own margins.
+    expect(spanX * ISO_ZOOM_MIN).toBeLessThan(1280);
+    expect(spanY * ISO_ZOOM_MIN).toBeLessThan(720);
+  });
+
+  it("never lets the orbit go under the floor", () => {
+    expect(MIN_POLAR_ANGLE).toBeGreaterThanOrEqual(0);
+    // Strictly above the horizon: at exactly PI / 2 the camera is in the ground plane, past it the
+    // operator is looking at the underside of the factory.
+    expect(MAX_POLAR_ANGLE).toBeLessThan(Math.PI / 2);
+    // …but only just: the point of the clamp is to keep the floor solid, not to forbid a low angle.
+    expect(MAX_POLAR_ANGLE).toBeGreaterThan(Math.PI / 2 - 0.1);
+  });
+
+  it("keeps the default view inside the orbit limits it will be dragged from", () => {
+    const polar = isoPolarAngle();
+    expect(polar).toBeGreaterThan(MIN_POLAR_ANGLE);
+    expect(polar).toBeLessThan(MAX_POLAR_ANGLE);
+  });
+
+  it("draws a ground plane far bigger than the widest view of it", () => {
+    // 1440 px at the widest zoom is 720 world units across; the ground has to outrun that from
+    // wherever the operator has panned to, or the edge of the world becomes scenery.
+    expect(FLOOR_SIZE).toBeGreaterThan((1440 / ISO_ZOOM_MIN) * 4);
+  });
+
+  it("has a frustum deep enough for that ground plane seen edge-on", () => {
+    // Half the ground's diagonal is the furthest a visible point can be along the view axis.
+    const reach = (FLOOR_SIZE * Math.SQRT2) / 2;
+    expect(CAMERA_FAR).toBeGreaterThan(reach);
+    expect(-CAMERA_NEAR).toBeGreaterThan(reach);
+  });
+});
+
+describe("the factory shell", () => {
+  const rooms = (n: number) => [
+    { position: { x: 0, z: 0 }, kind: "project" as const },
+    ...Array.from({ length: n }, (_, i) => ({ position: ringPosition(i), kind: "room" as const })),
+  ];
+
+  /** How far the outermost building reaches from the origin, corners included. */
+  const reachOf = (list: ReturnType<typeof rooms>) =>
+    Math.max(...list.map((r) =>
+      Math.max(Math.abs(r.position.x), Math.abs(r.position.z)) + buildingSize(r.kind).width / 2));
+
+  it("keeps the kerb outside the default view of a small factory", () => {
+    // At ISO_ZOOM a 1440 px viewport spans ~38 world units, so ±19 from the target. A slab half of
+    // SLAB_MIN_HALF puts the edge well outside that: the floor reads as unbounded until you go
+    // looking for its edge.
+    expect(slabHalf(rooms(1))).toBeGreaterThanOrEqual(SLAB_MIN_HALF);
+    expect(SLAB_MIN_HALF).toBeGreaterThan(1440 / ISO_ZOOM);
+  });
+
+  it("grows with the factory instead of hugging it", () => {
+    for (const n of [1, 8, 25, 64]) {
+      const list = rooms(n);
+      const reach = reachOf(list);
+      // Not "a few metres past the last building": the apron scales, so the shell always has the
+      // plant sitting inside it with clear floor around.
+      expect(slabHalf(list)).toBeGreaterThan(reach * (1 + SLAB_APRON_RATIO * 0.9));
+    }
+  });
+
+  it("still contains every building on every ring", () => {
+    for (const n of [0, 1, 8, 25, 64]) {
+      const list = rooms(n);
+      expect(slabHalf(list)).toBeGreaterThan(reachOf(list));
+    }
+  });
+
+  it("stays inside the ground it is poured on", () => {
+    expect(slabHalf(rooms(64)) * 2).toBeLessThan(FLOOR_SIZE);
   });
 });
 
@@ -546,5 +689,55 @@ describe("selection and packages", () => {
     expect(Math.max(...hues) - Math.min(...hues)).toBeLessThan(15);
     const lightness = PACKAGE_COLORS.map((c) => hslOf(c).l);
     expect(Math.max(...lightness) - Math.min(...lightness)).toBeGreaterThan(0.05);
+  });
+
+  it("keeps the waiting-crate colour out of the status vocabulary and off the cardboard", () => {
+    // A queue is not an approval waiting on the operator; borrowing amber would make the one colour
+    // that means "answer me" mean two things.
+    const { h, s } = hslOf(WAITING_PACKAGE_COLOR);
+    for (const band of STATUS_HUE_BANDS) expect(inBand(h, band)).toBe(false);
+    // Near-neutral, so it cannot be mistaken for a room's accent either (those sit at 0.3).
+    expect(s).toBeLessThan(0.2);
+    // Cool, where everything that moves on the belts is warm: a crate going nowhere is not goods.
+    expect(h).toBeGreaterThan(180);
+    expect(s).toBeLessThan(Math.min(...PACKAGE_COLORS.map((c) => hslOf(c).s)));
+  });
+});
+
+describe("messages waiting at a door", () => {
+  it("puts the first crate at the sender's end of the belt, not out on the road", () => {
+    const { t, lift } = waitingSlot(0);
+    expect(t).toBeGreaterThan(0);
+    expect(t).toBeLessThan(0.12);
+    expect(lift).toBe(0);
+  });
+
+  it("stacks each further crate a little along and a little higher", () => {
+    const a = waitingSlot(0);
+    const b = waitingSlot(1);
+    const c = waitingSlot(2);
+    expect(b.t).toBeGreaterThan(a.t);
+    expect(c.t).toBeGreaterThan(b.t);
+    expect(b.lift).toBeGreaterThan(a.lift);
+    expect(c.lift - b.lift).toBeCloseTo(b.lift - a.lift, 6);
+  });
+
+  it("stops spreading past the stack limit, so forty messages are not a staircase", () => {
+    const capped = waitingSlot(WAITING_STACK_MAX - 1);
+    expect(waitingSlot(WAITING_STACK_MAX)).toEqual(capped);
+    expect(waitingSlot(400)).toEqual(capped);
+    // A negative index is a caller bug, not a crate under the floor.
+    expect(waitingSlot(-3)).toEqual(waitingSlot(0));
+  });
+
+  it("counts each queue at its own sender, for its own recipient", () => {
+    expect(waitingStackIndices([
+      { from: "a", to: "b" },
+      { from: "a", to: "b" },
+      { from: "c", to: "b" },
+      // The other direction is a different pile: the marker stands at the sender's end.
+      { from: "b", to: "a" },
+      { from: "a", to: "b" },
+    ])).toEqual([0, 1, 0, 0, 2]);
   });
 });

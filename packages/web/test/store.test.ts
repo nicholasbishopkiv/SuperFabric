@@ -1,15 +1,19 @@
-import type { RoomInfo, SessionInfo } from "@superfabric/shared";
+import type { MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   agentStatus,
   beltDirections,
   beltFan,
+  DEFAULT_PACKAGE_MS,
   hasMotion,
   initialFabricState,
   liveAgentCount,
+  openTaskCount,
   roomAgents,
   roomlessSessions,
   roomPosition,
+  TASK_STATUS_ORDER,
+  tasksByStatus,
   useFabric,
 } from "../src/store";
 
@@ -21,18 +25,25 @@ beforeEach(() => {
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
     selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
+    projects: [], activeProjectId: null,
   });
 });
 
 /** A `SessionInfo` with every field the protocol requires; cases override just what they are about. */
 const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
-  autonomy: "auto", roomId: null, status: "idle", blocked: false, ...over,
+  autonomy: "auto", model: null, roomId: null, status: "idle", blocked: false, ...over,
 });
 
 const room = (over: Partial<RoomInfo> = {}): RoomInfo => ({
   id: "r1", name: "backend", path: "/p/backend", position: { x: 8, z: 0 },
   kind: "room", agentCount: 0, ...over,
+});
+
+/** A bus message with every field the protocol requires; cases override just what they are about. */
+const message = (over: Partial<MessageInfo> = {}): MessageInfo => ({
+  id: "m1", fromRoomId: "r1", toRoomId: "r2", kind: "request", body: "need a webhook",
+  taskId: null, deliveredAt: null, createdAt: 1_000, ...over,
 });
 
 describe("event store", () => {
@@ -95,6 +106,35 @@ describe("event store", () => {
       ],
     });
     expect(useFabric.getState().sessions.find((s) => s.id === "s1")?.autonomy).toBe("attended");
+  });
+
+  it("reflects each session's model, and re-renders the row when it changes", () => {
+    apply({
+      kind: "sessions",
+      sessions: [session({ id: "s1", model: null }), session({ id: "s2", model: "claude-haiku-4-5" })],
+    });
+    expect(useFabric.getState().sessions.map((s) => [s.id, s.model])).toEqual([
+      ["s1", null],
+      ["s2", "claude-haiku-4-5"],
+    ]);
+
+    const before = useFabric.getState().sessions;
+    // Unchanged rows keep their identity, so a rebroadcast repaints nothing…
+    apply({
+      kind: "sessions",
+      sessions: [session({ id: "s1", model: null }), session({ id: "s2", model: "claude-haiku-4-5" })],
+    });
+    expect(useFabric.getState().sessions[0]).toBe(before[0]);
+
+    // …but a switched model is a new row, or the picker would go on showing the old one.
+    apply({
+      kind: "sessions",
+      sessions: [session({ id: "s1", model: "claude-opus-5" }), session({ id: "s2", model: "claude-haiku-4-5" })],
+    });
+    const after = useFabric.getState().sessions;
+    expect(after[0]).not.toBe(before[0]);
+    expect(after[0].model).toBe("claude-opus-5");
+    expect(after[1]).toBe(before[1]);
   });
 
   it("carries the server's derived status and blocked flag through untouched", () => {
@@ -755,6 +795,201 @@ describe("packages", () => {
   });
 });
 
+describe("the task board", () => {
+  const task = (over: Partial<TaskInfo> = {}): TaskInfo => ({
+    id: "t1", title: "Expose a webhook", detail: "", status: "open", roomId: null,
+    agentId: null, blockedOnMessageId: null, createdAt: 1_000, updatedAt: 1_000, ...over,
+  });
+
+  it("takes the whole board from a tasks message", () => {
+    apply({ kind: "tasks", tasks: [task({ id: "t1" }), task({ id: "t2", status: "done" })] });
+    expect(useFabric.getState().tasks.map((t) => t.id)).toEqual(["t1", "t2"]);
+  });
+
+  it("keeps unchanged cards' identity so one moving task repaints one row", () => {
+    apply({ kind: "tasks", tasks: [task({ id: "t1" }), task({ id: "t2" })] });
+    const [first, second] = useFabric.getState().tasks;
+
+    apply({ kind: "tasks", tasks: [task({ id: "t1" }), task({ id: "t2", status: "done", updatedAt: 1_100 })] });
+    const after = useFabric.getState().tasks;
+    expect(after[0]).toBe(first);
+    expect(after[1]).not.toBe(second);
+  });
+
+  it("is a genuine no-op when the rebroadcast changed nothing", () => {
+    apply({ kind: "tasks", tasks: [task()] });
+    const before = useFabric.getState().tasks;
+    apply({ kind: "tasks", tasks: [task()] });
+    expect(useFabric.getState().tasks).toBe(before);
+  });
+
+  it("groups by status in the board's reading order, keeping empty groups", () => {
+    apply({ kind: "tasks", tasks: [
+      task({ id: "a", status: "done" }),
+      task({ id: "b", status: "blocked", blockedOnMessageId: "m1" }),
+      task({ id: "c", status: "blocked" }),
+    ] });
+    const groups = tasksByStatus(useFabric.getState().tasks);
+    expect(groups.map((g) => g.status)).toEqual([...TASK_STATUS_ORDER]);
+    expect(groups.map((g) => g.tasks.map((t) => t.id))).toEqual([[], [], ["b", "c"], [], ["a"]]);
+  });
+
+  it("counts a room's unfinished tasks, and only that room's", () => {
+    const tasks = [
+      task({ id: "a", roomId: "r1" }),
+      task({ id: "b", roomId: "r1", status: "blocked" }),
+      task({ id: "c", roomId: "r1", status: "done" }),
+      task({ id: "d", roomId: "r2" }),
+      task({ id: "e", roomId: null }),
+    ];
+    // `done` is excluded: the badge is a workload, and a room whose cards are all finished is clear.
+    expect(openTaskCount(tasks, "r1")).toBe(2);
+    expect(openTaskCount(tasks, "r2")).toBe(1);
+    expect(openTaskCount(tasks, "nope")).toBe(0);
+  });
+});
+
+describe("bus messages on the belts", () => {
+  const project = room({ id: "p", name: "fabrica", path: "/p", kind: "project", position: { x: 0, z: 0 } });
+  const messages = (list: MessageInfo[]) => apply({ kind: "messages", messages: list });
+  /** The snapshot every connection opens with. Everything after it is news. */
+  const connected = () => {
+    useFabric.getState().setConnected(true);
+    messages([]);
+  };
+
+  beforeEach(() => {
+    apply({ kind: "rooms", rooms: [project, room({ id: "r1" }), room({ id: "r2", name: "web" })] });
+  });
+
+  it("adopts the first snapshot as history instead of replaying it on the belts", () => {
+    // A tab that connects to a factory with an hour of traffic behind it must not show that hour
+    // as a burst of packages: the animation means "this is happening now".
+    useFabric.getState().setConnected(true);
+    messages([
+      message({ id: "old-1", deliveredAt: 1_001 }),
+      message({ id: "old-2", fromRoomId: "r2", toRoomId: "r1", deliveredAt: 1_002 }),
+    ]);
+    expect(useFabric.getState().packages).toEqual([]);
+    expect(useFabric.getState().messagesLoaded).toBe(true);
+  });
+
+  it("puts a package on the belt for a delivery it has not seen before", () => {
+    connected();
+    const before = Date.now();
+    messages([message({ id: "m1", deliveredAt: 2_000 })]);
+
+    const [pkg, ...rest] = useFabric.getState().packages;
+    expect(rest).toEqual([]);
+    // Keyed by the message's own id: the package *is* that message, not a look-alike.
+    expect(pkg.id).toBe("m1");
+    expect([pkg.from, pkg.to]).toEqual(["r1", "r2"]);
+    expect(pkg.startedAt).toBeGreaterThanOrEqual(before);
+  });
+
+  it("does not re-animate a message the next snapshot still carries", () => {
+    connected();
+    messages([message({ id: "m1", deliveredAt: 2_000 })]);
+    // `list()` is a snapshot of the newest 200, rebroadcast whole on every change — a second
+    // message arriving means the first one is sent again, and it must not fly twice.
+    messages([
+      message({ id: "m2", fromRoomId: "r2", toRoomId: "r1", deliveredAt: 2_100 }),
+      message({ id: "m1", deliveredAt: 2_000 }),
+    ]);
+    expect(useFabric.getState().packages.map((p) => p.id)).toEqual(["m1", "m2"]);
+  });
+
+  it("animates several new deliveries in the order they were sent, not the order they arrive", () => {
+    connected();
+    // The snapshot is newest-first; the belts should still leave oldest-first.
+    messages([
+      message({ id: "later", deliveredAt: 2_200, createdAt: 2_200 }),
+      message({ id: "earlier", deliveredAt: 2_100, createdAt: 2_100 }),
+    ]);
+    expect(useFabric.getState().packages.map((p) => p.id)).toEqual(["earlier", "later"]);
+  });
+
+  it("shows an undelivered message as a waiting marker at its sender, not as a package", () => {
+    connected();
+    messages([message({ id: "m1", deliveredAt: null })]);
+
+    expect(useFabric.getState().packages).toEqual([]);
+    expect(useFabric.getState().waiting).toEqual([
+      { id: "m1", from: "r1", to: "r2", kind: "request", createdAt: 1_000 },
+    ]);
+  });
+
+  it("flips the same message from waiting to in flight when it is finally delivered", () => {
+    connected();
+    messages([message({ id: "m1", deliveredAt: null })]);
+    expect(useFabric.getState().waiting.map((w) => w.id)).toEqual(["m1"]);
+
+    messages([message({ id: "m1", deliveredAt: 2_500 })]);
+
+    // One object changing state: it leaves the pile and rides the belt under the same id, so the
+    // box starts at the door the marker was standing at rather than appearing from nothing.
+    expect(useFabric.getState().waiting).toEqual([]);
+    expect(useFabric.getState().packages.map((p) => p.id)).toEqual(["m1"]);
+  });
+
+  it("keeps the pile's identity when a rebroadcast changed nothing about it", () => {
+    connected();
+    messages([message({ id: "m1", deliveredAt: null })]);
+    const first = useFabric.getState().waiting;
+    messages([message({ id: "m1", deliveredAt: null })]);
+    expect(useFabric.getState().waiting).toBe(first);
+  });
+
+  it("stacks a pile-up in creation order", () => {
+    connected();
+    messages([
+      message({ id: "b", createdAt: 1_200 }),
+      message({ id: "a", createdAt: 1_100 }),
+    ]);
+    expect(useFabric.getState().waiting.map((w) => w.id)).toEqual(["a", "b"]);
+  });
+
+  it("earns a belt between two rooms that a real message used, delivered or not", () => {
+    const belts = () => useFabric.getState().conveyors.map((c) => [c.from, c.to].sort().join("|")).sort();
+    connected();
+    messages([message({ id: "m1", fromRoomId: "r1", toRoomId: "r2", deliveredAt: null })]);
+    // The crate has to stand at the mouth of a belt that is actually drawn.
+    expect(belts()).toEqual(["p|r1", "p|r2", "r1|r2"]);
+  });
+
+  it("ignores a room talking to itself: there is no belt to ride", () => {
+    connected();
+    messages([message({ id: "m1", fromRoomId: "r1", toRoomId: "r1", deliveredAt: 2_000 })]);
+    expect(useFabric.getState().packages).toEqual([]);
+    expect(useFabric.getState().conveyors.map((c) => [c.from, c.to].sort().join("|")).sort())
+      .toEqual(["p|r1", "p|r2"]);
+  });
+
+  it("forgets messages the snapshot no longer carries, so the record cannot grow for ever", () => {
+    connected();
+    messages([message({ id: "m1", deliveredAt: 2_000 })]);
+    useFabric.getState().reapPackages(Date.now() + 10_000);
+    // m1 has fallen off the end of the newest-200 window.
+    messages([message({ id: "m2", deliveredAt: 2_100 })]);
+    expect(Object.keys(useFabric.getState().animatedMessages)).toEqual(["m2"]);
+  });
+
+  it("re-baselines after a reconnect instead of replaying what it missed", () => {
+    connected();
+    messages([message({ id: "m1", deliveredAt: 2_000 })]);
+    useFabric.getState().reapPackages(Date.now() + 10_000);
+
+    useFabric.getState().setConnected(false);
+    useFabric.getState().setConnected(true);
+    // Everything that happened while the tab was away arrives in one snapshot; it is history now.
+    messages([
+      message({ id: "m9", deliveredAt: 3_000 }),
+      message({ id: "m1", deliveredAt: 2_000 }),
+    ]);
+    expect(useFabric.getState().packages).toEqual([]);
+  });
+});
+
 describe("hasMotion", () => {
   const still = { sessions: [], packages: [], drag: null };
 
@@ -799,5 +1034,150 @@ describe("hasMotion", () => {
 
     useFabric.getState().reapPackages(Date.now() + 200);
     expect(hasMotion(useFabric.getState())).toBe(false);
+  });
+
+  it("is true while a package from a real bus message flies, and false again afterwards", () => {
+    apply({ kind: "rooms", rooms: [room({ id: "r1" }), room({ id: "r2", name: "web", position: { x: 0, z: 8 } })] });
+    useFabric.getState().setConnected(true);
+    apply({ kind: "messages", messages: [] });
+    apply({ kind: "messages", messages: [message({ id: "m1", deliveredAt: 2_000 })] });
+    expect(hasMotion(useFabric.getState())).toBe(true);
+
+    useFabric.getState().reapPackages(Date.now() + DEFAULT_PACKAGE_MS + 200);
+    expect(hasMotion(useFabric.getState())).toBe(false);
+  });
+
+  it("is false while messages sit undelivered: a pile-up is a state, not an animation", () => {
+    // Counting the queue as motion would pin frameloop="always" for as long as a room stayed busy.
+    apply({ kind: "rooms", rooms: [room({ id: "r1" }), room({ id: "r2", name: "web", position: { x: 0, z: 8 } })] });
+    useFabric.getState().setConnected(true);
+    apply({ kind: "messages", messages: [message({ id: "m1", deliveredAt: null })] });
+    expect(useFabric.getState().waiting).toHaveLength(1);
+    expect(hasMotion(useFabric.getState())).toBe(false);
+  });
+});
+
+// ---- M1b: switching factories ----
+
+describe("projects", () => {
+  const project = (over: Partial<ProjectInfo> = {}): ProjectInfo => ({
+    id: "p1", name: "shop", root: "/code/shop", lastOpenedAt: null, ...over,
+  });
+  const other = project({ id: "p2", name: "vendor", root: "/code/vendor" });
+
+  /** A floor with a building, an agent, a card, a belt and a queued crate — a factory in use. */
+  function fillFactory(): void {
+    apply({
+      kind: "rooms",
+      rooms: [
+        room({ id: "p", name: "shop", kind: "project", position: { x: 0, z: 0 } }),
+        room({ id: "r1" }),
+        room({ id: "r2", name: "web", position: { x: 0, z: 8 } }),
+      ],
+    });
+    apply({ kind: "sessions", sessions: [session({ id: "s1", roomId: "r1", status: "working" })] });
+    apply({
+      kind: "tasks",
+      tasks: [{
+        id: "t1", title: "Expose a webhook", detail: "", status: "open",
+        roomId: "r1", agentId: null, blockedOnMessageId: null, createdAt: 1, updatedAt: 1,
+      }],
+    });
+    useFabric.getState().selectRoom("r1");
+    useFabric.getState().setConnected(true);
+    apply({ kind: "messages", messages: [message({ id: "m1", deliveredAt: null })] });
+    apply({ kind: "event", sessionId: "s1", seq: 1, event: { type: "agent_text", text: "working" } });
+  }
+
+  it("records the list and the active project the server says this socket is on", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    const s = useFabric.getState();
+    expect(s.projects.map((p) => p.id)).toEqual(["p1", "p2"]);
+    expect(s.activeProjectId).toBe("p1");
+  });
+
+  it("keeps the floor that arrived in the same round trip as the first projects frame", () => {
+    // On connect the client asks for projects first, but the answers can land either way round.
+    fillFactory();
+    apply({ kind: "projects", projects: [project()], activeProjectId: "p1" });
+    expect(useFabric.getState().roomIds).toHaveLength(3);
+    expect(useFabric.getState().tasks).toHaveLength(1);
+  });
+
+  it("drops the previous factory entirely when the active project changes", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    fillFactory();
+    // sanity: there is something to lose
+    const before = useFabric.getState();
+    expect(before.rooms.length).toBeGreaterThan(0);
+    expect(before.conveyors.length).toBeGreaterThan(0);
+    expect(before.waiting).toHaveLength(1);
+    expect(before.events["s1"]).toHaveLength(1);
+
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p2" });
+
+    const s = useFabric.getState();
+    // A stale building from another factory standing on this floor is the symptom of merging here.
+    expect(s.rooms).toEqual([]);
+    expect(s.roomIds).toEqual([]);
+    expect(s.sessions).toEqual([]);
+    expect(s.tasks).toEqual([]);
+    expect(s.waiting).toEqual([]);
+    expect(s.packages).toEqual([]);
+    expect(s.conveyors).toEqual([]);
+    expect(s.packagedPairs).toEqual({});
+    expect(s.animatedMessages).toEqual({});
+    expect(s.roomStatus).toEqual({});
+    expect(s.events).toEqual({});
+    expect(s.lastSeq).toEqual({});
+    expect(s.contiguousSeq).toEqual({});
+    expect(s.selectedRoomId).toBeNull();
+    // …and the tab's own state is not a casualty of the switch
+    expect(s.activeProjectId).toBe("p2");
+    expect(s.projects.map((p) => p.id)).toEqual(["p1", "p2"]);
+    expect(s.connected).toBe(true);
+  });
+
+  it("re-baselines the bus, so the new factory's queue does not fly down a belt", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    fillFactory();
+    expect(useFabric.getState().messagesLoaded).toBe(true);
+
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p2" });
+    expect(useFabric.getState().messagesLoaded).toBe(false);
+
+    // The new floor's first snapshot is history: it is adopted, not animated.
+    apply({ kind: "rooms", rooms: [room({ id: "r1" }), room({ id: "r2", name: "web", position: { x: 0, z: 8 } })] });
+    apply({ kind: "messages", messages: [message({ id: "m9", deliveredAt: 3_000 })] });
+    expect(useFabric.getState().packages).toEqual([]);
+  });
+
+  it("asks the camera to re-frame, because the new floor is somewhere else", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    const before = useFabric.getState().fitRequests;
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p2" });
+    expect(useFabric.getState().fitRequests).toBe(before + 1);
+  });
+
+  it("changes nothing when the same frame arrives twice", () => {
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    fillFactory();
+    const before = useFabric.getState();
+    // Every tab is told when anyone adds or opens a project, so a no-op frame is the common case.
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    const after = useFabric.getState();
+    expect(after.rooms).toBe(before.rooms);
+    expect(after.projects).toBe(before.projects);
+    expect(after.fitRequests).toBe(before.fitRequests);
+  });
+
+  it("takes a changed project list without touching the floor", () => {
+    apply({ kind: "projects", projects: [project()], activeProjectId: "p1" });
+    fillFactory();
+    const rooms = useFabric.getState().rooms;
+    // Another tab created a project: the switcher gains an entry, this floor does not change.
+    apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
+    expect(useFabric.getState().projects.map((p) => p.id)).toEqual(["p1", "p2"]);
+    expect(useFabric.getState().rooms).toBe(rooms);
   });
 });

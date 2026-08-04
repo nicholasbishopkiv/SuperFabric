@@ -31,11 +31,20 @@ export function connect(): void {
   ws.onopen = () => {
     reconnectDelayMs = RECONNECT_MIN_MS;
     useFabric.getState().setConnected(true);
+    // Projects first: the answer says which factory this socket is on, and every list that follows is
+    // scoped to it. Asking in the other order would hand the store rooms it cannot yet attribute.
+    send({ kind: "list_projects" });
     send({ kind: "list_sessions" });
     // The floor is rebuilt from the server on every connect: rooms and sessions carry everything a
     // building needs to draw itself (position, kind, live status), so a reload never shows a blank
     // factory waiting for the first event to arrive.
     send({ kind: "list_rooms" });
+    // The bus's traffic, for the same reason: a message queued for a busy room is drawn on the
+    // floor, and this snapshot is the baseline that keeps the belts from replaying old deliveries.
+    send({ kind: "list_messages" });
+    // And the board, which is server state like the others: an operator reloading the page must see
+    // what the factory is working on without having to wait for a task to change.
+    send({ kind: "list_tasks" });
     // The server hard-terminates sockets on shutdown, so a reconnect must re-ask for the tail of
     // every session we were following — from the last contiguous seq we hold, not from 0.
     const { contiguousSeq } = useFabric.getState();
@@ -63,6 +72,22 @@ export function connect(): void {
 
   // A failed connect fires error then close; close drives the retry, so nothing to do here.
   ws.onerror = () => {};
+}
+
+/**
+ * Switch this tab to another factory. The subscription bookkeeping is cleared here rather than in the
+ * store because it lives in this module: the sessions we were following belong to the floor we are
+ * leaving, the server drops its side too, and a reconnect must not resubscribe to them.
+ */
+export function openProject(projectId: string): void {
+  subscribed.clear();
+  resyncAsked.clear();
+  send({ kind: "open_project", projectId });
+}
+
+/** Add a factory by path. The server refuses anything that is not an existing absolute directory. */
+export function createProject(root: string, name?: string): void {
+  send({ kind: "create_project", root, ...(name !== undefined && name !== "" ? { name } : {}) });
 }
 
 export function subscribe(sessionId: string): void {

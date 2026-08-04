@@ -121,6 +121,45 @@ export function conveyorCurve(
   return new CatmullRomCurve3([start, mid, end], false, "catmullrom", 0.5);
 }
 
+// ---- messages nobody has picked up yet -----------------------------------------------------------
+
+/** How far along its belt the first undelivered message sits: at the sender's door, not on the road. */
+export const WAITING_T = 0.055;
+/** How much further along each one behind it stands, so a queue reads as a queue and not as a blob. */
+export const WAITING_T_STEP = 0.022;
+/** And how much higher, which is what makes the pile look stacked rather than strung out. */
+export const WAITING_LIFT = 0.19;
+/**
+ * How many markers one pair of rooms stacks before they stop spreading. A room with forty messages
+ * queued must not build a staircase across the floor — past this they pile in place, and the number
+ * is the operator's to read off the room panel rather than to count off the floor.
+ */
+export const WAITING_STACK_MAX = 6;
+
+/** Where the `index`-th waiting message for one pair of rooms stands on their belt. */
+export function waitingSlot(index: number): { t: number; lift: number } {
+  const i = Math.min(Math.max(index, 0), WAITING_STACK_MAX - 1);
+  return { t: WAITING_T + i * WAITING_T_STEP, lift: i * WAITING_LIFT };
+}
+
+/**
+ * Each waiting message's place in the queue **at its own sender, for its own recipient** — so two
+ * rooms both waiting on the payments room build two piles rather than one, and a reply queued the
+ * other way round stacks separately from the request it answers.
+ *
+ * Directed on purpose (`from -> to`, not the undirected pair a belt is drawn for): the marker stands
+ * at the sender's end, so which end it is matters.
+ */
+export function waitingStackIndices(queue: readonly { from: string; to: string }[]): number[] {
+  const seen = new Map<string, number>();
+  return queue.map(({ from, to }) => {
+    const key = `${from}>${to}`;
+    const index = seen.get(key) ?? 0;
+    seen.set(key, index + 1);
+    return index;
+  });
+}
+
 /**
  * Point on the belt at `t` in [0, 1], measured by *arc length* so a package travels at a constant
  * speed instead of hurrying through the bend. Pass `target` to reuse a vector: this is called once

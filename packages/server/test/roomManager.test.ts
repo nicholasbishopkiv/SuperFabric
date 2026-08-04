@@ -4,18 +4,40 @@ import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { ringPosition } from "@superfabric/shared";
 import { openDb } from "../src/db.js";
+import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
 
-/** A throwaway project root plus a manager over an in-memory db, cleaned up afterwards. */
-function withProject<T>(fn: (ctx: { root: string; db: ReturnType<typeof openDb>; mgr: RoomManager }) => T): T {
+/**
+ * A throwaway project root plus a manager over an in-memory db, cleaned up afterwards. The root is
+ * the *default* project's root, so a call that names no project (as most of these do) resolves its
+ * folders against this directory.
+ */
+function withProject<T>(fn: (ctx: {
+  root: string;
+  db: ReturnType<typeof openDb>;
+  projects: ProjectManager;
+  projectId: string;
+  mgr: RoomManager;
+}) => T): T {
   const root = mkdtempSync(join(tmpdir(), "superfabric-rooms-"));
   const db = openDb(":memory:");
   try {
-    return fn({ root, db, mgr: new RoomManager(db, root) });
+    const projects = new ProjectManager(db, root);
+    return fn({
+      root, db, projects,
+      projectId: projects.defaultProject().id,
+      mgr: new RoomManager(db, projects),
+    });
   } finally {
     db.close();
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+/** A second factory: a throwaway root, its project row, and the id to scope calls with. */
+function addProject(projects: ProjectManager, label: string): { root: string; id: string } {
+  const root = mkdtempSync(join(tmpdir(), `superfabric-rooms-${label}-`));
+  return { root, id: projects.create({ root }).id };
 }
 
 const roomCount = (db: ReturnType<typeof openDb>, kind?: string) =>
@@ -39,7 +61,7 @@ describe("RoomManager", () => {
         const second = mgr.ensureProjectRoom();
         expect(second.id).toBe(first.id);
         // a fresh manager over the same db (a server restart) must not add another one
-        expect(new RoomManager(db, root).ensureProjectRoom().id).toBe(first.id);
+        expect(new RoomManager(db, new ProjectManager(db, root)).ensureProjectRoom().id).toBe(first.id);
         expect(roomCount(db, "project").c).toBe(1);
         expect(roomCount(db).c).toBe(1);
       });
@@ -54,7 +76,7 @@ describe("RoomManager", () => {
           const root = join(parent, folder);
           mkdirSync(root);
           const db = openDb(":memory:");
-          expect(new RoomManager(db, root).ensureProjectRoom().name).toBe(expected);
+          expect(new RoomManager(db, new ProjectManager(db, root)).ensureProjectRoom().name).toBe(expected);
           db.close();
         }
       } finally {
@@ -87,6 +109,25 @@ describe("RoomManager", () => {
 
         const row = db.prepare("SELECT name, path, kind FROM rooms WHERE id = ?").get(room.id);
         expect(row).toEqual({ name: "backend", path: join(root, "backend"), kind: "room" });
+      });
+    });
+
+    it("tells the agent about the factory bus, by this room's own name", () => {
+      withProject(({ root, mgr }) => {
+        mgr.ensureProjectRoom();
+        mgr.createRoom("payments");
+        const charter = readFileSync(join(root, "payments", "CLAUDE.md"), "utf8");
+
+        // Its own identity: an agent cannot address anyone if it does not know who it is.
+        expect(charter).toContain("You are the **payments** room");
+        // The tools, under the names the model actually sees (mcp__<server>__<tool>).
+        expect(charter).toContain("mcp__factory__factory_send");
+        expect(charter).toContain("mcp__factory__factory_task_update");
+        expect(charter).toContain("mcp__factory__factory_inbox");
+        // Incoming messages are turns, not something to fetch…
+        expect(charter).toMatch(/arrive as ordinary turns/);
+        // …so the one instruction that saves tokens on every turn is explicit.
+        expect(charter).toMatch(/Do not poll/);
       });
     });
 
@@ -200,7 +241,7 @@ describe("RoomManager", () => {
         expect(moved.position).toEqual({ x: -12.5, z: 4 });
         expect(mgr.listRooms().find((r) => r.id === room.id)!.position).toEqual({ x: -12.5, z: 4 });
         // and it survives a restart, because it is in the db and not in memory
-        expect(new RoomManager(db, root).listRooms().find((r) => r.id === room.id)!.position)
+        expect(new RoomManager(db, new ProjectManager(db, root)).listRooms().find((r) => r.id === room.id)!.position)
           .toEqual({ x: -12.5, z: 4 });
       });
     });
@@ -220,6 +261,213 @@ describe("RoomManager", () => {
         const room = mgr.createRoom("backend");
         expect(mgr.getRoom(room.id)).toMatchObject({ id: room.id, name: "backend", path: room.path });
         expect(mgr.getRoom("nope")).toBeUndefined();
+      });
+    });
+  });
+
+  // ---- M1b: several factories in one server ----
+
+  describe("projects", () => {
+    it("keeps each project's floor to itself, same room names and all", () => {
+      withProject(({ projects, projectId, mgr }) => {
+        const other = addProject(projects, "other");
+        try {
+          const homeProject = mgr.ensureProjectRoom(projectId);
+          const homeBackend = mgr.createRoom("backend", { projectId });
+          const awayProject = mgr.ensureProjectRoom(other.id);
+          // The same name on two floors: uniqueness is per project, which is the whole point.
+          const awayBackend = mgr.createRoom("backend", { projectId: other.id });
+
+          expect(awayBackend.id).not.toBe(homeBackend.id);
+          expect(mgr.listRooms(projectId).map((r) => r.id)).toEqual([homeProject.id, homeBackend.id]);
+          expect(mgr.listRooms(other.id).map((r) => r.id)).toEqual([awayProject.id, awayBackend.id]);
+          // …and each room's folder is under its own root, not the other's
+          expect(homeBackend.path.startsWith(mgr.getRoom(homeProject.id)!.path)).toBe(true);
+          expect(awayBackend.path.startsWith(other.root)).toBe(true);
+          // a duplicate *within* one project is still refused
+          expect(() => mgr.createRoom("backend", { projectId })).toThrow(/already exists/);
+        } finally {
+          rmSync(other.root, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("scopes the ring so a second factory's first room is not pushed outwards", () => {
+      withProject(({ projects, projectId, mgr }) => {
+        const other = addProject(projects, "ring");
+        try {
+          mgr.ensureProjectRoom(projectId);
+          mgr.ensureProjectRoom(other.id);
+          mgr.createRoom("a", { projectId });
+          mgr.createRoom("b", { projectId });
+          // Two rooms already exist — but not on *this* floor, so this one starts at slot 0.
+          expect(mgr.createRoom("a", { projectId: other.id }).position).toEqual(ringPosition(0));
+        } finally {
+          rmSync(other.root, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("answers projectOf with the floor a room stands on", () => {
+      withProject(({ projects, projectId, mgr }) => {
+        const other = addProject(projects, "of");
+        try {
+          const here = mgr.createRoom("here", { projectId });
+          const there = mgr.createRoom("there", { projectId: other.id });
+          expect(mgr.projectOf(here.id)).toBe(projectId);
+          expect(mgr.projectOf(there.id)).toBe(other.id);
+          expect(mgr.projectOf("nope")).toBeUndefined();
+        } finally {
+          rmSync(other.root, { recursive: true, force: true });
+        }
+      });
+    });
+  });
+
+  // ---- M1b: a room's working folder is settable ----
+
+  describe("an explicit room folder", () => {
+    it("uses the given folder as-is, outside the project root, and creates it", () => {
+      withProject(({ root, mgr }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-elsewhere-"));
+        try {
+          mgr.ensureProjectRoom();
+          const dir = join(elsewhere, "payments-service");
+          const room = mgr.createRoom("payments", { path: dir });
+
+          expect(room.path).toBe(dir);
+          expect(existsSync(dir)).toBe(true);
+          // and nothing was created under the project root for it
+          expect(existsSync(join(root, "payments"))).toBe(false);
+          // the charter is still written, because that is where an agent learns it has a bus
+          expect(readFileSync(join(dir, "CLAUDE.md"), "utf8")).toMatch(/^# payments/);
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("adopts an existing folder outside the root without clobbering its CLAUDE.md", () => {
+      withProject(({ mgr }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-elsewhere-"));
+        try {
+          mgr.ensureProjectRoom();
+          writeFileSync(join(elsewhere, "CLAUDE.md"), "# their repo's own docs\n");
+          writeFileSync(join(elsewhere, "keep.txt"), "untouched\n");
+
+          const room = mgr.createRoom("vendor", { path: elsewhere });
+
+          expect(room.path).toBe(elsewhere);
+          expect(readFileSync(join(elsewhere, "CLAUDE.md"), "utf8")).toBe("# their repo's own docs\n");
+          expect(readFileSync(join(elsewhere, "keep.txt"), "utf8")).toBe("untouched\n");
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("still requires a usable room name, and an absolute folder", () => {
+      withProject(({ db, mgr }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-elsewhere-"));
+        try {
+          mgr.ensureProjectRoom();
+          // the name is the label on the building either way
+          expect(() => mgr.createRoom("Payments", { path: elsewhere })).toThrow(/invalid room name/);
+          expect(() => mgr.createRoom("has space", { path: elsewhere })).toThrow(/invalid room name/);
+          // a relative folder would resolve against whatever directory the server was started in
+          expect(() => mgr.createRoom("payments", { path: "relative/dir" })).toThrow(/absolute path/);
+          expect(roomCount(db, "room").c).toBe(0);
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("refuses a folder that exists and is not a directory", () => {
+      withProject(({ mgr }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-elsewhere-"));
+        try {
+          mgr.ensureProjectRoom();
+          const file = join(elsewhere, "a-file");
+          writeFileSync(file, "not a folder\n");
+          expect(() => mgr.createRoom("payments", { path: file })).toThrow(/not a directory/);
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("does not relax the default case: no path still means inside the project root", () => {
+      withProject(({ root, db, mgr }) => {
+        mgr.ensureProjectRoom();
+        for (const name of ["..", "../escape", "/etc", join("..", basename(root) + "-sibling")]) {
+          expect(() => mgr.createRoom(name)).toThrow(/project root/);
+        }
+        expect(existsSync(join(root, "..", "escape"))).toBe(false);
+        expect(roomCount(db, "room").c).toBe(0);
+      });
+    });
+  });
+
+  describe("setPath", () => {
+    it("re-points a room without moving anything on disk", () => {
+      withProject(({ root, db, mgr }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-elsewhere-"));
+        try {
+          mgr.ensureProjectRoom();
+          const room = mgr.createRoom("backend");
+          writeFileSync(join(root, "backend", "code.ts"), "export const x = 1;\n");
+
+          const moved = mgr.setPath(room.id, elsewhere);
+
+          expect(moved.path).toBe(elsewhere);
+          expect(mgr.getRoom(room.id)!.path).toBe(elsewhere);
+          // the old folder and its contents are exactly where they were: this re-points, never moves
+          expect(readFileSync(join(root, "backend", "code.ts"), "utf8")).toBe("export const x = 1;\n");
+          // and it is persisted, so a restart sees the new folder
+          expect(new RoomManager(db, new ProjectManager(db, root)).getRoom(room.id)!.path).toBe(elsewhere);
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("never overwrites the new folder's CLAUDE.md, and writes one when it has none", () => {
+      withProject(({ mgr }) => {
+        const kept = mkdtempSync(join(tmpdir(), "superfabric-kept-"));
+        const bare = mkdtempSync(join(tmpdir(), "superfabric-bare-"));
+        try {
+          mgr.ensureProjectRoom();
+          writeFileSync(join(kept, "CLAUDE.md"), "# their charter\n");
+          const room = mgr.createRoom("backend");
+
+          mgr.setPath(room.id, kept);
+          expect(readFileSync(join(kept, "CLAUDE.md"), "utf8")).toBe("# their charter\n");
+
+          mgr.setPath(room.id, bare);
+          expect(readFileSync(join(bare, "CLAUDE.md"), "utf8")).toMatch(/^# backend/);
+        } finally {
+          rmSync(kept, { recursive: true, force: true });
+          rmSync(bare, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it("refuses an unknown room, a relative path, and the project room itself", () => {
+      withProject(({ root, mgr }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-elsewhere-"));
+        try {
+          const project = mgr.ensureProjectRoom();
+          const room = mgr.createRoom("backend");
+
+          expect(() => mgr.setPath("nope", elsewhere)).toThrow(/unknown room/);
+          expect(() => mgr.setPath(room.id, "relative/dir")).toThrow(/absolute path/);
+          // the central building *is* the project root; the two must not be able to disagree
+          expect(() => mgr.setPath(project.id, elsewhere)).toThrow(/project root/);
+          expect(mgr.getRoom(project.id)!.path).toBe(root);
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
       });
     });
   });

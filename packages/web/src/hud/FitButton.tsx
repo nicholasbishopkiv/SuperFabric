@@ -1,18 +1,25 @@
+import { ExpandIcon } from "lucide-react";
 import { useEffect } from "react";
-import { useFabric } from "../store";
-import { HUD } from "./theme";
+import { useFabric, useHudInsets } from "../store";
+import { Button } from "../ui/button";
 
 /**
- * "Fit" — put the whole factory back in frame.
+ * "Fit" — put the whole factory back in frame, at the default isometric angle.
  *
- * The camera frames the floor by itself, but only until the operator pans or zooms: after that the
- * view belongs to them and nothing may move it, or a new room appearing would yank the floor out
- * from under whatever they were looking at. That rule needs exactly one escape hatch, and this is
- * it. Also bound to `f`, because the one thing an operator does after losing the factory is reach
- * for the keyboard.
+ * The camera frames the floor by itself, but only until the operator touches it: after that the view
+ * belongs to them and nothing may move it, or a new room appearing would yank the floor out from
+ * under whatever they were looking at. That rule needs exactly one escape hatch, and this is it.
+ * Also bound to `f`, because the one thing an operator does after losing the factory is reach for the
+ * keyboard.
+ *
+ * Since the camera can be orbited and tilted, this is also the way *back*: it restores the opening
+ * orientation along with the framing (see `CameraFraming`), so no orbit is a one-way trip.
  */
 export function FitButton() {
   const requestCameraFit = useFabric((s) => s.requestCameraFit);
+  // Pinned to the free strip's bottom-left corner rather than the viewport's, so the room panel
+  // never paints over it and it never floats on top of the task board.
+  const insets = useHudInsets();
 
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
@@ -29,23 +36,15 @@ export function FitButton() {
   }, [requestCameraFit]);
 
   return (
-    <button
+    <Button
       onClick={requestCameraFit}
-      title="Frame the whole factory (f)"
-      style={{
-        position: "fixed",
-        left: 12,
-        bottom: 12,
-        font: "600 13px system-ui, sans-serif",
-        color: HUD.text,
-        background: HUD.panel,
-        border: `1px solid ${HUD.line}`,
-        borderRadius: 6,
-        padding: "5px 10px",
-        cursor: "pointer",
-      }}
+      size="md"
+      className="fixed z-40 bg-panel/80 backdrop-blur-xl"
+      style={{ left: insets.left + 12, bottom: insets.bottom + 12 }}
+      title="Frame the whole factory and restore the default view (f) — drag to pan, right-drag to orbit, wheel to zoom"
     >
-      ⤢ fit
-    </button>
+      <ExpandIcon />
+      fit
+    </Button>
   );
 }

@@ -1,9 +1,15 @@
 import type {
+  MessageInfo,
+  MessageKind,
+  ProjectInfo,
   RoomInfo,
+  SavedAttachment,
   ScenePosition,
   ServerMessage,
   SessionEvent,
   SessionInfo,
+  TaskInfo,
+  TaskStatus,
 } from "@superfabric/shared";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
@@ -56,6 +62,25 @@ export interface PackageInFlight {
 }
 
 /**
+ * A bus message nobody has picked up yet, standing at the sending room's door.
+ *
+ * **A different fact from a package in flight, and drawn differently.** A message in transit is the
+ * factory working; a message nobody has collected is the factory *not* working — the recipient room
+ * is busy, or has no agent at all — and a pile of them at one door is exactly the thing an operator
+ * needs to notice. Collapsing the two into one animation would hide the second behind the first.
+ */
+export interface WaitingMessage {
+  /** The bus message's own id, so the marker and the package that replaces it are the same object. */
+  id: string;
+  /** Who sent it: the marker stands at that building. */
+  from: string;
+  /** Who it is for: the marker sits at the mouth of the belt leading there. */
+  to: string;
+  kind: MessageKind;
+  createdAt: number;
+}
+
+/**
  * A building being dragged across the floor right now, and where the operator's pointer has put it.
  *
  * This is **local and uncommitted on purpose**. Rooms are rebroadcast to every attached socket on a
@@ -68,6 +93,31 @@ export interface RoomDrag {
   position: ScenePosition;
 }
 
+/**
+ * A file that is on disk and waiting to be named in the next turn.
+ *
+ * Staged rather than sent, because the operator who just dropped a screenshot almost always wants
+ * to say something about it. The chip is removable for the same reason — dropping the wrong file
+ * must not force them to send it. Unstaging does **not** delete the file: it is the operator's file,
+ * in the operator's repository, and deleting their data because they changed their mind about
+ * mentioning it would be the wrong kind of tidy.
+ *
+ * `path` is the identity: the server never overwrites, so no two staged files share one.
+ */
+export interface StagedAttachment {
+  /** Absolute path on disk — this is what goes into the turn text. */
+  path: string;
+  /** The name the file actually got, which may not be the one the browser sent. */
+  name: string;
+  bytes: number;
+}
+
+/** The edges an overlay panel can cover. The top is deliberately free: nothing lives there. */
+export type HudSide = "left" | "right" | "bottom";
+
+/** How much of the canvas each panel covers, in CSS pixels. See `FabricState.hudInsets`. */
+export type HudInsets = Record<HudSide, number>;
+
 /** How long a package takes to cross a belt, unless the caller says otherwise. */
 export const DEFAULT_PACKAGE_MS = 2_400;
 
@@ -78,6 +128,14 @@ let packageSeq = 0;
 const pairKey = (a: string, b: string): string => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
 export interface FabricState {
+  /** Every factory this server serves, in the server's order. */
+  projects: ProjectInfo[];
+  /**
+   * The factory this tab is looking at, or null before the server has said. Server-owned: the socket
+   * holds the active project, so this is whatever the last `projects` message carried and never
+   * something the UI sets on its own.
+   */
+  activeProjectId: string | null;
   sessions: SessionInfo[];
   /** The factory floor: the project building first, then one workshop per room. */
   rooms: RoomInfo[];
@@ -94,10 +152,13 @@ export interface FabricState {
    * How many CSS pixels of the canvas each HUD panel covers. The canvas is full-bleed *behind* the
    * overlays, so without this the camera frames the factory in the middle of the viewport and the
    * middle of the viewport is under the console drawer. The panels measure themselves and report it
-   * here (they know their own collapsed/expanded width; the scene must not go reading their DOM),
+   * here (they know their own collapsed/expanded size; the scene must not go reading their DOM),
    * and the camera framing subtracts it.
+   *
+   * Three edges now: the task board owns the bottom one, and it is a *height* where the other two
+   * are widths — which is the whole reason this is a record of sides rather than a pair of numbers.
    */
-  hudInsets: { left: number; right: number };
+  hudInsets: HudInsets;
   /**
    * Bumped by the "fit" control. The camera frames the floor automatically only until the operator
    * pans or zooms — after that the view is theirs — so there has to be one explicit way to ask for
@@ -120,6 +181,25 @@ export interface FabricState {
   conveyors: Conveyor[];
   /** Packages travelling a belt right now. Empty is the normal state. */
   packages: PackageInFlight[];
+  /** The task board, newest first — the server's whole list, rebroadcast on every change. */
+  tasks: TaskInfo[];
+  /** Bus messages still queued at their sender, oldest first. See `WaitingMessage`. */
+  waiting: WaitingMessage[];
+  /**
+   * Message ids whose delivery this tab has already turned into a package (or adopted as history on
+   * the first snapshot). `messages` is a **snapshot** of the newest 200, rebroadcast in full on every
+   * change, so without this every rebroadcast would re-animate everything it still contains.
+   *
+   * Pruned to what the newest snapshot still holds, so it cannot grow without bound.
+   */
+  animatedMessages: Record<string, true>;
+  /**
+   * Whether this tab has had its first `messages` snapshot since connecting. That first snapshot is
+   * history — the traffic of the last hour, replied to and forgotten — and replaying it as a burst of
+   * packages would be a lie about what the factory is doing *now*. So it is adopted silently, and
+   * only what changes afterwards animates.
+   */
+  messagesLoaded: boolean;
   /**
    * Pair key -> the room pair, for every pair that has ever exchanged a package. A belt outlives the
    * package that justified it: the channel between two rooms is a fact about the factory, and having
@@ -137,13 +217,26 @@ export interface FabricState {
   contiguousSeq: Record<string, number>;
   /** sessionId -> a gap was seen; the ws client owes this session a resubscribe. */
   needsResync: Record<string, boolean>;
+  /**
+   * Files written to disk and waiting to be named in the next turn. See `StagedAttachment`; the
+   * composer turns them into lines of turn text when the message is finally sent.
+   */
+  staged: StagedAttachment[];
+  /** An upload is in flight. The composer says so rather than looking like nothing happened. */
+  uploading: boolean;
   connected: boolean;
   lastError: string | null;
+  /**
+   * The server's last `notice`: "this worked, and here is what happened" — where a file landed,
+   * what a re-pointed room now means. Separate from `lastError` because they are different facts
+   * and must not be painted the same colour.
+   */
+  lastNotice: string | null;
   apply(msg: ServerMessage): void;
   setConnected(connected: boolean): void;
   selectRoom(roomId: string | null): void;
   /** Report how wide one of the overlay panels is right now. A no-op when it has not changed. */
-  setHudInset(side: "left" | "right", px: number): void;
+  setHudInset(side: HudSide, px: number): void;
   /** Ask the camera to frame the whole factory again. */
   requestCameraFit(): void;
   /**
@@ -152,6 +245,20 @@ export interface FabricState {
    * otherwise the second attempt looks like it failed the same way.
    */
   clearError(): void;
+  /** Report a client-side failure (a failed upload) on the same channel as a server error. */
+  setError(message: string): void;
+  /** Forget the last notice, so a stale "saved to …" does not sit under the next thing. */
+  clearNotice(): void;
+  setUploading(uploading: boolean): void;
+  /**
+   * Add what an upload just wrote to the composer. Idempotent by path: a double-fired drop event
+   * (they happen) must not chip the same file twice, and the server never reuses a path.
+   */
+  stageAttachments(saved: readonly SavedAttachment[]): void;
+  /** Take one chip back out. The file stays on disk — it is the operator's. */
+  unstageAttachment(path: string): void;
+  /** Empty the composer's attachment row, which is what sending a turn does. */
+  clearStagedAttachments(): void;
   /**
    * Start dragging a building. `position` is where it stands right now, so the first frame of the
    * drag is identical to the last frame before it and the building never jumps on pointer-down.
@@ -162,34 +269,99 @@ export interface FabricState {
   /** Let go. The caller sends the one `move_room`; the store only forgets the local position. */
   endRoomDrag(): void;
   /**
-   * Put a package on the belt between two rooms. **This is the seam the M3 factory bus plugs into**:
-   * when a real inter-room message exists, the bus calls this and nothing else on the client changes.
-   * Until then the console drawer's manual control is the only caller.
+   * **Demo only.** Puts a package on the belt between two rooms with no message behind it, so the
+   * conveyors can be exercised on a factory with no agents running. Real traffic arrives through
+   * `applyMessages`; this is the console drawer's labelled demo button and nothing else should call
+   * it. Its packages carry `demo-…` ids, which is what keeps them out of the bus's book-keeping.
    */
   sendPackage(from: string, to: string, durationMs?: number): void;
+  /**
+   * The bus's traffic, as the server sees it right now. A **snapshot** of the newest 200 messages,
+   * newest first — not a delta — so this has to be idempotent: applying the same snapshot twice must
+   * animate nothing the second time.
+   *
+   * What it does, per message: a delivery this tab has not seen yet becomes a package on the belt; a
+   * message with no `deliveredAt` becomes a waiting marker at its sender; and the same id flipping
+   * from the second to the first is one object changing state, which is why the package is keyed by
+   * the message id and starts at the door the marker was standing at.
+   */
+  applyMessages(messages: MessageInfo[]): void;
+  /**
+   * The server's project list and the one this socket is on.
+   *
+   * When the active project **changes**, everything scoped to a project is *dropped* rather than
+   * merged: rooms, agents, the board, bus traffic, packages, belts and every transcript. A stale
+   * building from another factory standing on this floor is the visible symptom of merging here, and
+   * it cannot be cleaned up later because nothing in the new project's snapshots mentions it. The
+   * camera is asked to re-frame for the same reason: the new floor is somewhere else.
+   */
+  applyProjects(projects: ProjectInfo[], activeProjectId: string): void;
   /** Drop packages that have arrived. Called from the render loop and by a per-package timer. */
   reapPackages(now?: number): void;
 }
 
-/** Everything except the actions — exported so tests can reset between cases. */
-export const initialFabricState = {
+/**
+ * Everything a project owns, back to empty. Deliberately *not* `initialFabricState`: the HUD's panel
+ * widths, the socket's connected flag and the project list itself are properties of the tab, not of
+ * the factory it happens to be showing.
+ */
+const EMPTY_PROJECT_STATE = {
   sessions: [] as SessionInfo[],
   rooms: [] as RoomInfo[],
   roomIds: [] as string[],
   selectedRoomId: null as string | null,
-  hudInsets: { left: 0, right: 0 } as { left: number; right: number },
-  fitRequests: 0,
   drag: null as RoomDrag | null,
   roomStatus: {} as Record<string, FactoryStatus>,
   conveyors: [] as Conveyor[],
   packages: [] as PackageInFlight[],
+  tasks: [] as TaskInfo[],
+  waiting: [] as WaitingMessage[],
+  animatedMessages: {} as Record<string, true>,
+  // The next project's first `messages` snapshot is history, not news — the same reason a reconnect
+  // re-baselines. Without this every queued message on the new floor would fly down a belt at once.
+  messagesLoaded: false,
   packagedPairs: {} as Record<string, Conveyor>,
   events: {} as Record<string, EventRow[]>,
   lastSeq: {} as Record<string, number>,
   contiguousSeq: {} as Record<string, number>,
   needsResync: {} as Record<string, boolean>,
+  // An error about the factory we just left would sit under whatever the operator does next.
+  lastError: null as string | null,
+  lastNotice: null as string | null,
+  // A staged path points into the folder of the factory we have just left, and the composer it was
+  // staged for belongs to a session on that floor. Carrying it across would name a file at an agent
+  // that cannot see it.
+  staged: [] as StagedAttachment[],
+} as const;
+
+/** Everything except the actions — exported so tests can reset between cases. */
+export const initialFabricState = {
+  projects: [] as ProjectInfo[],
+  activeProjectId: null as string | null,
+  sessions: [] as SessionInfo[],
+  rooms: [] as RoomInfo[],
+  roomIds: [] as string[],
+  selectedRoomId: null as string | null,
+  hudInsets: { left: 0, right: 0, bottom: 0 } as HudInsets,
+  fitRequests: 0,
+  drag: null as RoomDrag | null,
+  roomStatus: {} as Record<string, FactoryStatus>,
+  conveyors: [] as Conveyor[],
+  packages: [] as PackageInFlight[],
+  tasks: [] as TaskInfo[],
+  waiting: [] as WaitingMessage[],
+  animatedMessages: {} as Record<string, true>,
+  messagesLoaded: false,
+  packagedPairs: {} as Record<string, Conveyor>,
+  events: {} as Record<string, EventRow[]>,
+  lastSeq: {} as Record<string, number>,
+  contiguousSeq: {} as Record<string, number>,
+  needsResync: {} as Record<string, boolean>,
+  staged: [] as StagedAttachment[],
+  uploading: false,
   connected: false,
   lastError: null as string | null,
+  lastNotice: null as string | null,
 };
 
 /** Highest seq reachable from `start` with no hole. `rows` must be sorted ascending. */
@@ -210,10 +382,20 @@ function sameRoom(a: RoomInfo, b: RoomInfo): boolean {
     && a.position.x === b.position.x && a.position.z === b.position.z;
 }
 
-/** Every field a figure or a beacon draws from. */
+/**
+ * Whether a rebroadcast changed the pile at all. Rows keep their identity across snapshots
+ * (`applyMessages` reuses them), so this is an identity comparison and the whole list keeps its own
+ * identity when nothing moved — which is what stops a `messages` broadcast that changed one
+ * delivery from re-rendering every waiting marker on the floor.
+ */
+function sameWaiting(a: readonly WaitingMessage[], b: readonly WaitingMessage[]): boolean {
+  return a.length === b.length && a.every((w, i) => w === b[i]);
+}
+
+/** Every field a figure, a beacon or an agent row in the HUD draws from. */
 function sameSession(a: SessionInfo, b: SessionInfo): boolean {
   return a.state === b.state && a.status === b.status && a.blocked === b.blocked
-    && a.autonomy === b.autonomy && a.roomId === b.roomId
+    && a.autonomy === b.autonomy && a.model === b.model && a.roomId === b.roomId
     && a.claudeSessionId === b.claudeSessionId && a.lastSeq === b.lastSeq;
 }
 
@@ -373,14 +555,44 @@ function applySessions(s: FabricState, incoming: SessionInfo[]): Partial<FabricS
   return { sessions, roomStatus: nextRoomStatus(s.roomStatus, s.rooms, sessions) };
 }
 
+/** Every field a card on the board draws from. */
+function sameTask(a: TaskInfo, b: TaskInfo): boolean {
+  return a.title === b.title && a.detail === b.detail && a.status === b.status
+    && a.roomId === b.roomId && a.agentId === b.agentId
+    && a.blockedOnMessageId === b.blockedOnMessageId && a.updatedAt === b.updatedAt;
+}
+
+/**
+ * Same trick as `applyRooms`/`applySessions`: the board is rebroadcast whole on every change, and an
+ * agent driving `factory_task_update` changes it as fast as it can call a tool. Unchanged cards keep
+ * their identity so one moving task repaints one row.
+ */
+function applyTasks(s: FabricState, incoming: TaskInfo[]): Partial<FabricState> | FabricState {
+  const previous = new Map(s.tasks.map((t) => [t.id, t]));
+  const tasks = incoming.map((t) => {
+    const prev = previous.get(t.id);
+    return prev !== undefined && sameTask(prev, t) ? prev : t;
+  });
+  if (tasks.length === s.tasks.length && tasks.every((t, i) => t === s.tasks[i])) return s;
+  return { tasks };
+}
+
 export const useFabric = create<FabricState>((set, get) => ({
   ...initialFabricState,
 
-  apply: (msg) =>
+  apply: (msg) => {
+    // Not a reducer: turning a delivery into a package also arms the reaper's timer, and a timer is
+    // a side effect that has no business inside `set`.
+    if (msg.kind === "messages") return get().applyMessages(msg.messages);
+    if (msg.kind === "projects") return get().applyProjects(msg.projects, msg.activeProjectId);
     set((s) => {
       if (msg.kind === "sessions") return applySessions(s, msg.sessions);
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
+      if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
       if (msg.kind === "error") return { lastError: msg.message };
+      // Not an error, and deliberately not stored with them: "saved to /p/attachments/a.png" is the
+      // server confirming something worked, and painting it red would be a lie.
+      if (msg.kind === "notice") return { lastNotice: msg.message };
       if (msg.kind !== "event") return s;
 
       const { sessionId, seq } = msg;
@@ -407,9 +619,17 @@ export const useFabric = create<FabricState>((set, get) => ({
         contiguousSeq: { ...s.contiguousSeq, [sessionId]: nextContiguous },
         needsResync: { ...s.needsResync, [sessionId]: nextContiguous < nextLast },
       };
-    }),
+    });
+  },
 
-  setConnected: (connected) => set({ connected }),
+  setConnected: (connected) =>
+    set((s) => {
+      // A reconnect re-baselines the bus: the snapshot that follows describes everything that
+      // happened while this tab was not listening, and replaying an hour of it as packages would
+      // animate a factory that has already moved on.
+      if (s.connected === connected) return s;
+      return connected ? { connected } : { connected, messagesLoaded: false };
+    }),
 
   selectRoom: (roomId) => set({ selectedRoomId: roomId }),
 
@@ -425,6 +645,29 @@ export const useFabric = create<FabricState>((set, get) => ({
   requestCameraFit: () => set((s) => ({ fitRequests: s.fitRequests + 1 })),
 
   clearError: () => set((s) => (s.lastError === null ? s : { lastError: null })),
+
+  setError: (message) => set((s) => (s.lastError === message ? s : { lastError: message })),
+
+  clearNotice: () => set((s) => (s.lastNotice === null ? s : { lastNotice: null })),
+
+  setUploading: (uploading) => set((s) => (s.uploading === uploading ? s : { uploading })),
+
+  stageAttachments: (saved) =>
+    set((s) => {
+      const known = new Set(s.staged.map((a) => a.path));
+      const added = saved
+        .filter((a) => !known.has(a.path))
+        .map((a) => ({ path: a.path, name: a.name, bytes: a.bytes }));
+      return added.length === 0 ? s : { staged: [...s.staged, ...added] };
+    }),
+
+  unstageAttachment: (path) =>
+    set((s) => {
+      const staged = s.staged.filter((a) => a.path !== path);
+      return staged.length === s.staged.length ? s : { staged };
+    }),
+
+  clearStagedAttachments: () => set((s) => (s.staged.length === 0 ? s : { staged: [] })),
 
   beginRoomDrag: (roomId, position) => set({ drag: { roomId, position } }),
 
@@ -450,7 +693,7 @@ export const useFabric = create<FabricState>((set, get) => ({
       return {
         packages: [
           ...s.packages,
-          { id: `pkg-${++packageSeq}`, from, to, startedAt: Date.now(), durationMs },
+          { id: `demo-${++packageSeq}`, from, to, startedAt: Date.now(), durationMs },
         ],
         packagedPairs,
         conveyors: packagedPairs === s.packagedPairs
@@ -462,6 +705,104 @@ export const useFabric = create<FabricState>((set, get) => ({
     // and a package that is never reaped leaves `hasMotion` true forever. Belt and braces.
     setTimeout(() => get().reapPackages(), durationMs + 80);
   },
+
+  applyMessages: (incoming) => {
+    const s = get();
+    const now = Date.now();
+    const animated = { ...s.animatedMessages };
+    const started: PackageInFlight[] = [];
+    const waiting: WaitingMessage[] = [];
+    const previousWaiting = new Map(s.waiting.map((w) => [w.id, w]));
+    const pairs: Record<string, Conveyor> = { ...s.packagedPairs };
+    let pairsChanged = false;
+
+    /** A message earns the belt it uses, whether it is riding it or queued at the end of it. */
+    const earnBelt = (from: string, to: string): void => {
+      const key = pairKey(from, to);
+      if (pairs[key] !== undefined) return;
+      pairs[key] = { from, to, fan: 0 };
+      pairsChanged = true;
+    };
+
+    // Oldest first: the snapshot is newest-first, and packages should leave in the order the
+    // messages were actually sent.
+    for (const m of [...incoming].sort((a, b) => a.createdAt - b.createdAt)) {
+      if (m.fromRoomId !== m.toRoomId) earnBelt(m.fromRoomId, m.toRoomId);
+
+      if (m.deliveredAt === null) {
+        // Identity is preserved across snapshots so a rebroadcast does not re-render the pile.
+        const prev = previousWaiting.get(m.id);
+        waiting.push(prev ?? {
+          id: m.id, from: m.fromRoomId, to: m.toRoomId, kind: m.kind, createdAt: m.createdAt,
+        });
+        continue;
+      }
+      // Delivered. Once per message id, ever: the snapshot keeps carrying it for as long as it is
+      // among the newest 200, and it must not fly again on every rebroadcast.
+      if (animated[m.id] === true) continue;
+      animated[m.id] = true;
+      // The first snapshot of a connection is history, not news — see `messagesLoaded`.
+      if (!s.messagesLoaded) continue;
+      // A room talking to itself has no belt to ride. The message is real and is in the log; there
+      // is simply nothing to animate.
+      if (m.fromRoomId === m.toRoomId) continue;
+      // Keyed by the message id, so the box that leaves is the same object as the marker that was
+      // standing there: the waiting marker and the package are two states of one message, and the
+      // package starts at the door the marker stood at rather than appearing from nothing.
+      started.push({
+        id: m.id, from: m.fromRoomId, to: m.toRoomId, startedAt: now, durationMs: DEFAULT_PACKAGE_MS,
+      });
+    }
+
+    const packages = started.length === 0 ? s.packages : [...s.packages, ...started];
+    // Keep only what the snapshot still carries (plus anything still in the air): the record exists
+    // to suppress re-animation of messages we can still be told about, and nothing else.
+    const live = new Set(incoming.map((m) => m.id));
+    for (const p of packages) live.add(p.id);
+    const kept: Record<string, true> = {};
+    for (const id of Object.keys(animated)) if (live.has(id)) kept[id] = true;
+
+    set({
+      packages,
+      waiting: sameWaiting(s.waiting, waiting) ? s.waiting : waiting,
+      animatedMessages: kept,
+      messagesLoaded: true,
+      packagedPairs: pairsChanged ? pairs : s.packagedPairs,
+      conveyors: pairsChanged ? nextConveyors(s.conveyors, s.rooms, pairs) : s.conveyors,
+    });
+
+    // Same belt-and-braces reap as the demo action: a backgrounded tab renders no frames, and an
+    // unreaped package would leave `hasMotion` true for ever.
+    if (started.length > 0) setTimeout(() => get().reapPackages(), DEFAULT_PACKAGE_MS + 80);
+  },
+
+  applyProjects: (projects, activeProjectId) =>
+    set((s) => {
+      const sameList = projects.length === s.projects.length
+        && projects.every((p, i) => {
+          const prev = s.projects[i];
+          return prev !== undefined && prev.id === p.id && prev.name === p.name
+            && prev.root === p.root && prev.lastOpenedAt === p.lastOpenedAt;
+        });
+      // A `projects` frame arrives whenever *anyone* adds or opens a project, so the common case is
+      // that nothing about this tab changed at all.
+      if (sameList && activeProjectId === s.activeProjectId) return s;
+
+      const list = sameList ? s.projects : projects;
+      // First frame of a connection: there is nothing to drop, and dropping would throw away rooms
+      // that legitimately arrived in the same round trip.
+      if (s.activeProjectId === null || s.activeProjectId === activeProjectId) {
+        return { projects: list, activeProjectId };
+      }
+      return {
+        ...EMPTY_PROJECT_STATE,
+        projects: list,
+        activeProjectId,
+        // The new floor is somewhere else on the ground plane; keeping the old camera would leave the
+        // operator looking at empty concrete.
+        fitRequests: s.fitRequests + 1,
+      };
+    }),
 
   reapPackages: (now = Date.now()) =>
     set((s) => {
@@ -476,6 +817,16 @@ export const useFabric = create<FabricState>((set, get) => ({
 // room and its own agent count, so one room's change re-renders one building.
 
 export const useRoomIds = (): string[] => useFabric((s) => s.roomIds);
+
+// ---- projects ----
+
+export const useProjects = (): ProjectInfo[] => useFabric((s) => s.projects);
+
+export const useActiveProjectId = (): string | null => useFabric((s) => s.activeProjectId);
+
+/** The factory this tab is showing, or undefined before the server has said which. */
+export const useActiveProject = (): ProjectInfo | undefined =>
+  useFabric((s) => s.projects.find((p) => p.id === s.activeProjectId));
 
 export const useRoom = (roomId: string): RoomInfo | undefined =>
   useFabric((s) => s.rooms.find((r) => r.id === roomId));
@@ -538,8 +889,10 @@ export const useBeltDirections = (roomId: string): number[] =>
 
 export const useSelectedRoomId = (): string | null => useFabric((s) => s.selectedRoomId);
 
-export const useHudInsets = (): { left: number; right: number } =>
-  useFabric(useShallow((s) => s.hudInsets));
+/** The composer's attachment row. See `StagedAttachment`. */
+export const useStagedAttachments = (): StagedAttachment[] => useFabric((s) => s.staged);
+
+export const useHudInsets = (): HudInsets => useFabric(useShallow((s) => s.hudInsets));
 
 /** Whether *any* building is being dragged. Subscribing to the boolean, not to the moving position. */
 export const useIsDragging = (): boolean => useFabric((s) => s.drag !== null);
@@ -600,6 +953,42 @@ export function roomlessSessions(sessions: readonly SessionInfo[]): SessionInfo[
 
 export const useRoomlessSessions = (): SessionInfo[] =>
   useFabric(useShallow((s) => roomlessSessions(s.sessions)));
+
+// ---- the task board ----
+
+/**
+ * The order the board reads in: what has not started, what is moving, what is stuck, what is up for
+ * review, what is finished. `blocked` sits in the middle rather than at the end because it is the
+ * group the operator is being asked to do something about.
+ */
+export const TASK_STATUS_ORDER: readonly TaskStatus[] = [
+  "open", "in_progress", "blocked", "review", "done",
+];
+
+export const useTasks = (): TaskInfo[] => useFabric((s) => s.tasks);
+
+/** The board grouped for display. Empty groups are kept: an empty column is information. */
+export function tasksByStatus(tasks: readonly TaskInfo[]): { status: TaskStatus; tasks: TaskInfo[] }[] {
+  return TASK_STATUS_ORDER.map((status) => ({ status, tasks: tasks.filter((t) => t.status === status) }));
+}
+
+/**
+ * How many tasks a room still owes. `done` is excluded on purpose: the badge is a workload, and a
+ * room whose every card is finished should read as clear rather than as busy.
+ */
+export function openTaskCount(tasks: readonly TaskInfo[], roomId: string): number {
+  return tasks.filter((t) => t.roomId === roomId && t.status !== "done").length;
+}
+
+export const useRoomTaskCount = (roomId: string): number =>
+  useFabric((s) => openTaskCount(s.tasks, roomId));
+
+/**
+ * The bus messages nobody has picked up yet. Deliberately *not* part of `hasMotion`: the marker is
+ * static, because a pile-up that pinned the frameloop to `"always"` would spin the GPU for as long as
+ * a room was busy — and a queue is a state to read, not an animation to watch.
+ */
+export const useWaitingMessages = (): WaitingMessage[] => useFabric((s) => s.waiting);
 
 /**
  * Whether anything in the scene needs animating. The canvas runs `frameloop="demand"` and only

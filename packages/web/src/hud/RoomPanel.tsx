@@ -1,7 +1,7 @@
 import type { AutonomyMode, SessionInfo } from "@superfabric/shared";
 import { RoomName } from "@superfabric/shared";
+import { BotIcon, FolderIcon, PencilIcon, PlusIcon, WarehouseIcon } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
-import { BYPASS_COLOR, SELECT_COLOR, STATUS_COLOR } from "../scene/palette";
 import type { FactoryStatus } from "../store";
 import {
   agentStatus,
@@ -13,17 +13,21 @@ import {
   useRoomIds,
   useRoomlessSessions,
   useRoomStatus,
+  useRoomTaskCount,
   useSelectedRoomId,
 } from "../store";
+import { Badge } from "../ui/badge";
+import { Button } from "../ui/button";
+import { FieldNote, Input } from "../ui/input";
+import { cn } from "../ui/utils";
 import { send } from "../wsClient";
 import { AutonomySelect } from "./AutonomySelect";
-import { HUD } from "./theme";
-import { useHudInset } from "./useHudInset";
+import { ModelSelect } from "./ModelSelect";
+import { EdgePanel, PanelSection } from "./Panel";
+import { StatusDot } from "./StatusDot";
 
 /**
- * The room panel: the first surface from which a person can actually build a factory. Until now a
- * room could only be created by a WebSocket script, which made the whole floor a thing to look at
- * rather than a thing to use.
+ * The room panel: the first surface from which a person can actually build a factory.
  *
  * It lives on the left because the console drawer owns the right edge; the two never overlap, and
  * between them the middle of the floor stays clear.
@@ -47,31 +51,12 @@ function nameProblem(name: string): string | null {
   return `Not a usable folder name: ${NAME_RULE}.`;
 }
 
-/** The status vocabulary of the floor, as a 8px dot. Colours come from the scene's one table. */
-function StatusDot({ status, title }: { status: FactoryStatus; title?: string }) {
-  return (
-    <span
-      title={title ?? status}
-      aria-label={status}
-      style={{
-        display: "inline-block",
-        width: 8,
-        height: 8,
-        borderRadius: "50%",
-        background: STATUS_COLOR[status],
-        // An idle dot must not read as a light that is on; a ring around it says "known, quiet".
-        boxShadow: status === "idle" ? "none" : `0 0 6px ${STATUS_COLOR[status]}`,
-        flex: "none",
-      }}
-    />
-  );
-}
-
 /** One room in the list: name, live agents, status dot. Selecting it selects the building. */
 const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
   const room = useRoom(roomId);
   const agents = useRoomAgentCount(roomId);
-  const status = useRoomStatus(roomId);
+  const tasks = useRoomTaskCount(roomId);
+  const status: FactoryStatus = useRoomStatus(roomId);
   const selected = useIsSelected(roomId);
   const selectRoom = useFabric((s) => s.selectRoom);
 
@@ -82,62 +67,176 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
       <button
         onClick={() => selectRoom(roomId)}
         title={room.path}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          width: "100%",
-          font: "inherit",
-          textAlign: "left",
-          padding: "5px 7px",
-          marginBottom: 3,
-          cursor: "pointer",
-          // Selection is cyan everywhere, on the floor and in this list: the two are the
-          // same `selectedRoomId`, so they must not be two different colours.
-          background: selected ? "#e6fbff" : "#fff",
-          border: `1px solid ${selected ? SELECT_COLOR : HUD.line}`,
-          borderRadius: 4,
-        }}
+        className={cn(
+          "flex w-full items-center gap-2 rounded-[3px] border px-2 py-1 text-left text-sm",
+          "outline-none transition-colors focus-visible:ring-1 focus-visible:ring-accent",
+          // Selection is cyan everywhere, on the floor and in this list: the two are the same
+          // `selectedRoomId`, so they must not be two different colours.
+          selected
+            ? "border-accent/70 bg-accent/12 text-accent"
+            : "border-transparent text-fg hover:border-line hover:bg-fg/5",
+        )}
       >
         <StatusDot status={status} />
-        <span style={{ fontWeight: selected ? 700 : 400, overflow: "hidden", textOverflow: "ellipsis" }}>
-          {room.name}
-        </span>
-        {room.kind === "project" && <span style={{ color: HUD.dim, fontSize: 12 }}>project</span>}
-        <span style={{ flex: 1 }} />
-        <span style={{ color: HUD.dim, fontSize: 12, whiteSpace: "nowrap" }}>
-          {agents} agent{agents === 1 ? "" : "s"}
+        <span className={cn("truncate", selected && "font-semibold")}>{room.name}</span>
+        {room.kind === "project" && (
+          <span className="shrink-0 text-2xs text-fg-faint">project</span>
+        )}
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {/* Unfinished tasks owned by this room — the same count the board's cards add up to, so the
+              list and the board can never disagree about who owes what. */}
+          {tasks > 0 && (
+            <Badge title={`${tasks} unfinished task${tasks === 1 ? "" : "s"} on the board`}>
+              {tasks}
+            </Badge>
+          )}
+          <span
+            className={cn(
+              "inline-flex items-center gap-0.5 text-2xs tabular-nums",
+              agents > 0 ? "text-fg-muted" : "text-fg-faint",
+            )}
+            title={`${agents} live agent${agents === 1 ? "" : "s"}`}
+          >
+            <BotIcon className="size-3" />
+            {agents}
+          </span>
         </span>
       </button>
     </li>
   );
 });
 
-/** One agent of the selected room: what it is doing, and how much rope it has. */
+/** One agent of the selected room: what it is doing, how much rope it has, and what it runs on. */
 function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolean }) {
   const status = agentStatus(agent);
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+    // Two rows rather than one: the panel is narrow and an agent carries two controls. Wrapping
+    // keeps them both readable instead of squeezing each into a few characters.
+    <div className="flex flex-wrap items-center gap-1.5 rounded-[3px] border border-line/60 bg-panel-sunken/40 px-1.5 py-1">
       <StatusDot status={status} title={`${status} · ${agent.state}`} />
-      <code style={{ fontSize: 12 }} title={agent.id}>
+      <code className="font-mono text-2xs text-fg" title={agent.id}>
         {agent.id.slice(0, 8)}
       </code>
-      <span style={{ color: HUD.dim, fontSize: 12 }}>{status}</span>
+      <span className="text-2xs text-fg-muted">{status}</span>
       {agent.autonomy === "bypass" && (
-        <span title="ungated — nothing this agent does is asked about" style={{ color: BYPASS_COLOR, fontSize: 12 }}>
+        <Badge variant="bypass" title="ungated — nothing this agent does is asked about">
           ungated
-        </span>
+        </Badge>
       )}
-      <span style={{ flex: 1 }} />
-      <AutonomySelect
-        value={agent.autonomy}
-        disabled={!connected}
-        short
-        onChange={(autonomy: AutonomyMode) =>
-          send({ kind: "set_autonomy", sessionId: agent.id, autonomy })
-        }
-      />
+      <span className="ml-auto flex items-center gap-1">
+        <AutonomySelect
+          value={agent.autonomy}
+          disabled={!connected}
+          short
+          onChange={(autonomy: AutonomyMode) =>
+            send({ kind: "set_autonomy", sessionId: agent.id, autonomy })
+          }
+        />
+        {/* Changing this restarts the agent's executor on the new model, resuming the same
+            conversation — see `SessionManager.setModel`. */}
+        <ModelSelect
+          value={agent.model}
+          disabled={!connected}
+          short
+          onChange={(model) => send({ kind: "set_model", sessionId: agent.id, model })}
+        />
+      </span>
     </div>
+  );
+}
+
+/**
+ * The room's folder, and how to point it somewhere else.
+ *
+ * Kept next to the path rather than behind a settings screen because the folder *is* the room: a
+ * department may live in a separate repository, and re-pointing it is a normal thing to do rather than
+ * a repair. The two things an operator must know are said out loud: nothing is moved on disk, and an
+ * agent already running keeps the folder its session started in.
+ */
+function RoomFolder({
+  roomId,
+  path: current,
+  connected,
+}: {
+  roomId: string;
+  path: string;
+  connected: boolean;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [path, setPath] = useState(current);
+  const clearError = useFabric((s) => s.clearError);
+  // How many agents would *not* move with the room. Said before the change rather than after: the
+  // server cannot report it as an error (the change succeeded), and an operator who learns it
+  // afterwards has already been surprised.
+  const running = useRoomAgentCount(roomId);
+
+  function submit(e: React.FormEvent): void {
+    e.preventDefault();
+    const wanted = path.trim();
+    if (wanted === "" || wanted === current) {
+      setEditing(false);
+      return;
+    }
+    clearError();
+    send({ kind: "set_room_path", roomId, path: wanted });
+    setEditing(false);
+  }
+
+  if (!editing) {
+    return (
+      <div className="flex items-start gap-1.5">
+        {/* The path is the room: "room = folder" is the product's central claim, so the folder is
+            shown rather than hidden behind an id. */}
+        <FolderIcon className="mt-0.5 size-3 shrink-0 text-fg-faint" />
+        <span className="min-w-0 break-all font-mono text-2xs text-fg-muted">{current}</span>
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          className="ml-auto shrink-0"
+          onClick={() => {
+            setPath(current);
+            setEditing(true);
+          }}
+          disabled={!connected}
+          title="Point this room at another folder"
+          aria-label="Change folder"
+        >
+          <PencilIcon />
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <Input
+        name="roomPath"
+        value={path}
+        onChange={(e) => setPath(e.target.value)}
+        placeholder="/absolute/path/to/the/folder"
+        className="font-mono text-xs"
+      />
+      <div className="mt-1.5 flex gap-1.5">
+        <Button type="submit" variant="accent" disabled={!connected}>
+          Re-point
+        </Button>
+        <Button type="button" variant="ghost" onClick={() => setEditing(false)}>
+          Cancel
+        </Button>
+      </div>
+      <FieldNote>
+        An absolute path, typed by hand — the browser cannot hand the server a real folder path, so
+        there is no picker. Nothing is moved: this re-points the room, and new agents start in the new
+        folder.
+      </FieldNote>
+      {running > 0 && (
+        <FieldNote className="text-status-blocked">
+          {running} agent{running === 1 ? "" : "s"} already running here will keep the folder{" "}
+          {running === 1 ? "it was" : "they were"} started in until restarted — the SDK owns a live
+          session's working directory.
+        </FieldNote>
+      )}
+    </form>
   );
 }
 
@@ -148,32 +247,48 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
   if (room === undefined) return null;
 
   return (
-    <section style={{ borderTop: `1px solid ${HUD.line}`, paddingTop: 10, marginBottom: 12 }}>
-      <div style={{ fontWeight: 700, marginBottom: 2 }}>{room.name}</div>
-      {/* The path is the room: "room = folder" is the product's central claim, so the folder is
-          shown rather than hidden behind an id. */}
-      <div style={{ color: HUD.dim, fontSize: 12, wordBreak: "break-all", marginBottom: 8 }}>
-        {room.path}
-      </div>
-
-      {agents.length === 0 ? (
-        <div style={{ color: HUD.dim, marginBottom: 8 }}>No agents here yet.</div>
-      ) : (
-        <div style={{ marginBottom: 8 }}>
-          {agents.map((a) => (
-            <AgentLine key={a.id} agent={a} connected={connected} />
-          ))}
+    <PanelSection
+      title={room.name}
+      right={
+        <Button
+          size="xs"
+          variant="accent"
+          onClick={() => send({ kind: "create_session", roomId })}
+          disabled={!connected}
+          title="Start a Claude Code session in this room's folder"
+        >
+          <PlusIcon />
+          agent
+        </Button>
+      }
+    >
+      {room.kind === "project" ? (
+        // The central building stands for the project root itself, so its folder is the project's —
+        // changing it here would let the two disagree. Another factory is another project.
+        <div className="flex items-start gap-1.5">
+          <FolderIcon className="mt-0.5 size-3 shrink-0 text-fg-faint" />
+          <span className="min-w-0 break-all font-mono text-2xs text-fg-muted">{room.path}</span>
         </div>
+      ) : (
+        <RoomFolder roomId={roomId} path={room.path} connected={connected} />
       )}
+      {/* The charter is where an agent learns it is a department with a bus. A room created here
+          gets that section written for it; a folder that already had a CLAUDE.md keeps its own,
+          untouched — so for those it is the operator who has to say it. */}
+      <FieldNote>
+        Charter: <code className="font-mono">CLAUDE.md</code> in that folder. New rooms are told
+        about the factory bus in theirs; a folder that already had one is never overwritten, so add
+        it by hand there.
+      </FieldNote>
 
-      <button
-        onClick={() => send({ kind: "create_session", roomId })}
-        disabled={!connected}
-        style={{ font: "inherit" }}
-      >
-        New agent here
-      </button>
-    </section>
+      <div className="mt-2 space-y-1">
+        {agents.length === 0 ? (
+          <div className="text-2xs text-fg-faint">No agents here yet.</div>
+        ) : (
+          agents.map((a) => <AgentLine key={a.id} agent={a} connected={connected} />)
+        )}
+      </div>
+    </PanelSection>
   );
 }
 
@@ -188,38 +303,37 @@ function UnassignedSessions() {
   if (sessions.length === 0) return null;
 
   return (
-    <section style={{ borderTop: `1px solid ${HUD.line}`, paddingTop: 10 }}>
-      <div style={{ fontWeight: 700 }}>Unassigned agents</div>
-      <div style={{ color: HUD.dim, fontSize: 12, marginBottom: 6 }}>
-        In no room, so nothing on the floor draws them.
+    <PanelSection title="Unassigned agents">
+      <FieldNote className="mt-0 mb-1.5">In no room, so nothing on the floor draws them.</FieldNote>
+      <div className="space-y-0.5">
+        {sessions.map((s) => (
+          <div key={s.id} className="flex items-center gap-1.5">
+            <StatusDot status={agentStatus(s)} title={`${agentStatus(s)} · ${s.state}`} />
+            <code className="font-mono text-2xs text-fg" title={s.id}>
+              {s.id.slice(0, 8)}
+            </code>
+            <span className="text-2xs text-fg-muted">{s.state}</span>
+          </div>
+        ))}
       </div>
-      {sessions.map((s) => (
-        <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
-          <StatusDot status={agentStatus(s)} title={`${agentStatus(s)} · ${s.state}`} />
-          <code style={{ fontSize: 12 }} title={s.id}>
-            {s.id.slice(0, 8)}
-          </code>
-          <span style={{ color: HUD.dim, fontSize: 12 }}>{s.state}</span>
-        </div>
-      ))}
-    </section>
+    </PanelSection>
   );
 }
 
 export function RoomPanel() {
   const [open, setOpen] = useState(true);
   const [name, setName] = useState("");
+  /** An explicit folder for the new room, empty for the default `<project>/<name>`. */
+  const [path, setPath] = useState("");
+  const [showPath, setShowPath] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const roomIds = useRoomIds();
   const selectedRoomId = useSelectedRoomId();
   const connected = useFabric((s) => s.connected);
-  const lastError = useFabric((s) => s.lastError);
   const clearError = useFabric((s) => s.clearError);
   const selectRoom = useFabric((s) => s.selectRoom);
   /** The name we are waiting for the server to confirm, so the new room can be selected on arrival. */
   const pending = useRef<string | null>(null);
-  // How much of the canvas this panel covers, so the camera can frame the floor that is visible.
-  const inset = useHudInset<HTMLElement>("left");
 
   // Select a room the operator just created the moment the broadcast introduces it: they asked for
   // it, so it is what they want to look at — and the detail section is where "New agent here" is.
@@ -237,47 +351,35 @@ export function RoomPanel() {
     const bad = nameProblem(wanted);
     setProblem(bad);
     if (bad !== null) return;
+    const folder = showPath ? path.trim() : "";
     // A stale rejection ("already exists") must not sit under a fresh attempt.
     clearError();
     pending.current = wanted;
-    send({ kind: "create_room", name: wanted });
+    // With a folder the room lives exactly there, anywhere on disk; without one it is
+    // `<project root>/<name>` and the server keeps it inside the root.
+    send({ kind: "create_room", name: wanted, ...(folder === "" ? {} : { path: folder }) });
     setName("");
+    setPath("");
   }
 
   return (
-    <aside
-      ref={inset}
-      style={{
-        position: "fixed",
-        top: 0,
-        left: 0,
-        bottom: 0,
-        width: open ? "min(320px, 32vw)" : "auto",
-        boxSizing: "border-box",
-        fontFamily: "system-ui, sans-serif",
-        fontSize: 14,
-        color: HUD.text,
-        background: open ? HUD.panel : "transparent",
-        borderRight: open ? `1px solid ${HUD.line}` : "none",
-        padding: open ? "12px 14px" : 8,
-        overflowY: "auto",
-      }}
+    <EdgePanel
+      side="left"
+      open={open}
+      onOpenChange={setOpen}
+      label="Rooms"
+      icon={<WarehouseIcon />}
+      summary={roomIds.length}
+      summaryTitle={`Open the room panel — ${roomIds.length} room${roomIds.length === 1 ? "" : "s"}`}
+      headerExtra={
+        <span className="ml-auto text-2xs tabular-nums text-fg-faint">{roomIds.length}</span>
+      }
+      className="w-[min(320px,32vw)]"
     >
-      <button
-        onClick={() => setOpen(!open)}
-        title={open ? "Collapse the room panel" : "Open the room panel"}
-        style={{ font: "inherit", marginBottom: open ? 8 : 0 }}
-      >
-        {open ? "‹ rooms" : "rooms ›"}
-      </button>
-
-      {/* Kept mounted while collapsed so a half-typed room name survives a collapse. */}
-      <div style={{ display: open ? "block" : "none" }}>
-        <h2 style={{ fontSize: 16, margin: "0 0 8px" }}>Rooms</h2>
-
-        <form onSubmit={submit} style={{ marginBottom: 12 }}>
-          <div style={{ display: "flex", gap: 6 }}>
-            <input
+      <div className="px-3 pb-2">
+        <form onSubmit={submit}>
+          <div className="flex gap-1.5">
+            <Input
               name="roomName"
               value={name}
               onChange={(e) => {
@@ -285,36 +387,74 @@ export function RoomPanel() {
                 setProblem(null);
               }}
               placeholder="new room name…"
-              style={{ flex: 1, minWidth: 0, padding: "5px 7px", font: "inherit" }}
             />
-            <button type="submit" disabled={!connected} style={{ font: "inherit" }}>
+            <Button type="submit" variant="accent" disabled={!connected} className="shrink-0">
+              <PlusIcon />
               Create
+            </Button>
+          </div>
+          <FieldNote>The name is the folder name: {NAME_RULE}.</FieldNote>
+          {/* The default is `<project>/<name>`, which is what "room = folder" means most of the
+              time. A department that lives in a separate repository is the exception, so the field
+              for it is out of the way until it is asked for. */}
+          {showPath ? (
+            <>
+              <Input
+                name="roomPath"
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                placeholder="/absolute/path/to/an/existing/repo"
+                className="mt-1.5 font-mono text-xs"
+              />
+              <FieldNote>
+                Typed by hand — the browser cannot hand the server a real folder path, so there is no
+                picker. Leave it empty to use the project's own folder. An existing{" "}
+                <code className="font-mono">CLAUDE.md</code> there is never overwritten.{" "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowPath(false);
+                    setPath("");
+                  }}
+                  className="text-accent underline underline-offset-2 hover:text-accent/80"
+                >
+                  use the default
+                </button>
+              </FieldNote>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowPath(true)}
+              className="mt-1 text-2xs text-fg-muted underline underline-offset-2 hover:text-fg"
+            >
+              Choose a folder outside the project…
             </button>
-          </div>
-          <div style={{ color: HUD.dim, fontSize: 12, marginTop: 4 }}>
-            The name is the folder name: {NAME_RULE}.
-          </div>
-          {problem !== null && <div style={{ color: HUD.err, fontSize: 12, marginTop: 4 }}>{problem}</div>}
-          {lastError !== null && (
-            <div style={{ color: HUD.err, fontSize: 12, marginTop: 4 }}>server: {lastError}</div>
+          )}
+          {/* Local validation only. Anything the *server* says lives in the one notice bar — see
+              `NoticeBar`. */}
+          {problem !== null && (
+            <FieldNote className="text-status-error">{problem}</FieldNote>
           )}
         </form>
+      </div>
 
+      <div className="px-3 pb-2.5">
         {roomIds.length === 0 ? (
-          <div style={{ color: HUD.dim, marginBottom: 12 }}>
+          <div className="text-2xs text-fg-faint">
             {connected ? "No rooms yet." : "Waiting for the server…"}
           </div>
         ) : (
-          <ul style={{ listStyle: "none", margin: "0 0 12px", padding: 0 }}>
+          <ul className="space-y-0.5">
             {roomIds.map((id) => (
               <RoomRow key={id} roomId={id} />
             ))}
           </ul>
         )}
-
-        {selectedRoomId !== null && <SelectedRoom roomId={selectedRoomId} connected={connected} />}
-        <UnassignedSessions />
       </div>
-    </aside>
+
+      {selectedRoomId !== null && <SelectedRoom roomId={selectedRoomId} connected={connected} />}
+      <UnassignedSessions />
+    </EdgePanel>
   );
 }

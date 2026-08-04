@@ -1,10 +1,22 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { RoomName, ringPosition, type RoomInfo, type ScenePosition } from "@superfabric/shared";
 import type { Db } from "./db.js";
+import type { ProjectManager } from "./projectManager.js";
 
-/** Charter template written into a new room's folder. Rooms are folders; this is the room's brief. */
+/**
+ * Charter template written into a new room's folder. Rooms are folders; this is the room's brief.
+ *
+ * The bus section is not decoration: a fresh agent has no other way to learn that it is a department
+ * in a factory, what that department is called, or that the `mcp__factory__*` tools in its tool list
+ * are how it reaches the other rooms. The tool names are the namespaced ones the model actually sees
+ * (`mcp__<server>__<tool>` — see `notes/agent-sdk-api.md`), so an agent can copy them verbatim.
+ *
+ * Kept short on purpose. This is a charter the operator will rewrite, not a manual: everything here
+ * has to survive being read once. An existing `CLAUDE.md` is never overwritten (see `createRoom`), so
+ * a room adopted from a folder that already had one needs this paragraph added by hand.
+ */
 function charter(name: string): string {
   return `# ${name}
 
@@ -19,18 +31,48 @@ _What other rooms can rely on from this one, and what it needs from them._
 ## Conventions
 
 _Anything an agent working here must follow._
+
+## The factory bus
+
+You are the **${name}** room of this factory. The other rooms are other agents working in other
+folders of this project, and you can talk to them:
+
+- \`mcp__factory__factory_send(to_room, kind, body)\` sends a message to another room, addressed by
+  the name on its building. \`kind\` is \`request\` when you need something back, \`response\` when you
+  are answering, \`info\` otherwise.
+- Messages **to** this room arrive as ordinary turns in this session, framed \`[factory bus]\` and
+  naming the room that sent them. Answer them as you would answer anyone — but reply with
+  \`factory_send\`, not just by writing text.
+- \`mcp__factory__factory_task_update(task_id, status)\` moves one of your tasks on the factory's
+  board; \`mcp__factory__factory_report_status(summary)\` puts one line about what you are doing in
+  front of the operator.
+- Do not poll. \`mcp__factory__factory_inbox\` is for re-reading traffic you already have, never for
+  checking whether any arrived — it arrives on its own.
 `;
 }
 
 /** Row shape of the columns a room listing needs. */
 interface RoomRow {
   id: string;
+  project_id: string;
   name: string;
   path: string;
   kind: string;
   pos_x: number;
   pos_z: number;
   agent_count: number;
+}
+
+/** What `createRoom` may be told beyond the name. */
+export interface CreateRoomOptions {
+  /** The factory this room stands on. Defaults to the default project. */
+  projectId?: string;
+  /**
+   * The room's working folder, used **as given**. Omitted, the room is `<project root>/<name>` and
+   * has to stay inside the root; given, it may point anywhere — a department is allowed to live in a
+   * separate repository, and that is the one case where containment does not apply.
+   */
+  path?: string;
 }
 
 /**
@@ -42,29 +84,38 @@ interface RoomRow {
  * Deliberately knows nothing about sessions beyond counting the ones that point at a room.
  */
 export class RoomManager {
-  /** Resolved once: every containment check compares against this exact string. */
-  private readonly root: string;
   private readonly stmts;
 
-  constructor(private db: Db, projectRoot: string) {
-    this.root = path.resolve(projectRoot);
+  /**
+   * `projects` rather than a single root string: a room's default folder is resolved against *its*
+   * project's root, and one manager serves every factory on the server.
+   */
+  constructor(private db: Db, private projects: ProjectManager) {
     this.stmts = {
-      insert: db.prepare("INSERT INTO rooms (id, name, path, kind, pos_x, pos_z) VALUES (?, ?, ?, ?, ?, ?)"),
-      byName: db.prepare("SELECT id FROM rooms WHERE name = ?"),
-      projectRoom: db.prepare("SELECT id FROM rooms WHERE kind = 'project' ORDER BY created_at, rowid LIMIT 1"),
-      countRooms: db.prepare("SELECT COUNT(*) c FROM rooms WHERE kind != 'project'"),
+      insert: db.prepare(
+        "INSERT INTO rooms (id, project_id, name, path, kind, pos_x, pos_z) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ),
+      // Per project: two factories may each have a room called "backend" (migration 5 made the
+      // uniqueness UNIQUE(project_id, name) for exactly this reason).
+      byName: db.prepare("SELECT id FROM rooms WHERE project_id = ? AND name = ?"),
+      projectRoom: db.prepare(
+        "SELECT id FROM rooms WHERE project_id = ? AND kind = 'project' ORDER BY created_at, rowid LIMIT 1",
+      ),
+      countRooms: db.prepare("SELECT COUNT(*) c FROM rooms WHERE project_id = ? AND kind != 'project'"),
       move: db.prepare("UPDATE rooms SET pos_x = ?, pos_z = ? WHERE id = ?"),
+      setPath: db.prepare("UPDATE rooms SET path = ? WHERE id = ?"),
       // One statement for the whole listing: the agent count is a join, not a query per room, and
       // it is the only thing this class ever asks about sessions.
       list: db.prepare(`
-        SELECT r.id AS id, r.name AS name, r.path AS path, r.kind AS kind,
+        SELECT r.id AS id, r.project_id AS project_id, r.name AS name, r.path AS path, r.kind AS kind,
                r.pos_x AS pos_x, r.pos_z AS pos_z, COUNT(s.id) AS agent_count
         FROM rooms r LEFT JOIN sessions s ON s.room_id = r.id
+        WHERE r.project_id = ?
         GROUP BY r.id
         ORDER BY (CASE WHEN r.kind = 'project' THEN 0 ELSE 1 END), r.created_at, r.rowid
       `),
       one: db.prepare(`
-        SELECT r.id AS id, r.name AS name, r.path AS path, r.kind AS kind,
+        SELECT r.id AS id, r.project_id AS project_id, r.name AS name, r.path AS path, r.kind AS kind,
                r.pos_x AS pos_x, r.pos_z AS pos_z, COUNT(s.id) AS agent_count
         FROM rooms r LEFT JOIN sessions s ON s.room_id = r.id
         WHERE r.id = ?
@@ -74,17 +125,19 @@ export class RoomManager {
   }
 
   /**
-   * The single central building, standing for the project root itself. Idempotent: the row is
-   * created once and every later call (including after a restart) returns the same one. No folder is
-   * created — the root already exists, and writing a charter into it would touch the user's repo.
+   * The single central building of one project, standing for its root folder. Idempotent: the row is
+   * created once per project and every later call (including after a restart) returns the same one.
+   * No folder is created — the root already exists, and writing a charter into it would touch the
+   * user's repo.
    */
-  ensureProjectRoom(): RoomInfo {
+  ensureProjectRoom(projectId: string = this.defaultProjectId()): RoomInfo {
+    const root = this.projects.root(projectId);
     // `!= null`, not `!== undefined`: "no such row" is `null` for the driver db.ts uses.
-    const existing = this.stmts.projectRoom.get() as { id: string } | null;
+    const existing = this.stmts.projectRoom.get(projectId) as { id: string } | null;
     if (existing != null) return this.getRoom(existing.id)!;
 
     const id = randomUUID();
-    this.stmts.insert.run(id, this.projectRoomName(), this.root, "project", 0, 0);
+    this.stmts.insert.run(id, projectId, projectRoomName(root), root, "project", 0, 0);
     return this.getRoom(id)!;
   }
 
@@ -92,43 +145,68 @@ export class RoomManager {
    * Create a room: the folder, its charter, and the row. The folder may already exist (adopting a
    * directory that is already part of the repo is the normal case), in which case only the row is
    * new and an existing `CLAUDE.md` is left exactly as it is.
+   *
+   * `opts.path` chooses the folder explicitly and is the *only* way past the containment check —
+   * see `resolveRoomDir`.
    */
-  createRoom(name: string): RoomInfo {
-    // Containment first, so a traversal attempt is reported as what it is even if it would also
-    // fail the name rule. `path.resolve` collapses `..`, so this catches absolute paths too.
-    const dir = path.resolve(this.root, name);
-    if (dir !== this.root && !dir.startsWith(this.root + path.sep)) {
-      throw new Error(`room ${JSON.stringify(name)} resolves outside the project root ${this.root}`);
-    }
-    // Then the shape: a room name is one folder segment, used verbatim.
-    const parsed = RoomName.safeParse(name);
-    if (!parsed.success) {
-      throw new Error(`invalid room name ${JSON.stringify(name)}: ${parsed.error.issues[0]?.message ?? "rejected"}`);
-    }
-    if (dir === this.root) throw new Error(`room ${JSON.stringify(name)} would be the project root itself`);
-    if (this.stmts.byName.get(name) != null) throw new Error(`room ${JSON.stringify(name)} already exists`);
+  createRoom(name: string, opts: CreateRoomOptions = {}): RoomInfo {
+    const projectId = opts.projectId ?? this.defaultProjectId();
+    const dir = this.resolveRoomDir(projectId, name, opts.path);
 
-    mkdirSync(dir, { recursive: true });
-    // Never clobber docs that are already there: a room may be an existing folder with its own
-    // CLAUDE.md, and that file is the operator's, not ours.
-    const claudeMd = path.join(dir, "CLAUDE.md");
-    if (!existsSync(claudeMd)) writeFileSync(claudeMd, charter(name));
+    if (this.stmts.byName.get(projectId, name) != null) {
+      throw new Error(`room ${JSON.stringify(name)} already exists`);
+    }
+
+    this.adoptFolder(dir, name);
 
     const id = randomUUID();
-    const pos = ringPosition((this.stmts.countRooms.get() as { c: number }).c);
-    this.stmts.insert.run(id, name, dir, "room", pos.x, pos.z);
+    const pos = ringPosition((this.stmts.countRooms.get(projectId) as { c: number }).c);
+    this.stmts.insert.run(id, projectId, name, dir, "room", pos.x, pos.z);
     return this.getRoom(id)!;
   }
 
-  /** The project room first, then rooms in creation order. */
-  listRooms(): RoomInfo[] {
-    return (this.stmts.list.all() as RoomRow[]).map(toRoomInfo);
+  /**
+   * Re-point a room at another folder. **Nothing on disk is moved**: this changes where the room *is*,
+   * not where its files are, and the operator is the one who knows whether anything needs copying.
+   *
+   * Agents already running keep the `cwd` their SDK session was started with — the SDK owns a live
+   * session's working directory and there is no way to change it under a running query — so only
+   * agents created after this call work in the new folder. The UI says so next to the field; a silent
+   * half-change would be the worst version of this feature.
+   *
+   * The project room is refused: its folder *is* the project root, and the two must not disagree.
+   */
+  setPath(roomId: string, newPath: string): RoomInfo {
+    const room = this.getRoom(roomId);
+    if (room === undefined) throw new Error(`unknown room ${roomId}`);
+    if (room.kind === "project") {
+      throw new Error("the project room's folder is the project root; create another project instead");
+    }
+    const dir = explicitDir(newPath, room.name);
+    this.adoptFolder(dir, room.name);
+    this.stmts.setPath.run(dir, roomId);
+    return this.getRoom(roomId)!;
+  }
+
+  /** One project's floor: its project room first, then its rooms in creation order. */
+  listRooms(projectId: string = this.defaultProjectId()): RoomInfo[] {
+    return (this.stmts.list.all(projectId) as RoomRow[]).map(toRoomInfo);
   }
 
   /** `undefined` for an unknown room: the absent-row shape the rest of the package speaks. */
   getRoom(roomId: string): RoomInfo | undefined {
     const row = this.stmts.one.get(roomId) as RoomRow | null;
     return row == null ? undefined : toRoomInfo(row);
+  }
+
+  /**
+   * Which factory a room stands on, or `undefined` for an unknown room. Everything that has a room id
+   * and needs a project id — the bus stamping a message, the board refusing a foreign room — asks
+   * here rather than carrying a project through its own call chain.
+   */
+  projectOf(roomId: string): string | undefined {
+    const row = this.stmts.one.get(roomId) as RoomRow | null;
+    return row == null ? undefined : row.project_id;
   }
 
   /** Move a building on the floor. The layout is persisted, so it survives a reload and a restart. */
@@ -139,17 +217,82 @@ export class RoomManager {
   }
 
   /**
-   * The project room's display name is the root's basename. A repository folder is not bound by
-   * `RoomName` (it may be capitalised, or hold spaces), but every `RoomInfo` on the wire must be
-   * protocol-valid — so an unusable basename is folded into a safe label. The project room's name is
-   * only a label anyway: its path is the root, never `root/name`.
+   * Where a new room's folder is. Two cases, and the difference between them is the point:
+   *
+   * - **no explicit path** — `<project root>/<name>`, and the resolved directory must stay under the
+   *   root. This is the case the traversal check protects and it is not relaxed: `..`, an absolute
+   *   name, anything that climbs out is refused.
+   * - **an explicit path** — used as given, anywhere on the filesystem. A department may live in a
+   *   separate repository, so there is nothing to contain it to; the operator typed a path and the
+   *   path is the answer.
    */
-  private projectRoomName(): string {
-    const base = path.basename(this.root);
-    if (RoomName.safeParse(base).success) return base;
-    const folded = base.toLowerCase().replace(/[^a-z0-9._-]/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64);
-    return RoomName.safeParse(folded).success ? folded : "project";
+  private resolveRoomDir(projectId: string, name: string, explicit: string | undefined): string {
+    const root = this.projects.root(projectId);
+    if (explicit !== undefined) {
+      // The name is still a folder segment (it is the label on the building and has to be usable in
+      // a path), so it is checked either way — just not against the root.
+      return explicitDir(explicit, name);
+    }
+    // Containment first, so a traversal attempt is reported as what it is even if it would also
+    // fail the name rule. `path.resolve` collapses `..`, so this catches absolute paths too.
+    const dir = path.resolve(root, name);
+    if (dir !== root && !dir.startsWith(root + path.sep)) {
+      throw new Error(`room ${JSON.stringify(name)} resolves outside the project root ${root}`);
+    }
+    requireRoomName(name);
+    if (dir === root) throw new Error(`room ${JSON.stringify(name)} would be the project root itself`);
+    return dir;
   }
+
+  /**
+   * Make sure the folder is there and has a charter, without ever touching one it already has: a room
+   * may be an existing folder with its own `CLAUDE.md`, and that file is the operator's, not ours.
+   * A room with no charter at all is worse than a surprising one — it is where an agent learns that
+   * it is a department with a bus — so an adopted folder that has none gets ours.
+   */
+  private adoptFolder(dir: string, name: string): void {
+    if (existsSync(dir) && !statSync(dir).isDirectory()) {
+      throw new Error(`room folder is not a directory: ${dir}`);
+    }
+    mkdirSync(dir, { recursive: true });
+    const claudeMd = path.join(dir, "CLAUDE.md");
+    if (!existsSync(claudeMd)) writeFileSync(claudeMd, charter(name));
+  }
+
+  private defaultProjectId(): string {
+    return this.projects.defaultProject().id;
+  }
+}
+
+/** A folder the operator chose by hand: absolute, and named by a usable room name. */
+function explicitDir(given: string, name: string): string {
+  requireRoomName(name);
+  const trimmed = given.trim();
+  if (!path.isAbsolute(trimmed)) {
+    throw new Error(`a room folder must be an absolute path: ${JSON.stringify(given)}`);
+  }
+  return path.resolve(trimmed);
+}
+
+/** A room name is one folder segment, used verbatim. The wire checks it too; this is the second layer. */
+function requireRoomName(name: string): void {
+  const parsed = RoomName.safeParse(name);
+  if (!parsed.success) {
+    throw new Error(`invalid room name ${JSON.stringify(name)}: ${parsed.error.issues[0]?.message ?? "rejected"}`);
+  }
+}
+
+/**
+ * The project room's display name is the root's basename. A repository folder is not bound by
+ * `RoomName` (it may be capitalised, or hold spaces), but every `RoomInfo` on the wire must be
+ * protocol-valid — so an unusable basename is folded into a safe label. The project room's name is
+ * only a label anyway: its path is the root, never `root/name`.
+ */
+function projectRoomName(root: string): string {
+  const base = path.basename(root);
+  if (RoomName.safeParse(base).success) return base;
+  const folded = base.toLowerCase().replace(/[^a-z0-9._-]/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64);
+  return RoomName.safeParse(folded).success ? folded : "project";
 }
 
 function toRoomInfo(row: RoomRow): RoomInfo {
