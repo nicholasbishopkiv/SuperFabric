@@ -1,3 +1,4 @@
+import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
@@ -9,7 +10,10 @@ import { defineConfig } from "vite";
 const serverPort = Number(process.env.SUPERFABRIC_SERVER_PORT ?? 4620);
 
 export default defineConfig({
-  plugins: [react()],
+  // Tailwind v4 is a Vite plugin rather than a PostCSS pass: there is no `tailwind.config.js` and
+  // no content globs — the theme lives in `src/index.css` (`@theme`) and sources are discovered
+  // from the project root.
+  plugins: [tailwindcss(), react()],
   // The dev server proxies the WebSocket so the app can always talk to a same-origin
   // "/ws" and never needs to know the server's port. `/attachments` is the upload endpoint on
   // the same Fastify server and is proxied for the same reason — and the browser's `Origin`
