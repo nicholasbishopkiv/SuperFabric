@@ -5,10 +5,12 @@ import type { Group } from "three";
 import {
   BoxGeometry,
   ConeGeometry,
+  CylinderGeometry,
   MeshBasicMaterial,
   MeshStandardMaterial,
   RingGeometry,
   SphereGeometry,
+  TorusGeometry,
 } from "three";
 import type { Errand, FactoryStatus } from "../store";
 import {
@@ -22,13 +24,16 @@ import { errandAt, fetchPath, pathLength, walkAt, type WalkPath } from "./errand
 import { agentFacing, agentSlots, bayForDirection } from "./layout";
 import {
   BYPASS_COLOR,
+  CARRIED,
   DETAIL,
   FLOOR,
   PACKAGE_COLORS,
   packageToneIndex,
   PROJECT,
+  ROLE_HAT,
   STATUS_COLOR,
 } from "./palette";
+import { type CarryKind, type HatShape, roleLook } from "./roleLook";
 
 /**
  * A worker, in seven boxes and two spheres.
@@ -43,6 +48,11 @@ import {
  * for "this is what this person's state is", and it keeps the loudest colour on the biggest facing
  * surface, where it is legible at low zoom. Trousers, arms, head and helmet are neutral, so the
  * figure still reads as a figure rather than as a coloured pill.
+ *
+ * **The role is the hat and the hand, never the vest.** A role that read as a status would make the
+ * whole floor lie, so it is carried by silhouette (one hat shape and one carried tool per work
+ * family) and by value (five neutral hat colours under 15% saturation), with not one new hue on the
+ * floor. `roleLook.ts` holds the table and the argument for it.
  *
  * Every geometry and every material is created **once for the whole factory**: eight agents in a room
  * must cost eight groups of draw calls, not eight geometry allocations, and every figure of the same
@@ -65,6 +75,18 @@ const HEAD_GEOMETRY = new SphereGeometry(HEAD_RADIUS, 12, 10);
 /** A hard hat: the top half of a sphere, plus a brim, which is a helmet in two primitives. */
 const HELMET_GEOMETRY = new SphereGeometry(0.175, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2);
 const BRIM_GEOMETRY = new BoxGeometry(0.36, 0.045, 0.34);
+/**
+ * The other four hats. See `roleLook.ts` for what each says; here they are three primitives at most,
+ * because the whole point of carrying the role on a *shape* is that the shape has to survive being
+ * twelve pixels across.
+ */
+/** A flat-topped bump cap, and the wider brim that goes with it. */
+const FLAT_CROWN_GEOMETRY = new CylinderGeometry(0.172, 0.178, 0.11, 12);
+const WIDE_BRIM_GEOMETRY = new BoxGeometry(0.44, 0.04, 0.42);
+/** A peak at the front only, which is what turns a dome into a cap rather than a helmet. */
+const PEAK_GEOMETRY = new BoxGeometry(0.28, 0.038, 0.2);
+/** An ear defender. Two of these are the widest hat on the floor, and read as plant from far away. */
+const MUFF_GEOMETRY = new BoxGeometry(0.075, 0.14, 0.13);
 /** The bypass marker: a ring at the feet and a spike over the head. */
 const RING_GEOMETRY = new RingGeometry(0.3, 0.42, 20);
 const SPIKE_GEOMETRY = new ConeGeometry(0.1, 0.24, 8);
@@ -108,16 +130,62 @@ const VEST_MATERIALS: Record<FactoryStatus, MeshStandardMaterial> = {
 const TROUSER_MATERIAL = new MeshStandardMaterial({ color: "#3d4550", roughness: 0.85 });
 const SLEEVE_MATERIAL = new MeshStandardMaterial({ color: "#4b5460", roughness: 0.8 });
 const SKIN_MATERIAL = new MeshStandardMaterial({ color: "#e3c6a8", roughness: 0.85 });
-const HELMET_MATERIAL = new MeshStandardMaterial({ color: "#eef0ee", roughness: 0.45 });
+/**
+ * One material per hat colour, for the whole factory — the five role neutrals plus the
+ * orchestrator's. Keyed by the hex so `roleLook` can hand back a colour rather than a material and
+ * still cost no allocation: eleven role looks across N agents must be N groups of draw calls, not N
+ * materials, and every figure wearing the same hat batches with the others.
+ */
+const HAT_MATERIALS: Record<string, MeshStandardMaterial> = Object.fromEntries(
+  [...new Set([...Object.values(ROLE_HAT), PROJECT.ridge])].map((hex) => [
+    hex,
+    new MeshStandardMaterial({ color: hex, roughness: 0.45 }),
+  ]),
+);
+/** The hat every figure wore before roles existed, and what an unknown role still gets. */
+const HELMET_MATERIAL = HAT_MATERIALS[ROLE_HAT.white];
 /**
  * The orchestrator's hat, in the project block's own eaves colour: it works in the central building
  * and wears headquarters' slate rather than a workshop's white. A second, quieter cue than the
  * standard — legible up close, where the standard is legible from across the floor.
+ *
+ * It **outranks the role's own hat value**, and keeps the role's *shape*: which agent is senior is a
+ * fact about the whole factory, and the shape still says what kind of work it does.
  */
-const ORCHESTRATOR_HELMET_MATERIAL = new MeshStandardMaterial({
-  color: PROJECT.ridge,
-  roughness: 0.45,
-});
+const ORCHESTRATOR_HELMET_MATERIAL = HAT_MATERIALS[PROJECT.ridge];
+
+// ---- what a role carries ------------------------------------------------------------------------
+//
+// Five tools, one per work family, all in neutrals the floor already owns (`CARRIED`): the tool's job
+// is to change a silhouette, and one that also introduced a colour would be paying twice over for a
+// single reading. Every geometry and material here is created once for the factory.
+
+const TOOL_METAL = new MeshStandardMaterial({ color: CARRIED.metal, roughness: 0.45, metalness: 0.5 });
+const TOOL_PALE = new MeshStandardMaterial({ color: CARRIED.pale, roughness: 0.8 });
+const TOOL_DARK = new MeshStandardMaterial({ color: CARRIED.dark, roughness: 0.7 });
+
+/** A rolled drawing, tucked under the arm: the planner's tool. */
+const ROLL_GEOMETRY = new CylinderGeometry(0.045, 0.045, 0.52, 8);
+/** A spanner: a shaft and a head. The builder's. */
+const SPANNER_SHAFT_GEOMETRY = new BoxGeometry(0.055, 0.32, 0.045);
+const SPANNER_HEAD_GEOMETRY = new BoxGeometry(0.13, 0.085, 0.055);
+/** A magnifier: a ring on a handle. The checker's. */
+const LENS_RING_GEOMETRY = new TorusGeometry(0.085, 0.019, 6, 14);
+const LENS_HANDLE_GEOMETRY = new BoxGeometry(0.035, 0.16, 0.035);
+/** A clipboard and its clip. The writer's. */
+const CLIPBOARD_GEOMETRY = new BoxGeometry(0.24, 0.32, 0.025);
+const CLIP_GEOMETRY = new BoxGeometry(0.17, 0.045, 0.04);
+/** A valve handwheel. The operator's, and the roundest thing on any figure. */
+const VALVE_GEOMETRY = new TorusGeometry(0.105, 0.026, 6, 16);
+
+/**
+ * Where a tool is carried: at the **left** side, at hip height.
+ *
+ * Not the right, and that is a collision rather than a preference — the right hand holds the crate on
+ * an errand (`CARRIED_POSITION`) and the orchestrator's mast stands at `MAST_X`. On the body rather
+ * than on the arm group, like the crate, so a swinging arm never swings a spanner through a torso.
+ */
+const TOOL_POSITION: readonly [number, number, number] = [-0.36, LEG_HEIGHT + 0.24, 0.06];
 /** Unlit on purpose: the ungated marker must be equally obvious on a shaded side of the floor. */
 const BYPASS_MATERIAL = new MeshBasicMaterial({ color: BYPASS_COLOR });
 /**
@@ -189,6 +257,89 @@ const CARRIED_POSITION: readonly [number, number, number] = [0.36, LEG_HEIGHT + 
 /** The arm that holds it stays down and a little back, so the crate looks gripped, not balanced. */
 const CARRY_ARM = 0.22;
 
+/**
+ * The hat, in one of five silhouettes. Sits at the same height whatever the shape, so a room of
+ * different roles reads as a row of people and not as a row of different-sized people.
+ */
+function Hat({ shape, material }: { shape: HatShape; material: MeshStandardMaterial }) {
+  const y = HEAD_Y - 0.02;
+  switch (shape) {
+    case "hard":
+      return (
+        <>
+          <mesh geometry={HELMET_GEOMETRY} material={material} position-y={y} />
+          <mesh geometry={BRIM_GEOMETRY} material={material} position-y={y} />
+        </>
+      );
+    case "flat":
+      return (
+        <>
+          <mesh geometry={FLAT_CROWN_GEOMETRY} material={material} position-y={y + 0.075} />
+          <mesh geometry={WIDE_BRIM_GEOMETRY} material={material} position-y={y + 0.01} />
+        </>
+      );
+    case "visor":
+      return (
+        <>
+          <mesh geometry={HELMET_GEOMETRY} material={material} position-y={y} scale-y={0.86} />
+          {/* Front only: a peak all the way round would be the hard hat again. */}
+          <mesh geometry={PEAK_GEOMETRY} material={material} position={[0, y + 0.01, 0.17]} />
+        </>
+      );
+    case "soft":
+      // The same dome, squashed and a little wider than the head it sits on: a soft cap has no brim
+      // and sits low, which is most of what tells it from a helmet — but without the overhang it
+      // reads as a bare head at working zoom, which was visible in the first screenshot of it.
+      return <mesh geometry={HELMET_GEOMETRY} material={material} position-y={y} scale={[1.14, 0.68, 1.14]} />;
+    case "muffs":
+      return (
+        <>
+          <mesh geometry={HELMET_GEOMETRY} material={material} position-y={y} />
+          <mesh geometry={BRIM_GEOMETRY} material={material} position-y={y} />
+          {/* The defenders themselves are plant metal, not hat: they are equipment, and the contrast
+              is what makes the widened silhouette read as two objects rather than as a fat head. */}
+          <mesh geometry={MUFF_GEOMETRY} material={TOOL_METAL} position={[-0.175, y - 0.05, 0]} />
+          <mesh geometry={MUFF_GEOMETRY} material={TOOL_METAL} position={[0.175, y - 0.05, 0]} />
+        </>
+      );
+  }
+}
+
+/** What the figure carries at its left side. `none` draws nothing at all — see `CarryKind`. */
+function CarriedTool({ carry }: { carry: CarryKind }) {
+  if (carry === "none") return null;
+  return (
+    <group position={TOOL_POSITION}>
+      {carry === "roll" && (
+        // Tilted, so it reads as tucked under an arm rather than as a pipe standing beside a leg.
+        <mesh geometry={ROLL_GEOMETRY} material={TOOL_PALE} rotation={[0.24, 0, 0.42]} />
+      )}
+      {carry === "spanner" && (
+        <>
+          <mesh geometry={SPANNER_SHAFT_GEOMETRY} material={TOOL_METAL} />
+          <mesh geometry={SPANNER_HEAD_GEOMETRY} material={TOOL_METAL} position-y={0.17} />
+        </>
+      )}
+      {carry === "lens" && (
+        <>
+          <mesh geometry={LENS_RING_GEOMETRY} material={TOOL_METAL} position-y={0.13} />
+          <mesh geometry={LENS_HANDLE_GEOMETRY} material={TOOL_DARK} />
+        </>
+      )}
+      {carry === "clipboard" && (
+        <>
+          {/* Turned a few degrees out of the body, so the board has a face from the camera's side. */}
+          <mesh geometry={CLIPBOARD_GEOMETRY} material={TOOL_PALE} rotation-y={-0.5} />
+          <mesh geometry={CLIP_GEOMETRY} material={TOOL_METAL} position-y={0.15} rotation-y={-0.5} />
+        </>
+      )}
+      {carry === "valve" && (
+        <mesh geometry={VALVE_GEOMETRY} material={TOOL_METAL} rotation={[0, Math.PI / 2, 0.2]} />
+      )}
+    </group>
+  );
+}
+
 /** One agent's walk to a bay and back: the clock the store fixed, and the route it implies. */
 interface Fetch {
   errand: Errand;
@@ -213,6 +364,7 @@ interface Fetch {
 const AgentFigure = memo(function AgentFigure({
   id,
   status,
+  roleId,
   bypass,
   orchestrator,
   x,
@@ -221,6 +373,11 @@ const AgentFigure = memo(function AgentFigure({
 }: {
   id: string;
   status: FactoryStatus;
+  /**
+   * What this agent arrived as, or `null` for a plain one. Carried on the hat and in the hand and
+   * **never on the vest** — see `roleLook.ts` for why a role is a shape rather than a colour.
+   */
+  roleId: string | null;
   bypass: boolean;
   /** This is the factory's senior agent. See `MAST_GEOMETRY` for why it is a shape and not a hue. */
   orchestrator: boolean;
@@ -298,7 +455,11 @@ const AgentFigure = memo(function AgentFigure({
   }, [working, blocked, fetch, x, z, restYaw]);
 
   const vest = VEST_MATERIALS[status];
-  const helmet = orchestrator ? ORCHESTRATOR_HELMET_MATERIAL : HELMET_MATERIAL;
+  const look = roleLook(roleId);
+  // The role decides the hat's shape; seniority overrules its colour and nothing else.
+  const helmet = orchestrator
+    ? ORCHESTRATOR_HELMET_MATERIAL
+    : (HAT_MATERIALS[look.color] ?? HELMET_MATERIAL);
   const splay = blocked ? WAITING_ARMS : 0;
 
   return (
@@ -333,9 +494,14 @@ const AgentFigure = memo(function AgentFigure({
           </group>
         )}
 
+        {/* The role, in the hand: five tools, one per work family, and the same vocabulary the room's
+            props are drawn from. Inside the facing group so it turns with the body. */}
+        <CarriedTool carry={look.carry} />
+
         <mesh geometry={HEAD_GEOMETRY} material={SKIN_MATERIAL} position-y={HEAD_Y} />
-        <mesh geometry={HELMET_GEOMETRY} material={helmet} position-y={HEAD_Y - 0.02} />
-        <mesh geometry={BRIM_GEOMETRY} material={helmet} position-y={HEAD_Y - 0.02} />
+        {/* The role, on the head: a silhouette per work family in one of five neutral values. It is
+            emphatically **not** a status — see `ROLE_HAT` for why there is no hue left to spend. */}
+        <Hat shape={look.shape} material={helmet} />
 
         {/* The standard is inside the facing group, so it turns with the figure and shows its face
             to the camera rather than its edge. */}
@@ -421,6 +587,7 @@ export const Agents = memo(function Agents({
           key={agent.id}
           id={agent.id}
           status={agentStatus(agent)}
+          roleId={agent.roleId}
           bypass={agent.autonomy === "bypass"}
           orchestrator={agent.isOrchestrator}
           x={slots[i][0]}

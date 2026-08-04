@@ -203,6 +203,67 @@ export const DETAIL = {
   skylight: "#cfe0ea",
 } as const;
 
+// ---- roles, and what a room is furnished with --------------------------------------------------
+
+/**
+ * The values a role's hard hat comes in — and the reason there is not a hue among them.
+ *
+ * The vest is the status and the trim is the department, so a role has to be said somewhere else.
+ * The obvious answer is a hue per role, and **the hue wheel is spoken for**: `STATUS_HUE_BANDS`
+ * takes red-through-amber, green and the bypass magenta; the accent band takes 190–300 for the
+ * departments; and the three slivers left over (60–90 yellow-green, 165–190 teal, 300–318
+ * violet-magenta) are exactly the ones `ACCENT_HUE_MIN`/`MAX` were pulled in to *avoid*, because
+ * even desaturated they read as a cousin of a status. Eleven role hues cannot be cut from that
+ * without one of them lying.
+ *
+ * So role is carried by **shape and value**: a hat silhouette per work family (see `roleLook.ts`)
+ * and one of these five neutrals per role inside it. Every one is under 15% saturation — below the
+ * point the floor's own rules treat a hue as meaning anything at all (`idle` is a 9% slate, and the
+ * accent tests already skip anything under 20% on those grounds) — so a hat can never be mistaken
+ * for a status, for a department or for the ungated marker. Two of them are colours the floor
+ * already wears: `white` is the hard hat every figure wore before roles existed, and `bone` is the
+ * paint on the slab.
+ */
+export const ROLE_HAT = {
+  white: "#eef0ee",
+  bone: FLOOR.paint,
+  steel: "#aab3bd",
+  slate: "#6b7683",
+  graphite: "#454c55",
+} as const;
+
+/**
+ * What a carried tool is made of. Three neutrals the floor already owns — plant metal, the bone
+ * white of its paint, and the near-black of a bay opening — because the tool's job is to change a
+ * **silhouette**, and a tool that also introduced a colour would be paying twice for one reading.
+ */
+export const CARRIED = {
+  metal: DETAIL.vent,
+  pale: FLOOR.paint,
+  dark: DETAIL.bay,
+} as const;
+
+/**
+ * A room's furniture: the bench, the rack, the desk a department works at.
+ *
+ * All cool near-neutrals, in the same family as the buildings they stand against, and deliberately
+ * **not** warm: warm cardboard is what *moves* on this floor (see `PACKAGE_COLORS`), so furniture
+ * borrowing that temperature would read as goods. A prop introduces no hue and no new meaning — it
+ * says what kind of work happens here and then gets out of the way. The one thing on a prop that
+ * ever changes is its lamp or screen, and that reuses `DETAIL.windowGlow` at the glazing's own
+ * intensity rather than inventing a second "somebody is working" colour.
+ */
+export const PROP = {
+  /** Legs, frames, uprights: the same steel as the stanchions on the kerb. */
+  frame: FLOOR.stanchion,
+  /** A worktop, seen from above and therefore the biggest face of any prop. */
+  top: "#7e8792",
+  /** A darker face: a rack's front, the back of a screen, the underside of a bench. */
+  panel: "#4c555f",
+  /** Paper, boards, a drawing pinned to a table. */
+  paper: FLOOR.paint,
+} as const;
+
 /** The package meshes travelling the belts, and the belts themselves. */
 export const BELT_COLOR = "#3f454b";
 export const SLAT_COLOR = "#6d757d";
