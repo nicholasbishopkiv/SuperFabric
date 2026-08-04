@@ -7,6 +7,7 @@ import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
 import { ensureOrchestrator } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
+import type { RoleLibrary } from "./roleLibrary.js";
 import type { RoomManager } from "./roomManager.js";
 import type { TaskRouter } from "./router.js";
 import type { SessionManager } from "./sessionManager.js";
@@ -57,6 +58,13 @@ export interface WsHubOptions {
    * accounts have used nothing" are different facts, and one of them is dangerous to show.
    */
   limits?: LimitMonitor;
+  /**
+   * The role library. Absent => `list_roles` and `set_role` are refused with an error rather than
+   * answered with an empty list, for the same reason the chronicle is: "this server ships no roles"
+   * and "there are no roles" are different facts, and a picker showing the second for the first would
+   * leave the operator looking for a feature that is right there.
+   */
+  roles?: RoleLibrary;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -86,6 +94,7 @@ export class WsHub {
   private readonly accounts: AccountManager | undefined;
   private readonly logins: AccountLoginManager | undefined;
   private readonly limits: LimitMonitor | undefined;
+  private readonly roles: RoleLibrary | undefined;
 
   constructor(
     private store: EventStore,
@@ -102,6 +111,7 @@ export class WsHub {
     this.accounts = opts.accounts;
     this.logins = opts.logins;
     this.limits = opts.limits;
+    this.roles = opts.roles;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -220,6 +230,9 @@ export class WsHub {
             // resolution is the session runner's, not this hub's: an agent's account is decided once,
             // where it is written to the row.
             accountId: msg.accountId,
+            // Omitted => a plain agent. An unknown id throws into the catch below rather than
+            // quietly starting a session that is not what was asked for.
+            roleId: msg.roleId,
             projectId: this.activeProject(sock),
           });
           this.broadcastSessions();
@@ -256,9 +269,26 @@ export class WsHub {
           break;
         // A query, not a state change: the answer belongs to the socket that asked. Broadcasting it
         // would make every tab's connect handshake spam every other tab with lists it already has.
+        // And the fourth of the family. A role composes the system prompt, the model and the tool
+        // servers — all `Options` fields fixed for the lifetime of a `query()` — so the session's
+        // executor is restarted and resumed rather than mutated.
+        case "set_role":
+          void this.mgr.setRole(msg.sessionId, msg.roleId).then(
+            () => { this.broadcastSessions(); },
+            (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
+          );
+          break;
         case "list_sessions":
           this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions(this.activeProject(sock)) });
           break;
+        // The role library, with its own failures attached. Machine-wide like the accounts — a role
+        // is a file on this machine, not a property of a factory — so the answer is the same on every
+        // floor and, like every other listing, it goes to the socket that asked.
+        case "list_roles": {
+          const roles = this.roleStore();
+          this.safeSend(sock, { kind: "roles", roles: roles.list(), problems: roles.problems() });
+          break;
+        }
         // The factory's senior agent. Idempotent, so the UI can call it from a button without first
         // asking whether one exists; the answer is the same fresh `sessions` list either way, and the
         // socket is subscribed to it so the operator can watch it work. It stands in the project room,
@@ -674,6 +704,12 @@ export class WsHub {
   private limitStore(): LimitMonitor {
     if (this.limits === undefined) throw new Error("this server does not monitor limits");
     return this.limits;
+  }
+
+  /** Likewise for roles: a server that ships none says so rather than answering with an empty picker. */
+  private roleStore(): RoleLibrary {
+    if (this.roles === undefined) throw new Error("this server has no role library");
+    return this.roles;
   }
 
   /** Likewise for the bus: "no factory bus here" is an answer, an empty list would be a lie. */

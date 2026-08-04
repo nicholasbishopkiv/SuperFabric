@@ -203,6 +203,23 @@ const MIGRATIONS: readonly Migration[] = [
     ALTER TABLE sessions ADD COLUMN paused_until INTEGER;
     ALTER TABLE usage_snapshots ADD COLUMN limited_by TEXT;
   `,
+  // 12 — M1c roles. The fourth member of the `autonomy`/`model`/`account_id` family and stored the
+  // same way, because it is the same kind of fact: a per-session choice that has to be re-applied
+  // when the agent comes back, or a rebooted architect returns as a blank session standing in the
+  // architect's room.
+  //
+  // **The id, not the role.** A role is a file; this column indexes it. Copying the charter onto the
+  // row would freeze it at the moment the agent was created, so an operator who fixed a typo in a
+  // preset would find their running agents still reciting the typo — and there would be no way to
+  // tell which of them were on which version. NULL is "a plain agent", which is what every session
+  // before this column was and still is.
+  //
+  // No foreign key and no CHECK, for the reason every other reference here has none: a role file the
+  // operator deleted must not stop a session resuming. An id that resolves to nothing resolves to
+  // "no role", loudly (see `SessionManager.roleOf`).
+  `
+    ALTER TABLE sessions ADD COLUMN role_id TEXT;
+  `,
 ];
 
 /**

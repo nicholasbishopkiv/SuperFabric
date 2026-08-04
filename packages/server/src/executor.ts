@@ -54,6 +54,18 @@ export interface ExecutorStartOptions {
    * second executor instance per role, i.e. a parallel runtime for what is one session with a job.
    */
   appendSystemPrompt?: string;
+  /**
+   * Tool names this session pre-approves, in the SDK's `allowedTools` sense: an **auto-allow list**,
+   * not a restriction. Anything named here is allowed without reaching the operator, so an entry is a
+   * privilege grant and MCP tools have to be written in the namespaced form the model sees
+   * (`mcp__<server>__<tool>`).
+   *
+   * Per session because it comes from a session's role, and empty for every session that has none —
+   * which is the shape every session had before roles existed, and the shape the ten shipped presets
+   * still have. Nothing in the product grants a privilege on an operator's behalf; this exists so a
+   * role an operator wrote *can*.
+   */
+  allowedTools?: readonly string[];
 }
 
 export interface ExecutorHandle {
