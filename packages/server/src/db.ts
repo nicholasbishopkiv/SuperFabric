@@ -245,6 +245,29 @@ const MIGRATIONS: readonly Migration[] = [
     );
     CREATE INDEX IF NOT EXISTS room_suggestions_project ON room_suggestions (project_id, created_at);
   `,
+  // 14 — M4: where a room's agents run.
+  //
+  // `'host'` for every row, which is what every room has always done: the column is a *widening*,
+  // and an operator who upgrades must find their factory behaving exactly as it did. Sandboxing is
+  // something they turn on, per room, having read the one line next to the switch.
+  //
+  // On the room rather than on the session, and deliberately unlike `autonomy`/`model`/`account_id`
+  // /`role_id` — those are properties of an agent, this is a property of the *work*. A department
+  // whose folder is worth isolating is worth isolating for everyone who stands in it, and a factory
+  // where half the agents in one room were contained and half were not would be a factory whose
+  // security posture nobody could state. It is read when an executor starts, so an agent already
+  // running keeps the runtime it started in until it is restarted — the same rule the room's folder
+  // and its account already follow, and said in the same words in the UI.
+  //
+  // Plain TEXT, and deliberately **no CHECK** — the same choice `sessions.role_id` and every other
+  // reference in this file makes. Two reasons, one of principle and one mechanical: an unrecognised
+  // value already folds to `host` in TypeScript (`asRuntime` in `roomManager.ts`), which is the
+  // least privileged of the two and therefore the only safe direction for a fallback to lean; and
+  // SQLite refuses `DROP COLUMN` on a column named in a CHECK, which would make this the one column
+  // in the schema a later migration could not undo.
+  `
+    ALTER TABLE rooms ADD COLUMN runtime TEXT NOT NULL DEFAULT 'host';
+  `,
 ];
 
 /**

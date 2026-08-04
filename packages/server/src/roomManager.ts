@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
-  PROJECT_CHARTER_FILE, RoomName, ringPosition, type RoomInfo, type ScenePosition,
+  DEFAULT_ROOM_RUNTIME, PROJECT_CHARTER_FILE, RoomName, RoomRuntime, ringPosition,
+  type RoomInfo, type ScenePosition,
 } from "@superfabric/shared";
 import type { Db } from "./db.js";
 import type { ProjectManager } from "./projectManager.js";
@@ -89,6 +90,8 @@ interface RoomRow {
   agent_count: number;
   /** The account new agents here start on; NULL is the ambient `~/.claude`. */
   account_id: string | null;
+  /** `host` | `container`. A hand-edited value folds to `host` — see `asRuntime`. */
+  runtime: string;
 }
 
 /**
@@ -97,7 +100,8 @@ interface RoomRow {
  */
 const ROOM_COLUMNS = `
   r.id AS id, r.project_id AS project_id, r.name AS name, r.path AS path, r.kind AS kind,
-  r.pos_x AS pos_x, r.pos_z AS pos_z, r.account_id AS account_id, COUNT(s.id) AS agent_count
+  r.pos_x AS pos_x, r.pos_z AS pos_z, r.account_id AS account_id, r.runtime AS runtime,
+  COUNT(s.id) AS agent_count
 `;
 
 /** What `createRoom` may be told beyond the name. */
@@ -149,6 +153,7 @@ export class RoomManager {
       move: db.prepare("UPDATE rooms SET pos_x = ?, pos_z = ? WHERE id = ?"),
       setPath: db.prepare("UPDATE rooms SET path = ? WHERE id = ?"),
       setAccount: db.prepare("UPDATE rooms SET account_id = ? WHERE id = ?"),
+      setRuntime: db.prepare("UPDATE rooms SET runtime = ? WHERE id = ?"),
       // One statement for the whole listing: the agent count is a join, not a query per room, and
       // it is the only thing this class ever asks about sessions.
       list: db.prepare(`
@@ -246,6 +251,26 @@ export class RoomManager {
    */
   setAccount(roomId: string, accountId: string | null): RoomInfo {
     const changed = this.stmts.setAccount.run(accountId, roomId).changes;
+    if (changed === 0) throw new Error(`unknown room ${roomId}`);
+    return this.getRoom(roomId)!;
+  }
+
+  /**
+   * Choose whether agents here run on the host or in a container.
+   *
+   * A **default for the next executor start**, exactly as the room's account is: an agent's runtime
+   * is fixed when its `query()` begins — a live session cannot be moved into a container, any more
+   * than its `cwd` or its `CLAUDE_CONFIG_DIR` can be changed underneath it — so nobody already
+   * working moves. `WsHub` says so out loud rather than leaving the operator to infer it from an
+   * agent that did not change.
+   *
+   * The value is validated here as well as on the wire, because the column has a CHECK and a
+   * rejected write would surface as a SQLite constraint error rather than as a sentence.
+   */
+  setRuntime(roomId: string, runtime: RoomRuntime): RoomInfo {
+    const parsed = RoomRuntime.safeParse(runtime);
+    if (!parsed.success) throw new Error(`unknown runtime ${JSON.stringify(runtime)}`);
+    const changed = this.stmts.setRuntime.run(parsed.data, roomId).changes;
     if (changed === 0) throw new Error(`unknown room ${roomId}`);
     return this.getRoom(roomId)!;
   }
@@ -366,5 +391,17 @@ function toRoomInfo(row: RoomRow): RoomInfo {
     kind: row.kind === "project" ? "project" : "room",
     agentCount: row.agent_count,
     accountId: row.account_id,
+    runtime: asRuntime(row.runtime),
   };
+}
+
+/**
+ * `rooms.runtime` is a TEXT column, so a hand-edited or downgraded database could hold anything. An
+ * unparseable value folds to `host` — the pre-M4 behaviour, and the reading that can never
+ * *silently* claim an isolation the operator is not getting. A row that says nothing must not be
+ * shown as sandboxed.
+ */
+function asRuntime(value: string | null | undefined): RoomRuntime {
+  const parsed = RoomRuntime.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_ROOM_RUNTIME;
 }

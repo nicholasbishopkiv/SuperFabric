@@ -294,6 +294,26 @@ export const RoomName = z.string().min(1).max(64).regex(
 export const ScenePosition = z.object({ x: z.number(), z: z.number() });
 export type ScenePosition = z.infer<typeof ScenePosition>;
 
+/**
+ * Where a room's agents actually run.
+ *
+ * - `host` — in the server's own process tree, as the operator, with the operator's filesystem. What
+ *   every room did before M4, and still the default: it is the fastest path, it needs no Docker, and
+ *   on a machine the operator trusts it is a perfectly reasonable choice.
+ * - `container` — one container per agent, holding only that room's folder and that account's
+ *   credentials, capped on CPU, memory and processes, with default-deny egress.
+ *
+ * Per **room** rather than per session because it is a property of the work, not of one agent: a
+ * department whose folder is worth sandboxing is worth sandboxing for everyone who stands in it. It
+ * is read when an agent's executor starts, so — exactly like the room's folder and its account — an
+ * agent already running keeps the runtime it started in until it is restarted.
+ */
+export const RoomRuntime = z.enum(["host", "container"]);
+export type RoomRuntime = z.infer<typeof RoomRuntime>;
+
+/** What a room runs on when nobody has chosen: the pre-M4 behaviour, unchanged. */
+export const DEFAULT_ROOM_RUNTIME: RoomRuntime = "host";
+
 export const RoomInfo = z.object({
   id: z.string(),
   /** Folder segment and display name. */
@@ -313,6 +333,11 @@ export const RoomInfo = z.object({
    * fixed for the lifetime of its `query()`. See `SessionInfo.accountId`.
    */
   accountId: z.string().nullable().default(null),
+  /**
+   * Whether agents here run on the host or in a container. Defaults to `host`, so a room row written
+   * before M4 — and a client built before it — reads the same as it always did.
+   */
+  runtime: RoomRuntime.default(DEFAULT_ROOM_RUNTIME),
 });
 export type RoomInfo = z.infer<typeof RoomInfo>;
 
@@ -721,6 +746,14 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * move a running agent; `set_session_account` is.
    */
   z.object({ kind: z.literal("set_room_account"), roomId: z.string(), accountId: z.string().nullable() }),
+  /**
+   * Whether agents created in this room run on the host or in a container.
+   *
+   * A default for *new* agents and for the next restart of an existing one, said the same way the
+   * room's folder and account are: an agent already working keeps the runtime its executor was
+   * started in, because there is no way to move a running `query()` into a container.
+   */
+  z.object({ kind: z.literal("set_room_runtime"), roomId: z.string(), runtime: RoomRuntime }),
   z.object({ kind: z.literal("list_rooms") }),
   // Accounts. Machine-wide rather than project-scoped (see `AccountInfo`), so unlike every other
   // listing here these four take no project and their answer is the same on every floor.
@@ -924,6 +957,19 @@ export const SessionInfo = z.object({
    * "working", and like `status` it must not require a transcript replay to know.
    */
   blocked: z.boolean(),
+  /**
+   * Where this agent's executor is **actually** running — not what its room is set to. `null` means
+   * it is not running at all (stopped, paused, errored, or not yet resumed).
+   *
+   * Live rather than stored, and that is the whole point of it. A room's runtime is a default for
+   * the next executor start, so an operator who switches a room to `container` while three agents
+   * are working has three agents still on the host until each restarts. Everywhere else in the
+   * product that lag is a mild surprise (an agent keeps its old folder, its old account); here it
+   * would be the floor claiming an isolation that is not in force, which is the one kind of lie a
+   * sandbox must never tell. So the room says what the next agent gets, and every agent says what
+   * *it* got.
+   */
+  runtime: RoomRuntime.nullable().default(null),
 });
 export type SessionInfo = z.infer<typeof SessionInfo>;
 

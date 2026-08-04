@@ -8,5 +8,9 @@
     "build": "pnpm -r --if-present build",
     "dev": "pnpm -r --parallel --if-present dev"
   },
-  "devDependencies": { "typescript": "^5.6.0", "vitest": "^3.0.0" }
+  "devDependencies": { "typescript": "^5.6.0", "vitest": "^3.0.0" },
+  "pnpm": {
+    "//": "dockerode drags in ssh2 (for docker-over-ssh, which we never use) and ssh2 drags in cpu-features; both have node-gyp install scripts and both are optional accelerators with pure-JS fallbacks. Building them would put node-gyp back into `pnpm install` — exactly the step `docs/decisions/0001-bun-runtime-keep-vite.md` removed by choosing bun:sqlite over better-sqlite3. We talk to the daemon over its unix socket, so nothing here is even loaded.",
+    "neverBuiltDependencies": ["cpu-features", "ssh2"]
+  }
 }

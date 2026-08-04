@@ -44,12 +44,12 @@ beforeEach(() => {
 const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
   autonomy: "auto", model: null, roomId: null, accountId: null, roleId: null, pausedUntil: null,
-  status: "idle", blocked: false, isOrchestrator: false, ...over,
+  status: "idle", blocked: false, isOrchestrator: false, runtime: null, ...over,
 });
 
 const room = (over: Partial<RoomInfo> = {}): RoomInfo => ({
   id: "r1", name: "backend", path: "/p/backend", position: { x: 8, z: 0 },
-  kind: "room", agentCount: 0, accountId: null, ...over,
+  kind: "room", agentCount: 0, accountId: null, runtime: "host", ...over,
 });
 
 /** A bus message with every field the protocol requires; cases override just what they are about. */

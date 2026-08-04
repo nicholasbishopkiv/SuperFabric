@@ -470,6 +470,7 @@ function contiguousFrom(rows: EventRow[], start: number): number {
 function sameRoom(a: RoomInfo, b: RoomInfo): boolean {
   return a.name === b.name && a.path === b.path && a.kind === b.kind
     && a.agentCount === b.agentCount && a.accountId === b.accountId
+    && a.runtime === b.runtime
     && a.position.x === b.position.x && a.position.z === b.position.z;
 }
 
@@ -494,6 +495,7 @@ function sameSession(a: SessionInfo, b: SessionInfo): boolean {
     && a.autonomy === b.autonomy && a.model === b.model && a.roomId === b.roomId
     && a.isOrchestrator === b.isOrchestrator && a.accountId === b.accountId
     && a.roleId === b.roleId
+    && a.runtime === b.runtime
     && a.pausedUntil === b.pausedUntil
     && a.claudeSessionId === b.claudeSessionId && a.lastSeq === b.lastSeq;
 }

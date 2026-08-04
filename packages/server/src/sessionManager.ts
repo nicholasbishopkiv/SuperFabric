@@ -18,7 +18,8 @@ import type { TaskRouter } from "./router.js";
 import { describeInstall, type SkillLibrary } from "./skills.js";
 import type { TaskStore } from "./taskStore.js";
 import {
-  AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type RoleSpec, type SessionInfo,
+  AutonomyMode, DEFAULT_AUTONOMY, DEFAULT_ROOM_RUNTIME, RoomRuntime, SessionStatus,
+  type RoleSpec, type SessionInfo,
 } from "@superfabric/shared";
 
 /**
@@ -120,6 +121,16 @@ export interface SessionManagerOptions {
    */
   onboarding?: OnboardingManager;
   /**
+   * The executor for rooms whose runtime is `container`.
+   *
+   * Absent => a room set to `container` still runs on the host, and says so in the agent's own log
+   * rather than failing to start. That is the pre-M4 shape and a valid server (no Docker on the
+   * machine, or the operator switched it off) rather than a broken one — the same arrangement
+   * `accounts`, `bus` and `roles` have. What it must never be is *silent*: an operator who chose a
+   * sandbox and got the host has to be told, in the one place they will look.
+   */
+  containerExecutor?: Executor;
+  /**
    * A session was refused with a rate-limit error.
    *
    * The one thing the session runner knows about limits, and it reports it rather than acting on it:
@@ -220,6 +231,16 @@ export class SessionManager {
    * are dropped rather than appended.
    */
   private generation = new Map<string, number>();
+  /**
+   * sessionId -> the runtime its *live* executor was actually started in.
+   *
+   * In memory rather than on the row, because it is a fact about a running process and not about a
+   * session: an agent that is not running has no runtime, and a stored value would keep claiming one
+   * after the executor was gone. It is what makes `SessionInfo.runtime` able to contradict the room
+   * — which is exactly what has to happen while a room the operator has just switched to `container`
+   * still holds agents that started on the host.
+   */
+  private liveRuntime = new Map<string, RoomRuntime>();
   private readonly stmts;
 
   constructor(
@@ -734,6 +755,34 @@ export class SessionManager {
   /** Let go of a session's current executor: anything it says from now on is teardown noise. */
   private supersede(id: string): void {
     this.generation.set(id, (this.generation.get(id) ?? 0) + 1);
+    // An agent with no executor is running in no runtime. Cleared here rather than at each call
+    // site, so a path that forgets to say "this one has stopped" cannot leave the floor showing a
+    // sandbox that no longer exists.
+    this.liveRuntime.delete(id);
+  }
+
+  /**
+   * Which runtime this agent's executor should be started in — the room's choice, honestly degraded.
+   *
+   * A roomless session is always on the host: there is no room to have chosen, and a container needs
+   * a workspace to mount. A room asking for a container on a server that has no container executor
+   * gets the host **and a line in its own log saying so**: an operator who chose a sandbox and
+   * silently got the operator's own machine would have every reason to believe their agent was
+   * contained when it was not, which is worse than never offering the choice.
+   */
+  private runtimeFor(sessionId: string, roomId: string | null): RoomRuntime {
+    if (roomId === null) return "host";
+    const wanted = this.rooms.getRoom(roomId)?.runtime ?? DEFAULT_ROOM_RUNTIME;
+    if (wanted !== "container") return "host";
+    if (this.opts.containerExecutor !== undefined) return "container";
+    this.store.append(sessionId, {
+      type: "session_status",
+      status: "starting",
+      detail: "this room is set to run agents in a container, but this server has no container "
+        + "runtime configured — starting on the host instead, with the operator's own filesystem "
+        + "and credentials",
+    });
+    return "host";
   }
 
   private startExecutor(id: string, spec: RunSpec) {
@@ -768,9 +817,21 @@ export class SessionManager {
       ...this.busToolServers(id, roomId, isOrchestrator, role?.id === ONBOARDING_ROLE_ID),
     };
 
-    const handle = this.executor.start(
+    // Which executor an agent gets is decided here and nowhere else, from the room's runtime. Below
+    // this line nothing branches on it: the same options go to whichever executor answered, and the
+    // events, the approvals, the log and the resume are the same in both directions. That is the
+    // seam paying for itself, and `test/containerEquivalence.test.ts` is what holds it down.
+    const contained = this.opts.containerExecutor;
+    const runtime = this.runtimeFor(id, roomId);
+    const executor = runtime === "container" && contained !== undefined ? contained : this.executor;
+    this.liveRuntime.set(id, runtime);
+
+    const handle = executor.start(
       {
         cwd, resumeSessionId: resume, autonomy, model: effectiveModel,
+        // What lets a contained agent be found again after a server restart: the container carries
+        // this as a label. The local executor ignores it — see `ExecutorStartOptions.sessionKey`.
+        sessionKey: id,
         ...(configDir !== undefined ? { configDir } : {}),
         mcpServers,
         ...(appendSystemPrompt !== undefined ? { appendSystemPrompt } : {}),
@@ -1030,14 +1091,26 @@ export class SessionManager {
     // 'active' and comes back on the next boot, where the scheduler will decide again from a fresh
     // reading — writing 'paused' here would hold an agent for a limit that may have rolled overnight.
     this.pausePending.clear();
-    await Promise.allSettled(handles.map((h) => this.stopWithTimeout(h, timeoutMs)));
+    // `detach` where the executor has one, `stop` otherwise. The difference matters for exactly one
+    // kind of agent: a contained one, which is a container with a buffered outbox that is already
+    // reconnecting. Shutting the server down is not a reason to end it — the next boot re-attaches
+    // and replays everything it missed, so an operator restarting SuperFabric loses nothing. A local
+    // agent has no such option: its subprocess dies with us either way.
+    await Promise.allSettled(handles.map((h) => this.stopWithTimeout(h, timeoutMs, "detach")));
   }
 
-  private stopWithTimeout(handle: ExecutorHandle, timeoutMs: number): Promise<void> {
+  private stopWithTimeout(
+    handle: ExecutorHandle,
+    timeoutMs: number,
+    mode: "stop" | "detach" = "stop",
+  ): Promise<void> {
+    const end = mode === "detach" && handle.detach !== undefined
+      ? handle.detach.bind(handle)
+      : handle.stop.bind(handle);
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("stop() timed out")), timeoutMs);
       timer.unref();
-      handle.stop().then(
+      end().then(
         () => { clearTimeout(timer); resolve(); },
         (err) => { clearTimeout(timer); reject(err); },
       );
@@ -1084,6 +1157,9 @@ export class SessionManager {
       status: asStatus(r.status),
       blocked: r.blocked === 1,
       isOrchestrator: r.is_orchestrator === 1,
+      // Not from the row: where the agent is *actually* running, or null when it is not running at
+      // all. See `SessionInfo.runtime` for why a room's setting is not good enough here.
+      runtime: this.liveRuntime.get(r.id) ?? null,
     }));
   }
 }
