@@ -17,8 +17,10 @@ import { STATUS_COLOR } from "../scene/palette";
  * been worse than nothing, because it reads as "zero".
  *
  * **Both approximations are marked, and they are different approximations.** A projection built on
- * estimated readings gets the same `≈` the meters above it use. The cost figure gets one always: it is
- * a *cost-equivalent* reconstructed from the provider's own per-query counter, and on a subscription no
+ * estimated readings says "at this **estimated** rate" and carries the meters' `≈` on the rate itself —
+ * in words on the headline, because "≈about 3 h" put two hedges in a row and read as noise where the
+ * provenance is the thing that has to be legible. The cost figure gets a `≈` always: it is a
+ * *cost-equivalent* reconstructed from the provider's own per-query counter, and on a subscription no
  * money changes hands per turn. Neither number is presented as harder than it is.
  */
 
@@ -111,7 +113,12 @@ export function BurnRate({ burn, cost }: { burn: AccountBurn | undefined; cost: 
             aria-hidden
             style={{ color: urgencyColor(burn.secondsToLimit) }}
           />
-          <span className="text-2xs text-fg-muted">at this rate</span>
+          {/* Marked in words rather than with a `≈` in front of "about 3 h", which read as noise.
+              The provenance is what has to be visible, and "(estimated)" is how the meters above say
+              the same thing. */}
+          <span className="text-2xs text-fg-muted">
+            at this {burn.approximate ? "estimated " : ""}rate
+          </span>
           <span
             className="font-mono text-xs font-semibold tabular-nums"
             style={{ color: urgencyColor(burn.secondsToLimit) }}
@@ -121,12 +128,14 @@ export function BurnRate({ burn, cost }: { burn: AccountBurn | undefined; cost: 
               + `${burn.samples} readings over ${Math.round(burn.spanSeconds / 60)} min`
             }
           >
-            {/* The mark travels with the figure: a projection off estimated readings is a guess about
-                a guess, and must never be shown as hard as one off the endpoint's own numbers. */}
-            {burn.approximate ? "≈" : ""}{formatRemaining(burn.secondsToLimit)}
+            {formatRemaining(burn.secondsToLimit)}
           </span>
           <span className="ml-auto shrink-0 font-mono text-2xs tabular-nums text-fg-faint">
-            {burn.windowLabel} · {burn.percentPerHour !== null ? formatRate(burn.percentPerHour) : ""}
+            {burn.windowLabel} ·{" "}
+            {/* The mark travels with the figure wherever the figure goes: a rate off estimated
+                readings must never look as hard as one off the endpoint's own numbers. */}
+            {burn.approximate ? "≈" : ""}
+            {burn.percentPerHour !== null ? formatRate(burn.percentPerHour) : ""}
           </span>
         </div>
       )}
