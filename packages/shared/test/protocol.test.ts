@@ -118,6 +118,15 @@ describe("protocol", () => {
         .toEqual({ kind: "ensure_orchestrator" });
     });
 
+    it("parses route_task, which asks and never assigns", () => {
+      expect(ClientMessage.parse({ kind: "route_task", taskId: "t1" }))
+        .toEqual({ kind: "route_task", taskId: "t1" });
+      // no room on it: naming one would be the operator assigning the task, which is `update_task`
+      expect(ClientMessage.parse({ kind: "route_task", taskId: "t1", roomId: "r1" }))
+        .toEqual({ kind: "route_task", taskId: "t1" });
+      expect(() => ClientMessage.parse({ kind: "route_task" })).toThrow();
+    });
+
     it("requires isOrchestrator on SessionInfo, as a flag and not a separate kind of session", () => {
       const { isOrchestrator: _omitted, ...info } = SESSION_INFO;
       expect(() => ServerMessage.parse({ kind: "sessions", sessions: [info] })).toThrow();

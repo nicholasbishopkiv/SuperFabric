@@ -8,6 +8,7 @@ import type { FactoryBus, RoomAgent } from "./factoryBus.js";
 import { ORCHESTRATOR_SYSTEM_PROMPT } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
 import type { RoomManager } from "./roomManager.js";
+import type { TaskRouter } from "./router.js";
 import type { TaskStore } from "./taskStore.js";
 import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
 
@@ -54,6 +55,8 @@ export interface CreateSessionOptions {
 export interface SessionManagerOptions {
   bus?: FactoryBus;
   tasks?: TaskStore;
+  /** Task routing. Only the orchestrator's tool set uses it; absent is a valid M3a-shaped server. */
+  router?: TaskRouter;
 }
 
 export class SessionManager {
@@ -299,6 +302,7 @@ export class SessionManager {
         // ordinary agent's tool list simply does not contain the routing tools. (Calling one anyway
         // is still refused inside the handler — see `busTools`.)
         isOrchestrator,
+        ...(this.opts.router !== undefined ? { router: this.opts.router } : {}),
         // factory_report_status is a line in this session's own log: the operator reads the agent's
         // own words next to everything else it did, rather than in a separate channel.
         reportStatus: (summary) => {

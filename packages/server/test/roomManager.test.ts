@@ -124,6 +124,8 @@ describe("RoomManager", () => {
         expect(charter).toContain("mcp__factory__factory_send");
         expect(charter).toContain("mcp__factory__factory_task_update");
         expect(charter).toContain("mcp__factory__factory_inbox");
+        // …including the way up: a room that cannot reach the orchestrator has to guess instead.
+        expect(charter).toContain("mcp__factory__factory_ask_orchestrator");
         // Incoming messages are turns, not something to fetch…
         expect(charter).toMatch(/arrive as ordinary turns/);
         // …so the one instruction that saves tokens on every turn is explicit.

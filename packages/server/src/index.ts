@@ -8,6 +8,7 @@ import { EventStore } from "./eventStore.js";
 import { FactoryBus } from "./factoryBus.js";
 import { ProjectManager } from "./projectManager.js";
 import { RoomManager } from "./roomManager.js";
+import { TaskRouter } from "./router.js";
 import { SessionManager } from "./sessionManager.js";
 import { TaskStore } from "./taskStore.js";
 import { ClaudeCodeExecutor } from "./executors/claudeCode.js";
@@ -39,8 +40,17 @@ const bus = new FactoryBus({
   deliver: (sessionId, text) => mgr.prompt(sessionId, text),
   roomAgents: (roomId) => mgr.roomAgents(roomId),
 });
-mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, { bus, tasks });
-const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus });
+// Routing is the same shape again: it needs to know which session is the orchestrator and who is
+// standing in each room, and it gets both as callbacks rather than as the runner itself.
+const router = new TaskRouter({
+  bus,
+  tasks,
+  rooms,
+  orchestratorFor: (projectId) => mgr.orchestratorFor(projectId),
+  roomAgents: (roomId) => mgr.roomAgents(roomId),
+});
+mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, { bus, tasks, router });
+const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router });
 
 const bootProject = projects.defaultProject();
 // Every project needs its central building, including one that existed before this boot.

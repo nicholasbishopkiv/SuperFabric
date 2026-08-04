@@ -290,6 +290,16 @@ export const ClientMessage = z.discriminatedUnion("kind", [
     roomId: z.string().nullable().optional(),
     agentId: z.string().nullable().optional(),
   }),
+  /**
+   * Ask the orchestrator where an unassigned task belongs — the board's "route it" affordance, and
+   * the same round trip `create_task` starts on its own for a card created with no room.
+   *
+   * Explicit rather than implicit because routing is a *model* decision that may be slow or wrong:
+   * an operator who has since created the orchestrator, or who wants the question asked again, needs
+   * a way to say so. Nothing is assigned by this message — it sends a question, and the task stays
+   * visibly unassigned until the orchestrator answers.
+   */
+  z.object({ kind: z.literal("route_task"), taskId: z.string() }),
   z.object({ kind: z.literal("list_tasks") }),
   /**
    * The bus's recent traffic. A client needs this on connect for two reasons: a message still

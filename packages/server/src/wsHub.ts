@@ -4,6 +4,7 @@ import type { FactoryBus } from "./factoryBus.js";
 import { ensureOrchestrator } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
 import type { RoomManager } from "./roomManager.js";
+import type { TaskRouter } from "./router.js";
 import type { SessionManager } from "./sessionManager.js";
 import type { TaskStore } from "./taskStore.js";
 
@@ -27,6 +28,11 @@ export interface WsHubOptions {
   tasks?: TaskStore;
   /** The factory bus. Absent => no `messages` broadcasts (there is no traffic to report). */
   bus?: FactoryBus;
+  /**
+   * Task routing. Absent => an unassigned task is simply left unassigned and `route_task` is refused
+   * with an error, which is the same shape as a server with no board.
+   */
+  router?: TaskRouter;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -51,6 +57,7 @@ export class WsHub {
   private readonly broadcastDebounceMs: number;
   private readonly tasks: TaskStore | undefined;
   private readonly bus: FactoryBus | undefined;
+  private readonly router: TaskRouter | undefined;
 
   constructor(
     private store: EventStore,
@@ -62,6 +69,7 @@ export class WsHub {
     this.broadcastDebounceMs = opts.sessionsDebounceMs ?? BROADCAST_DEBOUNCE_MS;
     this.tasks = opts.tasks;
     this.bus = opts.bus;
+    this.router = opts.router;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -279,12 +287,31 @@ export class WsHub {
         // changes (see the constructor), which is the only way the board also stays right for the
         // changes that never come through this hub. An unknown task or an assignee from the wrong
         // room throws into the catch below and is reported to the socket that asked.
-        case "create_task":
-          this.taskStore().create({
+        case "create_task": {
+          const task = this.taskStore().create({
             title: msg.title, detail: msg.detail, roomId: msg.roomId,
             projectId: this.activeProject(sock),
           });
+          // A card with no room is the intended path, and this is where routing starts: the
+          // orchestrator is sent a message describing it and the floor. With no orchestrator nothing
+          // is sent and nothing changes — the task stays visibly unassigned, which is the truth.
+          if (task.roomId === null && this.router !== undefined) this.router.requestRouting(task.id);
           break;
+        }
+        // The board's "route it": ask again, for a card that was created before this factory had an
+        // orchestrator or whose question went unanswered. Never assigns anything itself.
+        case "route_task": {
+          const router = this.taskRouter();
+          const sent = router.requestRouting(msg.taskId);
+          this.safeSend(sock, sent === undefined
+            ? {
+              kind: "notice",
+              message: "this factory has no orchestrator yet, so the task stays unassigned — create "
+                + "one and route it again",
+            }
+            : { kind: "notice", message: "the orchestrator has been asked where this task belongs" });
+          break;
+        }
         case "update_task":
           this.taskStore().update(msg.taskId, {
             ...(msg.status !== undefined ? { status: msg.status } : {}),
@@ -419,6 +446,12 @@ export class WsHub {
     if (projectId !== this.activeProject(sock)) {
       throw new Error(`room ${roomId} belongs to another project`);
     }
+  }
+
+  /** Likewise for the router: a factory with no routing says so rather than swallowing the request. */
+  private taskRouter(): TaskRouter {
+    if (this.router === undefined) throw new Error("this server has no task router");
+    return this.router;
   }
 
   /** A task request on a server with no task board is a routing error, not a silent no-op. */

@@ -46,6 +46,10 @@ folders of this project, and you can talk to them:
 - \`mcp__factory__factory_task_update(task_id, status)\` moves one of your tasks on the factory's
   board; \`mcp__factory__factory_report_status(summary)\` puts one line about what you are doing in
   front of the operator.
+- \`mcp__factory__factory_ask_orchestrator(question, task_id?)\` asks the factory's orchestrator —
+  the senior agent in the project room — for a ruling on anything above this room's remit: where
+  something belongs, which of two ways to go, a task that looks wrong for you. It answers as an
+  ordinary bus message.
 - Do not poll. \`mcp__factory__factory_inbox\` is for re-reading traffic you already have, never for
   checking whether any arrived — it arrives on its own.
 `;

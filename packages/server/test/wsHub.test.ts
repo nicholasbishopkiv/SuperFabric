@@ -7,6 +7,7 @@ import { openDb } from "../src/db.js";
 import { EventStore } from "../src/eventStore.js";
 import { ProjectManager } from "../src/projectManager.js";
 import { RoomManager } from "../src/roomManager.js";
+import { TaskRouter } from "../src/router.js";
 import { SessionManager } from "../src/sessionManager.js";
 import { FakeExecutor } from "../src/executors/fake.js";
 import { FactoryBus } from "../src/factoryBus.js";
@@ -42,15 +43,21 @@ function makeHub(opts: {
     deliver: (sessionId, text) => mgr.prompt(sessionId, text),
     roomAgents: (roomId) => mgr.roomAgents(roomId),
   });
+  const router = new TaskRouter({
+    bus, tasks, rooms,
+    orchestratorFor: (projectId) => mgr.orchestratorFor(projectId),
+    roomAgents: (roomId) => mgr.roomAgents(roomId),
+  });
   const withStores = opts.stores !== false;
   const hub = new WsHub(store, mgr, rooms, projects, {
     sessionsDebounceMs: opts.sessionsDebounceMs,
     tasks: withStores ? tasks : undefined,
     bus: withStores ? bus : undefined,
+    router: withStores ? router : undefined,
   });
   const { sock, sent } = fakeSocket();
   if (opts.attach !== false) hub.attach(sock);
-  return { db, store, exec, projects, rooms, tasks, bus, mgr, hub, sock, sent };
+  return { db, store, exec, projects, rooms, tasks, bus, router, mgr, hub, sock, sent };
 }
 
 /** The hub's private socket -> watermark table; asserted directly, it is the thing I1 broke. */
@@ -361,6 +368,100 @@ describe("WsHub", () => {
       } finally {
         rmSync(a, { recursive: true, force: true });
         rmSync(b, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("routing an unassigned task", () => {
+    /** A hub with a project room, one workshop and a throwaway root. */
+    function withFloor<T>(fn: (ctx: ReturnType<typeof makeHub> & {
+      backend: ReturnType<RoomManager["createRoom"]>;
+    }) => T): T {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-routing-"));
+      const ctx = makeHub({ root });
+      ctx.rooms.ensureProjectRoom();
+      const backend = ctx.rooms.createRoom("backend");
+      try {
+        return fn({ ...ctx, backend });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    it("create_task with no room asks the orchestrator", () => {
+      withFloor(({ hub, rooms, bus, tasks, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_task", title: "Charge cards" }));
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+
+        const projectRoom = rooms.listRooms().find(r => r.kind === "project")!;
+        const asked = bus.list();
+        expect(asked).toHaveLength(1);
+        expect(asked[0]).toMatchObject({ toRoomId: projectRoom.id, kind: "request" });
+        // and nothing has been assigned — the orchestrator has not answered yet
+        expect(tasks.list()[0]!.roomId).toBeNull();
+      });
+    });
+
+    it("create_task with a room routes nothing: it is already placed", () => {
+      withFloor(({ hub, bus, backend, sock }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        hub.handleMessage(sock, JSON.stringify({
+          kind: "create_task", title: "Charge cards", roomId: backend.id,
+        }));
+        expect(bus.list()).toEqual([]);
+      });
+    });
+
+    it("with no orchestrator, create_task sends nothing and reports no error", () => {
+      withFloor(({ hub, bus, tasks, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "create_task", title: "Charge cards" }));
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+        expect(bus.list()).toEqual([]);
+        // the card exists and is visibly unassigned, which is the truth the board already explains
+        expect(tasks.list()[0]).toMatchObject({ title: "Charge cards", roomId: null });
+      });
+    });
+
+    it("route_task asks again, and says so", () => {
+      withFloor(({ hub, tasks, bus, sock, sent }) => {
+        const task = tasks.create({ title: "Charge cards" });
+        hub.handleMessage(sock, JSON.stringify({ kind: "ensure_orchestrator" }));
+        hub.handleMessage(sock, JSON.stringify({ kind: "route_task", taskId: task.id }));
+
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+        expect(sent.some(m => m.kind === "notice" && /orchestrator has been asked/.test(m.message))).toBe(true);
+        expect(bus.list()).toHaveLength(1);
+      });
+    });
+
+    it("route_task on a factory with no orchestrator says so instead of inventing a room", () => {
+      withFloor(({ hub, tasks, bus, sock, sent }) => {
+        const task = tasks.create({ title: "Charge cards" });
+        hub.handleMessage(sock, JSON.stringify({ kind: "route_task", taskId: task.id }));
+
+        expect(sent.some(m => m.kind === "error")).toBe(false);
+        expect(sent.some(m => m.kind === "notice" && /no orchestrator yet/.test(m.message))).toBe(true);
+        expect(bus.list()).toEqual([]);
+        expect(tasks.get(task.id)!.roomId).toBeNull();
+      });
+    });
+
+    it("route_task reports an unknown task as an error rather than throwing at the socket", () => {
+      withFloor(({ hub, sock, sent }) => {
+        hub.handleMessage(sock, JSON.stringify({ kind: "route_task", taskId: "ghost" }));
+        expect(sent.some(m => m.kind === "error" && /unknown task ghost/.test(m.message))).toBe(true);
+      });
+    });
+
+    it("route_task on a server with no router is an error, not a silent no-op", () => {
+      const root = mkdtempSync(join(tmpdir(), "superfabric-hub-norouter-"));
+      try {
+        const { hub, sock, sent } = makeHub({ root, stores: false });
+        hub.handleMessage(sock, JSON.stringify({ kind: "route_task", taskId: "t1" }));
+        expect(sent.some(m => m.kind === "error" && /no task router/.test(m.message))).toBe(true);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
       }
     });
   });
