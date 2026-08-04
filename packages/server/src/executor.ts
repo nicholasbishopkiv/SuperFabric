@@ -15,6 +15,21 @@ export interface ExecutorEvents {
 export interface ExecutorStartOptions {
   cwd: string;
   /**
+   * A stable handle on the *session* this run belongs to — SuperFabric's session id.
+   *
+   * Every other field here describes how to run an agent; this one only says which agent it is, and
+   * it exists for exactly one reason: an executor whose agent lives **outside this process** has to
+   * be able to find it again after the process restarts. `ContainerExecutor` labels its containers
+   * with it, so a boot can re-attach to the container an operator's agent was already working in
+   * rather than killing it and starting over — which is the difference between "restarting the
+   * server is free" and "restarting the server costs you whatever the agent was doing".
+   *
+   * `ClaudeCodeExecutor` ignores it, and must: a local `query()` dies with the process, so there is
+   * nothing to find. That asymmetry is the point of it being optional — `SessionManager` passes the
+   * same options object to whichever executor a room's runtime chose, and does not branch.
+   */
+  sessionKey?: string;
+  /**
    * This agent's account, as the `CLAUDE_CONFIG_DIR` its provider process should use. Omitted =>
    * the executor's own default, and failing that the ambient `~/.claude` — which is what every
    * session ran on before M2 and still does when nothing is bound.
@@ -74,6 +89,20 @@ export interface ExecutorHandle {
   send(text: string): void;          // queue a user turn into the live session
   interrupt(): Promise<void>;
   stop(): Promise<void>;             // graceful shutdown, session stays resumable
+  /**
+   * Let go of this run **without ending the agent**, where the executor can.
+   *
+   * The distinction `stop()` cannot make: "this agent is done for now" (a pause, a restart onto new
+   * options) and "the *server* is going away" are different instructions, and they were the same
+   * call for as long as every agent was a subprocess that died with us anyway. A contained agent
+   * does not: it is a container with a buffered outbox that is already reconnecting, and tearing it
+   * down on shutdown would throw away work an operator restarting the server never agreed to lose.
+   *
+   * Called only by `SessionManager.stopAll`. Absent — as it is on `ClaudeCodeExecutor`, where there
+   * is nothing to leave behind — and shutdown falls back to `stop()`, which is the behaviour every
+   * executor had before this existed.
+   */
+  detach?(): Promise<void>;
 }
 
 export interface Executor {

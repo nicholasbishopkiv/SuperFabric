@@ -729,6 +729,7 @@ describe("db", () => {
       v8.exec("ALTER TABLE sessions DROP COLUMN paused_at");
       v8.exec("ALTER TABLE sessions DROP COLUMN paused_until");
       v8.exec("ALTER TABLE sessions DROP COLUMN role_id");
+      v8.exec("ALTER TABLE rooms DROP COLUMN runtime");
       v8.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
       v8.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
         .run("r1", "p1", "payments", "/code/shop/payments");
@@ -751,6 +752,10 @@ describe("db", () => {
       // And it is a plain agent, not a role: NULL is what every session written before roles existed
       // meant, and an upgrade must not invent one.
       expect(db.prepare("SELECT role_id FROM sessions WHERE id = 's1'").get()).toEqual({ role_id: null });
+      // And its rooms run where they always ran: on the host. M4's column is a widening, so an
+      // upgrade must never hand an operator a factory that is suddenly sandboxed — or, far worse,
+      // one that *says* it is.
+      expect(db.prepare("SELECT runtime FROM rooms WHERE id = 'r1'").get()).toEqual({ runtime: "host" });
       db.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

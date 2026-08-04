@@ -45,11 +45,11 @@ and a subscription limit monitor with auto-pause/resume.
   their plugins' servers and their claude.ai connectors are all out, by a documented flag rather than
   as a side effect of `settingSources` (`~/.claude.json` is not a settings *file*, so nothing
   promised that). Anything we pass is *trusted* — it skips the CLI's approval flow — so a future
-  room-level MCP configuration has to answer the trust question itself. **Known limitation:** this
-  decides what the agent is *offered*; it is not isolation. The session still runs as the operator,
-  with their credentials and their `~/.claude`. The real fix is M4 — a container per session and one
-  `CLAUDE_CONFIG_DIR` per account. See `packages/server/notes/agent-sdk-api.md`, "How the SDK sources
-  MCP servers", for the probe and the measurements.
+  room-level MCP configuration has to answer the trust question itself. **This decides what the agent
+  is *offered*; it is not isolation** — on a `host` room the session still runs as the operator, with
+  their credentials and their whole filesystem. Isolation is the room's *runtime* (below). See
+  `packages/server/notes/agent-sdk-api.md`, "How the SDK sources MCP servers", for the probe and the
+  measurements.
 - **A restart never eats an instruction.** `set_autonomy`/`set_model` restart a live session's
   executor, and a `prompt` landing in that window is *held* and delivered the moment the replacement
   is up — never dropped. The hold is bounded (`MAX_HELD_PROMPTS` in `sessionManager.ts`); past it the
@@ -86,6 +86,43 @@ and a subscription limit monitor with auto-pause/resume.
   bug to be most afraid of in this area, and the store-level tests exist to catch it. Room *names*
   are unique per project, not per server, so anything resolving a name (`busTools`) must scope it.
 
+- **A room chooses where its agents run, and every agent says where it actually is.**
+  `rooms.runtime` is `host` (the default, and what every room did before M4) or `container`, and
+  `SessionManager` picks the executor from it — below that line **nothing branches**: the event log,
+  approvals, the bus, limits, pause and resume are written once against the `Executor` interface that
+  has existed since M0, and `test/containerEquivalence.test.ts` drives one scripted turn through both
+  implementations and compares the logs rather than trusting the claim. On the *room* rather than on
+  the session, unlike `autonomy`/`model`/`account_id`/`role_id`, because it is a property of the work:
+  a factory where half the agents in one room were contained would be a factory whose security posture
+  nobody could state. **But `SessionInfo.runtime` is per agent and live** (`null` when it is not
+  running), because a runtime is fixed when a `query()` begins — a room switched to `container` while
+  three agents work leaves three agents on the host — and everywhere else that lag is a mild surprise,
+  whereas here it would be the floor claiming an isolation that is not in force.
+- **A contained agent gets three mounts and no more**: the room's folder (rw), that account's
+  `CLAUDE_CONFIG_DIR` (rw — the CLI rewrites its refresh token in place), the runner socket's
+  directory (ro). Never the operator's `~/.claude`, never another account's directory, never the
+  project root when the room lives elsewhere, never the docker socket. **A container room with no
+  account is refused rather than run**: the fallback everywhere else in the product is the ambient
+  `~/.claude`, and here that would mean bind-mounting the operator's home into the thing built to
+  keep the agent out of it.
+- **Containers reach the server over a unix socket, not a port**, and the *directory* holding it is
+  what is mounted (read-only), so a container that outlived a server restart finds the new inode at
+  the same path. It needs nothing from the host's network stack — the bridge-gateway route is dropped
+  outright by `ufw` on a default host, and the rule that would fix it is the operator's to add, not
+  ours — it adds no listener to a server that binds `127.0.0.1` on purpose, and it lets the
+  container's egress allow-list stay strict because the container needs no route back to us at all.
+  **Two gates:** the socket's `0600` stops another *user*; a per-container 256-bit token, compared
+  timing-safely on `hello`, stops another *container of the same user*. `origin.ts` deliberately
+  admits header-less non-browser clients, so it says nothing about a runner — this is a new surface,
+  not an extension of an old one. `SUPERFABRIC_RUNNER_TCP_PORT` is the documented fallback.
+- **Restarting the server must not cost the operator a working agent.** Shutdown calls
+  `ExecutorHandle.detach()` where an executor has one, which for a container means letting go of the
+  socket and leaving it running; the runner buffers its output and reconnects, and the next boot finds
+  the container by its label, reads the token out of the container's *own environment* and
+  re-attaches. **Docker is the store** — labels and env, no second record that could disagree with it.
+  A container whose options the operator has since changed is replaced rather than adopted (the spec
+  is a digest in a label), and `reapOrphans` at boot removes every container no live session claims,
+  which `RestartPolicy: unless-stopped` makes mandatory rather than tidy.
 - **An account is per session, persisted, and re-applied on resume** — the third member of the
   `autonomy`/`model` family, and for the same mechanical reason: `CLAUDE_CONFIG_DIR` lives in
   `Options.env`, which is fixed for the lifetime of a `query()`, so `set_session_account` restarts
@@ -143,9 +180,14 @@ Three modes, in our own vocabulary (`AutonomyMode` in `packages/shared/src/proto
 | `bypass` | nothing is gated at all; explicit per-agent opt-in | `"bypassPermissions"` |
 
 The wire protocol never speaks SDK: the mapping lives in the executor
-(`sdkPermissionMode()` in `src/executors/claudeCode.ts`), so an SDK rename touches one table.
-`canUseTool` stays wired in every mode, so the attended mode and any classifier-escalated call
-still reach the operator. `bypass` is only genuinely safe once sessions are sandboxed (M4).
+(`sdkPermissionMode()` in `src/executors/claudeCode.ts`) and, identically, in the runner, so an SDK
+rename touches two tables that are tested against each other rather than one that is quietly wrong
+in a container. `canUseTool` stays wired in every mode, so the attended mode and any
+classifier-escalated call still reach the operator. **`bypass` means two different things and the UI
+says which**: on a host room an ungated agent *is* the operator (badge: `ungated · uncontained`); in a
+container room it reaches one folder and one account (badge: `ungated`). It stays available on host
+rooms — the operator's machine, their choice — and nothing an operator already configured was changed
+when the runtime picker arrived.
 `create_session` carries an optional `autonomy`; `set_autonomy` toggles a live agent (the SDK's
 mode is fixed per `query()`, so the session's executor is restarted, resuming from the stored
 `claude_session_id`).
@@ -293,9 +335,11 @@ floor)**, **M1b (several projects in one server, settable room folders, attachme
 rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M2 (multi-account, the
 in-app login, the limit monitor and the pause/resume scheduler)**, **M3a (the factory bus, tasks, and
 packages that ride real messages)**, **M3b (the orchestrator, task auto-routing and the
-Chronicle)** and **M1c (the roles library and the onboarding agent)** are complete — see
-`docs/ROADMAP.md` for the acceptance evidence of each, including the live onboarding transcript.
-Next: M4 (a container per session).
+Chronicle)**, **M1c (the roles library and the onboarding agent)** and **M4 (a sandbox per room: the
+`agent-runner` image, `ContainerExecutor`, and `rooms.runtime`)** are complete — see
+`docs/ROADMAP.md` for the acceptance evidence of each, including the live onboarding transcript and
+M4's isolation proofs from inside a running container. Next: M5 (glTF agent characters, burn-rate
+metrics, factory export/import).
 
 ## Running it
 
@@ -313,6 +357,13 @@ catches type errors in the server — run it, not just the tests.
 
 Server state lives in `.fabrica/fabrica.db` (override the directory with
 `SUPERFABRIC_DATA`); port via `PORT`.
+
+Container rooms additionally need the image, built once: `pnpm -F @superfabric/agent-runner image`
+(a few minutes). Containers attach over `<data dir>/run/runner.sock` —
+`SUPERFABRIC_RUNNER_SOCKET_DIR` moves it, which is what a data directory whose path exceeds a unix
+socket's 100-odd characters needs. `SUPERFABRIC_CONTAINER_MEMORY_MB` / `_CPUS` / `_PIDS` change the
+caps; `SUPERFABRIC_RUNNER_TCP_PORT` switches to the TCP fallback (and then needs the `ufw` rule the
+README names).
 
 ### Bun gotchas worth knowing before you write server code
 
@@ -335,7 +386,13 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   `roles/README.md` (the format, and how to write your own). Content, not code: an operator is meant
   to read and fork these.
 - `packages/shared` — zod protocol shared by server and web (`SessionEvent`,
-  `ClientMessage`, `ServerMessage`).
+  `ClientMessage`, `ServerMessage`), plus `runner.ts` — the container↔server envelope, declared here
+  because *both* ends validate it from one schema and `sdkEvents.ts` — the one SDK→`SessionEvent`
+  mapping, here because there are now two hosts for a session and their transcripts must be
+  byte-identical.
+- `packages/agent-runner` — the program inside the container: one SDK `query()`, a bounded outbox
+  that survives the socket going away, and the Dockerfile plus `init-firewall.sh` (whose allow-list
+  is *ours*, not the reference devcontainer's — see its README).
 - `packages/server` — `db.ts` (schema + `PRAGMA user_version` migrations; **the only file that
   names the SQLite driver** — everything else takes its `Db` type, so a driver swap stays a
   one-file change) · `origin.ts` (WebSocket
@@ -354,8 +411,12 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   signature-based reload so an edited preset needs no restart) · `skills.ts` (resolving a skill name
   against the machine's own skill directories, and copying one into a room's `.claude/skills/`
   without ever overwriting what is there)
+  · `runnerHub.ts` (the server end of the runner protocol: the token check, frames applied once,
+  approvals idempotent by `requestId`) · `runnerListener.ts` (the unix socket, and the opt-in TCP
+  fallback) · `executors/container.ts` (`ContainerExecutor`: the mounts, the caps, re-attaching to a
+  container that outlived the server, and the orphan reaper)
   · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
-  each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
+  each turn boundary, and choosing an executor from the room's runtime) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
   `busTools.ts` (the bus as an in-process MCP server, one per session's room — seven tools for a
   room, nine for the orchestrator) · `orchestrator.ts` (the role prompt, and `ensureOrchestrator`:
   the only supported way to make one) · `onboarding.ts` (first contact: whether a project has been

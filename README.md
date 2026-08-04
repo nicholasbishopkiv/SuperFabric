@@ -82,9 +82,41 @@ the server as a local privileged tool:
 - **Agents default to `auto` autonomy**: Claude Code's own classifier decides on each gated tool
   call, so an approval card is the exception rather than the rule. Switch an agent to `attended`
   and every gated action asks you first. `bypass` disables gating entirely — the agent runs any
-  command without asking — and is a deliberate per-agent opt-in, appropriate only for a room you
-  are willing to treat as disposable until container sandboxing lands (M4). Autonomy is stored
-  per session and survives a server restart.
+  command without asking — and is a deliberate per-agent opt-in. Autonomy is stored per session
+  and survives a server restart.
+- **`bypass` means something different in each runtime, and the UI says which.** On a **host**
+  room an ungated agent *is you*: your whole filesystem, every credential on the machine, the
+  open internet. The badge reads `ungated · uncontained` and it is telling the truth. In a
+  **container** room the same agent can reach one folder, one account's credentials, two CPUs
+  and Anthropic — so the badge reads just `ungated`, and the blast radius is a thing you chose
+  the size of. Nothing about an agent you already configured was changed when this arrived:
+  `bypass` on a host room is still available, still yours to pick, and now honestly labelled.
+- **A room can run its agents in a container** (`host` is the default; the picker is on the room
+  panel). What a contained agent gets, and nothing else:
+  | | |
+  |---|---|
+  | that room's folder | read-write — it is what the agent is for |
+  | that account's `CLAUDE_CONFIG_DIR` | read-write; the CLI rewrites its refresh token in place |
+  | the runner socket's directory | read-only |
+  | CPU / memory / processes | 2 cores, 2 GiB, 512 pids (`SUPERFABRIC_CONTAINER_*` to change) |
+  | the filesystem it boots from | read-only, with `/tmp` and `$HOME` as tmpfs |
+  | the network | default-deny; Anthropic's API and auth hosts only |
+  | the user it runs as | non-root (uid 1000) |
+
+  Never your `~/.claude`, never another account's directory, never the docker socket, and never
+  the project root when the room lives somewhere else. A container room **needs an account of its
+  own** — the ambient `~/.claude` is not mounted into a sandbox, so an unbound container room
+  refuses to start rather than quietly handing over your home directory.
+- **Containers reach the server over a unix socket, not a port.** The socket lives in a directory
+  of its own under the data directory, bind-mounted into each container read-only, `0600`. No new
+  network listener exists: the server still binds `127.0.0.1` and nothing else, and the
+  container's own egress allow-list needs no hole back to the host. Each container is additionally
+  given a random 256-bit token that the server checks on attach, so one container cannot claim
+  another's session even though they share the socket. (A TCP fallback exists for a Docker daemon
+  that does not share this filesystem — `SUPERFABRIC_RUNNER_TCP_PORT`. It *is* a network listener
+  reachable from every container on the machine, and on a host running `ufw` it also needs
+  `sudo ufw allow in on docker0 from 172.17.0.0/16 to any port <port> proto tcp`. Prefer the
+  socket.)
 
 ## Documentation
 

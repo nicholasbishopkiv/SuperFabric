@@ -81,6 +81,21 @@ export const STATUS_EMISSIVE: Record<FactoryStatus, number> = {
 export const BYPASS_COLOR = "#ff2d95";
 
 /**
+ * The mark on a room whose agents run in a container.
+ *
+ * A deep ink-slate, and deliberately **quiet**. Sandboxing is not an alarm and not an achievement —
+ * it is a property of a department, in the same register as its name — so it is drawn as a word on
+ * the label rather than as a light on the roof. Every colour that *wants* something from the
+ * operator (the five statuses, the bypass magenta, the selection cyan) is loud, and a sixth loud
+ * colour would cost the other five some of their meaning.
+ *
+ * It cannot be mistaken for a department accent even though its hue (≈215°) sits inside the accent
+ * band: an accent is a desaturated mid-light *paint* on a building's trim, and this is a near-black
+ * ink used only on the white label chrome, where accents never appear.
+ */
+export const SANDBOX_COLOR = "#3f4a5a";
+
+/**
  * Selection. Not a status and not an accent: a saturated cyan that appears nowhere else, carried by
  * *added* geometry (a rim, a ground ring, a label border) rather than by repainting the building —
  * a selected room must keep its own identity, or selecting it destroys the information you selected

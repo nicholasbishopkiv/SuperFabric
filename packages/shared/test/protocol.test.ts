@@ -556,6 +556,36 @@ describe("protocol", () => {
         .toMatchObject({ sessions: [{ accountId: "a1" }] });
     });
   });
+
+  describe("runtimes", () => {
+    const ROOM = { id: "r1", name: "backend", path: "/p/backend", kind: "room", agentCount: 0 };
+
+    it("a room defaults to the host, which is what every room did before M4", () => {
+      // The default is the whole compatibility story: a database written before the column existed,
+      // and a client built before the field existed, both mean "on this machine, as the operator".
+      expect(RoomInfo.parse(ROOM).runtime).toBe("host");
+      expect(RoomInfo.parse({ ...ROOM, runtime: "container" }).runtime).toBe("container");
+      expect(() => RoomInfo.parse({ ...ROOM, runtime: "vm" })).toThrow();
+    });
+
+    it("a session reports the runtime it is actually running in, and null when it is not running", () => {
+      // Deliberately not defaulted to "host": a stopped agent runs nowhere, and a floor that showed
+      // a runtime for one would be describing a process that does not exist.
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [SESSION_INFO] }))
+        .toMatchObject({ sessions: [{ runtime: null }] });
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...SESSION_INFO, runtime: "container" }] }))
+        .toMatchObject({ sessions: [{ runtime: "container" }] });
+    });
+
+    it("parses set_room_runtime and refuses a runtime it does not know", () => {
+      expect(ClientMessage.parse({ kind: "set_room_runtime", roomId: "r1", runtime: "container" }))
+        .toEqual({ kind: "set_room_runtime", roomId: "r1", runtime: "container" });
+      expect(() => ClientMessage.parse({ kind: "set_room_runtime", roomId: "r1", runtime: "vm" })).toThrow();
+      // No default on the wire: a message that does not say which runtime it wants is not a message
+      // about runtimes, and guessing would be choosing for the operator.
+      expect(() => ClientMessage.parse({ kind: "set_room_runtime", roomId: "r1" })).toThrow();
+    });
+  });
   describe("limits", () => {
     const WINDOW = {
       key: "five_hour", label: "5-hour", utilization: 43,

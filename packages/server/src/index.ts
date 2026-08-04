@@ -1,6 +1,8 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
+import Docker from "dockerode";
 import Fastify from "fastify";
+import { RUNNER_SOCKET_FILE } from "@superfabric/shared";
 import { WebSocketServer, type WebSocket } from "ws";
 import { AccountLoginManager, CredentialsWatcher } from "./accountLogin.js";
 import { AccountManager } from "./accountManager.js";
@@ -20,11 +22,22 @@ import { TaskRouter } from "./router.js";
 import { SessionManager } from "./sessionManager.js";
 import { TaskStore } from "./taskStore.js";
 import { ClaudeCodeExecutor } from "./executors/claudeCode.js";
+import { ContainerExecutor, type DockerLike } from "./executors/container.js";
 import { isOriginAllowed } from "./origin.js";
+import { RunnerHub } from "./runnerHub.js";
+import { startRunnerListener } from "./runnerListener.js";
 import { WsHub } from "./wsHub.js";
 
 const dataDir = process.env.SUPERFABRIC_DATA ?? path.join(process.cwd(), ".fabrica");
 mkdirSync(dataDir, { recursive: true });
+
+/** An optional numeric knob. A value that is not a number is ignored rather than becoming NaN. */
+function numberFromEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
 
 // The project the server boots on: the first factory floor, and the fallback scope for anything that
 // does not name a project. It is no longer the only project there can be — the operator adds and
@@ -81,8 +94,49 @@ let limits!: LimitMonitor;
 // session runner (the onboarder is an ordinary session with a role) and the runner needs it (for the
 // one tool that records a proposal), so it is declared here and populated after.
 let onboarding!: OnboardingManager;
+// M4: the second half of the `Executor` seam. Containers reach the server over a **unix socket**
+// in a directory of its own under the data directory, bind-mounted read-only into every container —
+// see `RUNNER_SOCKET_DIR` in the shared protocol for why that rather than a TCP port. The TCP
+// fallback exists for a Docker daemon that does not share this filesystem and is off unless
+// `SUPERFABRIC_RUNNER_TCP_PORT` says otherwise.
+const runnerHub = new RunnerHub({ log: (line) => console.log(`runner: ${line}`) });
+const runnerSocketDir = process.env.SUPERFABRIC_RUNNER_SOCKET_DIR ?? path.join(dataDir, "run");
+const runnerTcpPort = process.env.SUPERFABRIC_RUNNER_TCP_PORT === undefined
+  ? undefined
+  : Number(process.env.SUPERFABRIC_RUNNER_TCP_PORT);
+const runnerListener = await startRunnerListener({
+  hub: runnerHub,
+  socketDir: runnerSocketDir,
+  socketFile: RUNNER_SOCKET_FILE,
+  ...(runnerTcpPort !== undefined ? { tcpPort: runnerTcpPort } : {}),
+  log: (line) => console.log(line),
+});
+// dockerode talks to the daemon's own unix socket in pure JS; nothing here is loaded unless a room
+// is actually set to `container`, and a machine with no Docker simply reports it when one is.
+const containerExecutor = new ContainerExecutor({
+  docker: new Docker() as unknown as DockerLike,
+  hub: runnerHub,
+  // What identifies *this* factory to the daemon. The data directory, canonicalised, because that is
+  // what a server instance is — one `fabrica.db`, one set of sessions — and because without it the
+  // boot-time orphan sweep is machine-wide and a second server destroys the first one's agents.
+  instanceId: realpathSync(dataDir),
+  socketDir: runnerSocketDir,
+  ...(runnerTcpPort !== undefined
+    ? { serverUrl: `ws://host.docker.internal:${runnerTcpPort}/runner` }
+    : {}),
+  ...(numberFromEnv("SUPERFABRIC_CONTAINER_MEMORY_MB") !== undefined
+    ? { memoryMb: numberFromEnv("SUPERFABRIC_CONTAINER_MEMORY_MB")! }
+    : {}),
+  ...(numberFromEnv("SUPERFABRIC_CONTAINER_CPUS") !== undefined
+    ? { cpus: numberFromEnv("SUPERFABRIC_CONTAINER_CPUS")! }
+    : {}),
+  ...(numberFromEnv("SUPERFABRIC_CONTAINER_PIDS") !== undefined
+    ? { pids: numberFromEnv("SUPERFABRIC_CONTAINER_PIDS")! }
+    : {}),
+  log: (line) => console.log(`container: ${line}`),
+});
 mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
-  bus, tasks, router, chronicle, accounts, roles, skills,
+  bus, tasks, router, chronicle, accounts, roles, skills, containerExecutor,
   // A getter for the same reason `onRateLimited` below is a closure: it is read when an executor
   // starts, which is long after both objects exist.
   get onboarding() { return onboarding; },
@@ -147,6 +201,14 @@ console.log(
 const resumed = mgr.resumeAll();
 if (resumed.length > 0) console.log(`resumed sessions: ${resumed.join(", ")}`);
 else console.log("no sessions to resume");
+
+// A contained agent's container outlives the server on purpose, and `RestartPolicy: unless-stopped`
+// brings it back after a machine reboot — so something has to remove the ones no live session claims
+// any more. Measured against *every* active session rather than the ones this boot started, because
+// a resume adopts its container asynchronously. Fire-and-forget: a factory with no Docker still boots.
+void containerExecutor.reapOrphans(new Set(mgr.activeSessionIds())).then((removed) => {
+  if (removed.length > 0) console.log(`removed ${removed.length} orphaned container(s)`);
+});
 
 // A message that was queued when the server went down is still queued now — that is the whole point
 // of persisting before delivering. Flush every room so a resumed agent gets its mail without the
@@ -218,6 +280,10 @@ async function shutdown(signal: string): Promise<void> {
   // subprocess and a pipe nobody can reach any more.
   logins.stopAll();
   credentials.close();
+  // After `stopAll`, which detached from every container rather than ending it: the socket file
+  // must outlive nothing, but the containers do — they are reconnecting already, and the next boot
+  // will find them by their labels.
+  await runnerListener.close();
   limits.stop();
   scheduler.stop();
 

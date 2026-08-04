@@ -382,6 +382,34 @@ export class WsHub {
           });
           break;
         }
+        // Where this room's agents run. Like the account and the folder it is a default for the
+        // *next* executor start, and the notice says so — but here the lag has to be spelled out
+        // rather than implied, because the thing that lags is an isolation boundary. An operator who
+        // switched a room to `container` and read "done" would reasonably believe the agent working
+        // in it was already sandboxed; it is not until it restarts.
+        case "set_room_runtime": {
+          this.requireRoomOnFloor(sock, msg.roomId);
+          const room = this.rooms.setRuntime(msg.roomId, msg.runtime);
+          this.broadcastRooms();
+          this.broadcastSessions();
+          const live = this.mgr
+            .listSessions(this.activeProject(sock))
+            .filter((s) => s.roomId === room.id && s.runtime !== null && s.runtime !== msg.runtime);
+          const where = msg.runtime === "container"
+            ? "in a container — only this room's folder and its account's credentials, capped CPU, "
+              + "memory and processes, and default-deny egress"
+            : "on this machine, as you, with your filesystem and your credentials";
+          this.safeSend(sock, {
+            kind: "notice",
+            message: `new agents in ${room.name} will run ${where}`
+              + (live.length === 0
+                ? ""
+                : ` — ${live.length} agent${live.length === 1 ? " is" : "s are"} already running here `
+                  + `and stay${live.length === 1 ? "s" : ""} on the ${live[0]!.runtime} runtime until `
+                  + "restarted (change its model or its role to restart it now)"),
+          });
+          break;
+        }
         case "list_rooms":
           this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms(this.activeProject(sock)) });
           break;

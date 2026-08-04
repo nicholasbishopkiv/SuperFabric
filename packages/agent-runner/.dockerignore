@@ -1,0 +1,8 @@
+# The build context is three files: the bundled runner and the two shell scripts. Everything else —
+# sources, tests, node_modules, the tsc output — is either already inside the bundle or has no
+# business in an image an agent runs in.
+*
+!dist/bundle
+!dist/bundle/runner.js
+!init-firewall.sh
+!entrypoint.sh

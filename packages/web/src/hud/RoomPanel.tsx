@@ -1,6 +1,8 @@
-import type { AutonomyMode, SessionInfo } from "@superfabric/shared";
+import type { AutonomyMode, RoomRuntime, SessionInfo } from "@superfabric/shared";
 import { RoomName } from "@superfabric/shared";
-import { BotIcon, CircleUserIcon, FlagIcon, FolderIcon, PencilIcon, PlusIcon, WarehouseIcon } from "lucide-react";
+import {
+  BotIcon, CircleUserIcon, FlagIcon, FolderIcon, PencilIcon, PlusIcon, ShieldIcon, WarehouseIcon,
+} from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import type { FactoryStatus } from "../store";
 import {
@@ -30,6 +32,7 @@ import { AccountSelect } from "./AccountSelect";
 import { AutonomySelect } from "./AutonomySelect";
 import { ModelSelect } from "./ModelSelect";
 import { RoleSelect } from "./RoleSelect";
+import { RUNTIME_SUMMARY, RuntimeSelect } from "./RuntimeSelect";
 import { EdgePanel, PanelSection } from "./Panel";
 import { StatusDot } from "./StatusDot";
 import { formatCountdown, useTickingNow } from "./UsageMeters";
@@ -92,6 +95,15 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
           <span className="shrink-0 text-2xs text-fg-faint">project</span>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {/* The same fact the building's label carries, in the list: agents created here run in a
+              container. Shown on the row rather than only in the detail, because "which of my
+              departments are sandboxed" is a question about the whole floor. */}
+          {room.runtime === "container" && (
+            <ShieldIcon
+              className="size-3 text-fg-muted"
+              aria-label="new agents here run in a container"
+            />
+          )}
           {/* The same fact the building's label and the figure's standard carry, in the list: this
               is where the senior agent stands. */}
           {orchestrator && (
@@ -209,9 +221,30 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
           orchestrator
         </Badge>
       )}
+      {/* Where this agent is *actually* running — its own runtime, not its room's. A room switched
+          to `container` while this one was working has not moved it, and a badge that read off the
+          room would claim an isolation that is not in force. */}
+      {agent.runtime === "container" && (
+        <Badge
+          title="contained: only this room's folder and its account, capped CPU/memory, default-deny egress"
+        >
+          <ShieldIcon />
+          sandboxed
+        </Badge>
+      )}
       {agent.autonomy === "bypass" && (
-        <Badge variant="bypass" title="ungated — nothing this agent does is asked about">
-          ungated
+        <Badge
+          variant="bypass"
+          title={
+            agent.runtime === "container"
+              ? "ungated — nothing this agent does is asked about. It is contained: the blast radius "
+                + "is this room's folder and its account."
+              : "ungated — nothing this agent does is asked about, and it runs on the host as you. "
+                + "Nothing contains it: it can reach your whole filesystem and every credential you "
+                + "have. Switch this room to the sandboxed runtime to bound that."
+          }
+        >
+          ungated{agent.runtime === "host" ? " · uncontained" : ""}
         </Badge>
       )}
       <span className="ml-auto flex items-center gap-1">
@@ -398,6 +431,63 @@ function RoomAccount({ roomId, accountId, connected }: {
 }
 
 /**
+ * Where this room's agents run.
+ *
+ * Beside the account rather than behind a settings screen, and for a stronger version of the same
+ * reason the account is: it decides what an agent working here *can reach*, which is a property of
+ * the department. The two sentences under it are the two things an operator cannot discover from
+ * the control itself — that a sandbox needs an account, and that nobody already working moves.
+ */
+function RoomRuntimeLine({ roomId, runtime, accountId, connected }: {
+  roomId: string;
+  runtime: RoomRuntime;
+  accountId: string | null;
+  connected: boolean;
+}) {
+  const running = useRoomAgents(roomId).filter((a) => a.runtime !== null && a.runtime !== runtime);
+  const clearError = useFabric((s) => s.clearError);
+
+  return (
+    <div className="mt-1.5">
+      <div className="flex items-center gap-1.5">
+        <ShieldIcon className="size-3 shrink-0 text-fg-faint" />
+        <span className="text-2xs text-fg-muted">New agents run</span>
+        <span className="ml-auto">
+          <RuntimeSelect
+            value={runtime}
+            disabled={!connected}
+            short
+            onChange={(next) => {
+              clearError();
+              send({ kind: "set_room_runtime", roomId, runtime: next });
+            }}
+          />
+        </span>
+      </div>
+      <FieldNote>{RUNTIME_SUMMARY[runtime]}</FieldNote>
+      {/* A container is the one runtime that cannot fall back to the operator's own `~/.claude`:
+          mounting your home directory into a sandbox is the thing a sandbox is for preventing. Said
+          here rather than discovered as a failed start. */}
+      {runtime === "container" && accountId === null && (
+        <FieldNote className="text-status-blocked">
+          This room has no account, so a contained agent has no credentials — your own{" "}
+          <code className="font-mono">~/.claude</code> is never mounted into a container. Bind an
+          account above, or agents here will refuse to start.
+        </FieldNote>
+      )}
+      {running.length > 0 && (
+        <FieldNote className="text-status-blocked">
+          {running.length} agent{running.length === 1 ? "" : "s"} already here{" "}
+          {running.length === 1 ? "is" : "are"} still on the {running[0]!.runtime} runtime and{" "}
+          {running.length === 1 ? "stays" : "stay"} there until restarted — a live session cannot be
+          moved into or out of a container. Changing its model or its role restarts it.
+        </FieldNote>
+      )}
+    </div>
+  );
+}
+
+/**
  * What the next agent created here arrives as.
  *
  * A picker beside the button rather than a dialog behind it: choosing a role is the *normal* way to
@@ -478,6 +568,12 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
       )}
       {/* Every room, including the central building: the orchestrator spends quota like anyone. */}
       <RoomAccount roomId={roomId} accountId={room.accountId} connected={connected} />
+      <RoomRuntimeLine
+        roomId={roomId}
+        runtime={room.runtime}
+        accountId={room.accountId}
+        connected={connected}
+      />
       <NewAgentRole roleId={roleId} connected={connected} onChange={setRoleId} />
       {/* The charter is where an agent learns it is a department with a bus. A room created here
           gets that section written for it; a folder that already had a CLAUDE.md keeps its own,
