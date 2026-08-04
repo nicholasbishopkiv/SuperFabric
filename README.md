@@ -61,7 +61,7 @@ orchestrator and the decision chronicle; the roles library and the onboarding in
 an optional container per room; burn-rate metrics; and factory export/import.
 Plus what came after them: removing things (an agent, a room or a whole factory — never a
 file), and a first run that asks which folder you work in instead of guessing.
-**1,391 tests green** (shared 88, server 842 + 1 live-quota test run by hand, web 431,
+**1,402 tests green** (shared 88, server 853 + 1 live-quota test run by hand, web 431,
 agent-runner 30).
 
 **It has not been used in anger by anyone but its author, and a list of what is

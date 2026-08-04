@@ -653,7 +653,27 @@ plugins its agents draw skills from, and `pnpm install`. Detect-first, re-runnab
 a summary in which every component is present / installed-now / missing-with-the-fix. It never logs
 anyone in.
 
-1381 → **1391 tests green** (shared 88, server 842 + 1 skipped live-quota test, web 431,
+### Two follow-ups from the same day
+
+**The meters stopped asking so often.** An operator watched the monitor earn a 429 and get handed a
+local estimate in exchange, which is a worse number wearing the same meter. Three changes: the floor
+is **five minutes** rather than three; it is measured from the **timestamp of the reading already
+held** rather than from an in-memory counter, so it survives a restart — which is what had actually
+been defeating it, since `bun --watch` bounces the server on every file save and each boot polled
+immediately; and a **429 is treated as what it is** — the endpoint saying we ask too often — so it
+earns a long back-off (or the response's own `Retry-After`) and leaves the last good reading on
+screen with a note, instead of replacing a measured number with a guess that cannot see other
+devices. `UsageHttpError` carries the status so the decision is made on a number rather than on
+prose.
+
+**The other CLIs are visible.** A machine with `claude`, `codex` and `agy` installed showed none of
+it. `toolchain.ts` reports what is on `PATH`, whether a credentials file on disk says it is signed
+in, and — the part that keeps this honest — **which of them SuperFabric can actually staff a room
+with**, which is Claude Code and nothing else today. Nothing is executed to produce the list, and a
+CLI whose login is not a file reads as "sign-in not readable from here" rather than as a cross: an
+operator who is logged in must never be told otherwise about their own machine.
+
+1381 → **1402 tests green** (shared 88, server 853 + 1 skipped live-quota test, web 431,
 agent-runner 30).
 
 ## What is not built

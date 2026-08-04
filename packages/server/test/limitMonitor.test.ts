@@ -2,11 +2,13 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LIMIT_PAUSE_PERCENT, USAGE_POLL_INTERVAL_MS } from "@superfabric/shared";
+import {
+  LIMIT_PAUSE_PERCENT, USAGE_POLL_INTERVAL_MS, USAGE_RATE_LIMIT_BACKOFF_MS,
+} from "@superfabric/shared";
 import { AccountManager } from "../src/accountManager.js";
 import { openDb, type Db } from "../src/db.js";
 import { LimitMonitor, worstWindow } from "../src/limitMonitor.js";
-import type { UsageAdapter, UsageReading } from "../src/usageAdapters.js";
+import { UsageHttpError, type UsageAdapter, type UsageReading } from "../src/usageAdapters.js";
 
 /**
  * The limit monitor: what it reads, how often it is willing to read it, and what it does when the
@@ -174,6 +176,40 @@ describe("LimitMonitor — the polling floor", () => {
     }
   });
 
+  it("does not re-read on a restart while the reading it comes back with is still fresh", async () => {
+    const h = harness();
+    try {
+      loggedInAccount(h, "alpha");
+      const { adapter, reads } = stubAdapter(() => reading([{ key: "five_hour", utilization: 5 }]));
+      const first = new LimitMonitor(h.db, h.accounts, { primary: adapter, now: () => h.clock.ms });
+      await first.pollAll();
+      expect(reads()).toBe(1);
+
+      // A restart, which on a developer's machine is `bun --watch` reacting to a file save. The
+      // in-memory attempt counter is gone; the *reading* is on disk with its timestamp, and that is
+      // what the floor is measured against — this is the path that actually earned a 429.
+      h.clock.ms += 30_000;
+      const afterRestart = new LimitMonitor(h.db, h.accounts, { primary: adapter, now: () => h.clock.ms });
+      await afterRestart.pollAll();
+      expect(reads()).toBe(1);
+      expect(afterRestart.msUntilDue("nope")).toBe(0); // an account it holds nothing for is due
+
+      // Five bounces in a minute, still no request.
+      for (let i = 0; i < 5; i++) {
+        h.clock.ms += 12_000;
+        await new LimitMonitor(h.db, h.accounts, { primary: adapter, now: () => h.clock.ms }).pollAll();
+      }
+      expect(reads()).toBe(1);
+
+      // Past the floor, a fresh process does read again.
+      h.clock.ms += USAGE_POLL_INTERVAL_MS;
+      await new LimitMonitor(h.db, h.accounts, { primary: adapter, now: () => h.clock.ms }).pollAll();
+      expect(reads()).toBe(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it("keeps the floor per account, so a second account does not slow the first down", async () => {
     const h = harness();
     try {
@@ -252,6 +288,139 @@ describe("LimitMonitor — degrading", () => {
       expect(usage.windows[0]!.utilization).toBe(61);
       expect(usage.note).toContain("no usage could be read");
       expect(usage.note).toContain("no transcripts");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("LimitMonitor — being rate-limited by the endpoint itself", () => {
+  /** A 429 as the adapter reports one: the typed error, so the monitor branches on a status. */
+  function rateLimited(retryAfterMs?: number): UsageAdapter {
+    return {
+      name: "429",
+      read: async () => {
+        throw new UsageHttpError(
+          'the usage endpoint answered 429 Too Many Requests: {"error":{"type":"rate_limit_error"}}',
+          429,
+          retryAfterMs,
+        );
+      },
+    };
+  }
+
+  it("keeps the good reading it already had rather than replacing it with a guess", async () => {
+    const h = harness();
+    try {
+      const alpha = loggedInAccount(h, "alpha");
+      const good = stubAdapter(() => reading([{ key: "five_hour", utilization: 42 }]));
+      const estimate: UsageAdapter = {
+        name: "estimate",
+        read: async () => ({ source: "estimate", approximate: true, windows: [], note: "a guess" }),
+      };
+      let primary: UsageAdapter = good.adapter;
+      const monitor = new LimitMonitor(h.db, h.accounts, {
+        primary: { name: "switchable", read: (a) => primary.read(a) },
+        fallback: estimate,
+        now: () => h.clock.ms,
+      });
+      await monitor.pollAll();
+      expect(monitor.usageOf(alpha.id)!.windows[0]!.utilization).toBe(42);
+
+      primary = rateLimited();
+      h.clock.ms += USAGE_POLL_INTERVAL_MS;
+      await monitor.pollAll();
+
+      const after = monitor.usageOf(alpha.id)!;
+      // The number is the last real one, not an estimate: swapping a measured reading for a guess
+      // that cannot see other devices makes the meters *worse*, which is what the operator objected
+      // to. It stays `endpoint` and non-approximate, and the note says why it is not moving.
+      expect(after.windows[0]!.utilization).toBe(42);
+      expect(after.source).toBe("endpoint");
+      expect(after.approximate).toBe(false);
+      expect(after.note).toMatch(/rate-limiting us/);
+      expect(after.note).toMatch(/last good reading/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("waits far longer than the ordinary floor before asking again", async () => {
+    const h = harness();
+    try {
+      loggedInAccount(h, "alpha");
+      let calls = 0;
+      const monitor = new LimitMonitor(h.db, h.accounts, {
+        primary: { name: "429", read: async () => { calls++; return await rateLimited().read({ id: "a", configDir: "/" }); } },
+        fallback: { name: "none", read: async () => { throw new Error("no estimate"); } },
+        now: () => h.clock.ms,
+      });
+      await monitor.pollAll();
+      expect(calls).toBe(1);
+
+      // The ordinary floor has passed and it still does not ask: a 429 is the endpoint saying
+      // *specifically* that we ask too often, and retrying on the normal cadence answers it with the
+      // behaviour that caused it.
+      h.clock.ms += USAGE_POLL_INTERVAL_MS + 1;
+      await monitor.pollAll();
+      expect(calls).toBe(1);
+
+      h.clock.ms += USAGE_RATE_LIMIT_BACKOFF_MS;
+      await monitor.pollAll();
+      expect(calls).toBe(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("honours Retry-After over its own back-off", async () => {
+    const h = harness();
+    try {
+      loggedInAccount(h, "alpha");
+      let calls = 0;
+      const monitor = new LimitMonitor(h.db, h.accounts, {
+        primary: {
+          name: "429",
+          read: async () => { calls++; return await rateLimited(60_000).read({ id: "a", configDir: "/" }); },
+        },
+        fallback: { name: "none", read: async () => { throw new Error("no estimate"); } },
+        now: () => h.clock.ms,
+      });
+      await monitor.pollAll();
+
+      // The endpoint said a minute. The ordinary floor is longer, and it wins — the back-off is a
+      // minimum, not a replacement for politeness.
+      h.clock.ms += 60_001;
+      await monitor.pollAll();
+      expect(calls).toBe(1);
+
+      h.clock.ms += USAGE_POLL_INTERVAL_MS;
+      await monitor.pollAll();
+      expect(calls).toBe(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("clears the back-off as soon as the endpoint answers again", async () => {
+    const h = harness();
+    try {
+      const alpha = loggedInAccount(h, "alpha");
+      let primary: UsageAdapter = rateLimited();
+      const monitor = new LimitMonitor(h.db, h.accounts, {
+        primary: { name: "switchable", read: (a) => primary.read(a) },
+        fallback: { name: "none", read: async () => { throw new Error("no estimate"); } },
+        now: () => h.clock.ms,
+      });
+      await monitor.pollAll();
+      expect(monitor.msUntilDue(alpha.id)).toBeGreaterThan(USAGE_POLL_INTERVAL_MS);
+
+      primary = stubAdapter(() => reading([{ key: "five_hour", utilization: 7 }])).adapter;
+      h.clock.ms += USAGE_RATE_LIMIT_BACKOFF_MS;
+      await monitor.pollAll();
+
+      // Back to the ordinary cadence: the endpoint is talking to us again.
+      expect(monitor.msUntilDue(alpha.id)).toBe(USAGE_POLL_INTERVAL_MS);
     } finally {
       h.cleanup();
     }

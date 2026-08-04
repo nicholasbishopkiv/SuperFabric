@@ -271,10 +271,25 @@ export const LIMIT_PAUSE_PERCENT = 95;
  * The floor under how often one account's usage may be read, in milliseconds.
  *
  * `docs/RESEARCH.md` §2: the endpoint is undocumented and aggressive polling earns a 429 — which
- * would be a monitor that causes the condition it exists to watch for. Three minutes is what the
- * research calls safe, and a five-hour window does not move meaningfully faster than that.
+ * would be a monitor that causes the condition it exists to watch for. **Five minutes**, raised from
+ * three after a real 429 on a developer's machine: a five-hour window does not move meaningfully in
+ * either interval, so the only thing the faster one bought was requests.
+ *
+ * The floor is measured from the **timestamp of the reading we already hold**, not from an in-memory
+ * counter, so it survives a restart. That is what actually earned the 429: `bun --watch` restarts the
+ * server on every file save, and each restart used to poll immediately because the counter was empty.
+ * A reading that is still fresh means no request is sent at all.
  */
-export const USAGE_POLL_INTERVAL_MS = 180_000;
+export const USAGE_POLL_INTERVAL_MS = 300_000;
+
+/**
+ * How long to leave the usage endpoint alone after it has answered 429, in milliseconds.
+ *
+ * Longer than the ordinary floor, because a 429 is the endpoint saying *specifically* that we asked
+ * too often — retrying on the normal cadence answers it with the same behaviour that caused it. Used
+ * only when the response carries no `Retry-After`; when it does, that wins.
+ */
+export const USAGE_RATE_LIMIT_BACKOFF_MS = 900_000;
 
 
 // ---- rooms ----
@@ -922,6 +937,37 @@ export const FactoryImportResult = z.object({
 });
 export type FactoryImportResult = z.infer<typeof FactoryImportResult>;
 
+/**
+ * One agent CLI on the machine SuperFabric is running on.
+ *
+ * Machine-wide, like an account and for the same reason: a binary on `PATH` belongs to the operator,
+ * not to a factory. The field that matters most is `runsAgents` — SuperFabric drives Claude Code and
+ * nothing else today (one implementation behind the `Executor` seam; multi-provider is an After-v1
+ * item), so a list that showed `codex` beside `claude` without saying so would imply a capability
+ * that does not exist.
+ */
+export const AgentCliInfo = z.object({
+  id: z.string(),
+  /** Display name, e.g. "OpenAI Codex CLI". */
+  name: z.string(),
+  /** The binary as it is typed, e.g. `codex`. */
+  command: z.string(),
+  /** Where it was found on `PATH`, or `null` when it is not installed. */
+  path: z.string().nullable(),
+  /**
+   * `true` / `false` where a credentials file on disk settles it, and **`null` when it cannot be
+   * told from here** — a CLI that keeps its login in a keyring is not a CLI that is logged out, and
+   * showing it as one would be a worse answer than no answer.
+   */
+  signedIn: z.boolean().nullable(),
+  /** The file or directory that was looked at, so the operator can check the claim. */
+  configPath: z.string().nullable(),
+  /** Whether SuperFabric can staff a room with it. Exactly one entry is `true` today. */
+  runsAgents: z.boolean(),
+  detail: z.string().nullable(),
+});
+export type AgentCliInfo = z.infer<typeof AgentCliInfo>;
+
 // ---- client -> server ----
 export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("subscribe"), sessionId: z.string(), afterSeq: z.number().int().nonnegative() }),
@@ -1079,6 +1125,11 @@ export const ClientMessage = z.discriminatedUnion("kind", [
   // Accounts. Machine-wide rather than project-scoped (see `AccountInfo`), so unlike every other
   // listing here these four take no project and their answer is the same on every floor.
   z.object({ kind: z.literal("list_accounts") }),
+  /**
+   * What agent CLIs are on this machine. Machine-wide like the accounts, answered to the socket that
+   * asked, and read from the filesystem only — nothing is executed to produce it.
+   */
+  z.object({ kind: z.literal("list_toolchain") }),
   /**
    * What each account's limits look like right now. Machine-wide like `list_accounts`, and for the
    * same reason: a subscription's quota is the operator's, not a factory's.
@@ -1414,6 +1465,8 @@ export const ServerMessage = z.discriminatedUnion("kind", [
      */
     activeProjectId: z.string().nullable(),
   }),
+  /** The answer to `list_toolchain`: every CLI looked for, installed or not. */
+  z.object({ kind: z.literal("toolchain"), tools: z.array(AgentCliInfo) }),
   z.object({ kind: z.literal("error"), message: z.string() }),
   /**
    * "This worked, and here is what happened."

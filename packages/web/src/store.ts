@@ -1,6 +1,7 @@
 import type {
   AccountBurn,
   AccountInfo,
+  AgentCliInfo,
   AccountMetrics,
   AccountUsage,
   ChronicleHit,
@@ -224,6 +225,15 @@ export interface FabricState {
    * piece of server state in this store that a factory switch leaves alone.
    */
   accounts: AccountInfo[];
+  /**
+   * The agent CLIs on the machine the server runs on: what is installed, what looks signed in, and
+   * which of them SuperFabric can actually staff a room with (today: only Claude Code).
+   *
+   * Machine-wide and left alone by a factory switch, like the accounts. Asked for once per connect —
+   * it is a `PATH` walk on the server, not a poll, and a binary does not appear mid-session often
+   * enough to be worth watching.
+   */
+  toolchain: AgentCliInfo[];
   /**
    * What each account's limits look like, in the account list's own order.
    *
@@ -551,6 +561,7 @@ const EMPTY_PROJECT_STATE = {
 export const initialFabricState = {
   projects: [] as ProjectInfo[],
   accounts: [] as AccountInfo[],
+  toolchain: [] as AgentCliInfo[],
   usage: [] as AccountUsage[],
   metrics: null as FactoryMetrics | null,
   factoryExport: null as FactoryExport | null,
@@ -1101,6 +1112,7 @@ export const useFabric = create<FabricState>((set, get) => ({
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
       if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
       if (msg.kind === "accounts") return applyAccounts(s, msg.accounts);
+      if (msg.kind === "toolchain") return { toolchain: msg.tools };
       if (msg.kind === "usage") return applyUsage(s, msg.usage);
       // The whole frame every time, like the room list: one message rebuilds the surface and there is
       // nothing to merge. It arrives on a poll and on every turn boundary, so identity is preserved

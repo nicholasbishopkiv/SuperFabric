@@ -17,6 +17,7 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
+import { Toolchain } from "./Toolchain";
 import { cn } from "../ui/utils";
 import { LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT } from "@superfabric/shared";
 import { BurnRate, formatUsd } from "./BurnRate";
@@ -377,6 +378,10 @@ export function AccountSwitcher() {
             </li>
           )}
         </ul>
+
+        {/* What else is on this machine. Under the accounts because that is where the question is
+            asked, and honest about the one thing that matters: only Claude Code runs agents. */}
+        <Toolchain />
 
         <FactorySpend />
 

@@ -153,8 +153,14 @@ and a subscription limit monitor with auto-pause/resume.
   reads both that and the shape `docs/RESEARCH.md` §2 documents, takes windows whose `kind` it has
   never heard of, and **degrades rather than crashing** — a half-understood body yields the meters it
   could read plus a note counting the fields it could not. Understanding *nothing* is the only
-  failure, and it is what hands over to the estimate. Polling is floored at 180 s **per account**: a
-  monitor that earns a 429 causes the condition it exists to watch for.
+  failure, and it is what hands over to the estimate. Polling is floored at **300 s per account, and the
+  floor is measured from the timestamp of the reading already held** — so it survives a restart, which
+  is what a `bun --watch` server bouncing on every file save had been defeating one request at a time.
+  Fresh data means no request is sent at all. A **429 from the endpoint is not a reading**: it earns a
+  long back-off (`USAGE_RATE_LIMIT_BACKOFF_MS`, or the response's own `Retry-After`) and the last good
+  meters stay on screen with a note saying why they are not moving — replacing a measured number with
+  an estimate that cannot see other devices makes the meters worse, not merely older. A monitor that
+  earns a 429 causes the condition it exists to watch for.
 - **An agent is paused at a turn boundary, never mid-turn**, and is never moved to another account.
   The boundary is the one the runner already knows (`turn_complete`, where the bus flushes);
   interrupting a live turn would throw away the tokens it has already spent. The pause is persisted
@@ -421,7 +427,7 @@ project is invented from the server's working directory, the UI opens on a folde
 guide, and a logged-in `~/.claude` found on disk is adopted as a visible account. See the "Removing
 things" and "First run" sections of `docs/ROADMAP.md`.
 
-**1391 tests green** (shared 88, server 842 + 1 skipped live-quota test, web 431, agent-runner 30).
+**1402 tests green** (shared 88, server 853 + 1 skipped live-quota test, web 431, agent-runner 30).
 
 **What is *not* built is listed at the end of `docs/ROADMAP.md`** and is worth reading before you
 add a doc sentence that implies otherwise — there are no notifications off the browser tab, eleven
@@ -523,7 +529,10 @@ README names).
   plus the `.credentials.json` watcher)
   · `usageAdapters.ts` (the limit-reading seam: the OAuth usage endpoint, and the
   honestly-approximate JSONL estimate behind it) · `limitMonitor.ts` (per-account polling at the
-  180 s floor, persisted snapshots, and the immediate mark from a 429) · `scheduler.ts` (80 % warn,
+  300 s floor measured from the last reading's own timestamp, so a restart cannot shorten it; a long
+  back-off when the endpoint itself answers 429; persisted snapshots; and the immediate mark from a
+  429 seen by a *session*) · `toolchain.ts` (which agent CLIs are on this machine — a `PATH` walk and
+  a `stat`, never a subprocess, and honest that only Claude Code can staff a room) · `scheduler.ts` (80 % warn,
   95 % pause at a turn boundary, resume at `resets_at` — and no rotation, ever)
   · `roleLibrary.ts` (roles as files: the shipped `roles/*.yaml`, the operator's overrides, and a
   signature-based reload so an edited preset needs no restart) · `skills.ts` (resolving a skill name
@@ -582,6 +591,8 @@ README names).
   burn rate and cost-equivalent under them plus this factory's spend by room (`BurnRate.tsx` —
   a duration at a resolution the readings support, and "Time left: unknown" with the server's
   reason in the place the figure would have been),
+  the CLIs found on this machine (`Toolchain.tsx` — under the accounts, because that is where "what
+  can this run on" is asked; `signedIn: null` prints as "not readable from here", never as a cross),
   removing things (`ConfirmDelete.tsx` — two steps, and the armed state shows the consequence in
   words rather than "Are you sure?"; `removal.ts` — those sentences as pure functions, because a
   plural that lies is not visible in a screenshot),

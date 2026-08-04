@@ -48,6 +48,9 @@ export function connect(): void {
     // Accounts. Asked for like the rest, and *not* re-asked on `open_project`: a subscription is
     // machine-wide, so the answer is the same on every floor and the list survives a switch.
     send({ kind: "list_accounts" });
+    // What agent CLIs are on the machine. Machine-wide like the accounts, and free: the server
+    // answers it from a PATH walk and a stat, without running anything.
+    send({ kind: "list_toolchain" });
     // The meters beside them. A *query* over what the server already holds — asking never makes it
     // read the usage endpoint, so a tab reloading ten times costs the operator's quota nothing.
     send({ kind: "list_usage" });

@@ -2,6 +2,7 @@ import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@supe
 import type { AccountLoginManager } from "./accountLogin.js";
 import type { AccountManager } from "./accountManager.js";
 import type { Demolition } from "./demolition.js";
+import { detectAgentClis } from "./toolchain.js";
 import type { FactoryPortability } from "./factoryPortability.js";
 import type { LimitMonitor } from "./limitMonitor.js";
 import type { MetricsStore } from "./metricsStore.js";
@@ -563,6 +564,12 @@ export class WsHub {
         // to those on one floor. See `AccountInfo`.
         case "list_accounts":
           this.safeSend(sock, { kind: "accounts", accounts: this.accountStore().list() });
+          break;
+        // What agent CLIs this machine has. Machine-wide like the accounts, and answered to the
+        // socket that asked. Detection is a PATH walk and a stat — nothing is executed, so a client
+        // asking on every connect costs no subprocesses.
+        case "list_toolchain":
+          this.safeSend(sock, { kind: "toolchain", tools: detectAgentClis() });
           break;
         // The meters, as the monitor last read them. Deliberately does **not** trigger a read: a
         // client connecting is not a reason to spend a request against an undocumented, rate-limited

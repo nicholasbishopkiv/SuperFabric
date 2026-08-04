@@ -108,7 +108,10 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   behind a seam, because **the source is undocumented and has already changed under us**.
   - *Primary*: `GET https://api.anthropic.com/api/oauth/usage` with that account's bearer from
     `.credentials.json`, `anthropic-beta: oauth-2025-04-20` and a `claude-code/<version>`
-    User-Agent, **floored at 180 s per account** — a monitor that earns a 429 causes the condition
+    User-Agent, **floored at 300 s per account and measured from the timestamp of the reading already
+    held** (so a restart cannot shorten it, and fresh data means no request at all); a 429 from the
+    endpoint earns a long back-off and leaves the last good meters standing rather than swapping in a
+    guess — a monitor that earns a 429 causes the condition
     it exists to watch for. Verified live on 2026-08-04: `five_hour` and `seven_day` carry
     `{utilization, resets_at}`; `seven_day_opus`/`seven_day_sonnet` are *present and null*; the
     per-model weekly figures now live in `limits[]` as

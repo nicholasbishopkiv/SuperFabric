@@ -292,6 +292,16 @@ else
   note "SuperFabric agents get the factory bus and their role's servers only — never these (strictMcpConfig)"
 fi
 
+# Other agent CLIs, reported rather than installed: which ones the operator has is their choice, and
+# SuperFabric drives Claude Code only (see `toolchain.ts`). The UI shows the same list.
+step "Other agent CLIs"
+for cli in codex agy gemini; do
+  if have "$cli"; then
+    note "found $cli ($(command -v "$cli")) — SuperFabric cannot staff a room with it yet"
+  fi
+done
+note "only Claude Code runs agents today; the accounts popover lists what was found here"
+
 # ---- 5. this repository -------------------------------------------------------------------------
 
 step "Workspace"

@@ -56,6 +56,11 @@ export type FetchLike = (url: string, init: { headers: Record<string, string> })
   ok: boolean;
   status: number;
   statusText?: string;
+  /**
+   * Optional so a test double stays two lines. Only `Retry-After` is ever read, and only on a
+   * failure — see `retryAfterMs`.
+   */
+  headers?: { get(name: string): string | null };
   json(): Promise<unknown>;
   text(): Promise<string>;
 }>;
@@ -237,6 +242,43 @@ export interface OAuthUsageAdapterOptions {
  * Every failure is a throw, and every throw is caught by the monitor and turned into a fallback plus
  * a note. That is the contract: this class never returns a half-truth.
  */
+/**
+ * The endpoint answered, and it was not a reading.
+ *
+ * A class rather than a message, because the caller has to *branch* on it: a 429 means "you asked
+ * too often" and deserves a long back-off, a 401 means "this account is not logged in" and no
+ * back-off will fix it, and a 500 is neither. Deciding that by matching prose would put the meaning
+ * of the interface in a regular expression — see `LimitMonitor.poll`.
+ */
+export class UsageHttpError extends Error {
+  constructor(
+    message: string,
+    /** HTTP status as the endpoint sent it. */
+    readonly status: number,
+    /** `Retry-After`, in milliseconds, when the response carried one. */
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+    this.name = "UsageHttpError";
+  }
+}
+
+/**
+ * `Retry-After` as milliseconds — seconds or an HTTP date, both of which the header allows.
+ *
+ * Honoured over our own back-off when present: the endpoint saying when to come back is better
+ * information than anything we could assume, and ignoring it would be rude in the specific way that
+ * gets an undocumented interface closed.
+ */
+function retryAfterMs(res: { headers?: { get(name: string): string | null } }): number | undefined {
+  const raw = res.headers?.get("retry-after");
+  if (raw === undefined || raw === null || raw.trim() === "") return undefined;
+  const seconds = Number(raw.trim());
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
+}
+
 export class OAuthUsageAdapter implements UsageAdapter {
   readonly name = "oauth-usage-endpoint";
   private readonly fetchFn: FetchLike;
@@ -268,9 +310,11 @@ export class OAuthUsageAdapter implements UsageAdapter {
       // The body is often the only thing that says *why*, and this is an interface with no
       // documentation to look it up in.
       const detail = await res.text().catch(() => "");
-      throw new Error(
+      throw new UsageHttpError(
         `the usage endpoint answered ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`
         + (detail === "" ? "" : `: ${detail.slice(0, 200)}`),
+        res.status,
+        retryAfterMs(res),
       );
     }
 

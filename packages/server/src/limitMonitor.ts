@@ -2,6 +2,7 @@ import {
   type AccountUsage,
   LIMIT_PAUSE_PERCENT,
   USAGE_POLL_INTERVAL_MS,
+  USAGE_RATE_LIMIT_BACKOFF_MS,
   type UsageWindow,
 } from "@superfabric/shared";
 import type { AccountManager } from "./accountManager.js";
@@ -9,6 +10,7 @@ import type { Db } from "./db.js";
 import {
   OAuthUsageAdapter,
   TranscriptEstimateAdapter,
+  UsageHttpError,
   type UsageAdapter,
   type UsageReading,
 } from "./usageAdapters.js";
@@ -18,9 +20,13 @@ import {
  *
  * Three properties are the whole class:
  *
- * 1. **It polls no faster than the research says is safe.** `USAGE_POLL_INTERVAL_MS` is a floor
- *    enforced per account, not a timer interval that a second caller could shorten — a monitor that
- *    earns a 429 is a monitor that causes the thing it watches for.
+ * 1. **It polls no faster than the research says is safe, and it counts from the reading it already
+ *    holds.** `USAGE_POLL_INTERVAL_MS` is a floor enforced per account, not a timer interval a second
+ *    caller could shorten — a monitor that earns a 429 is a monitor that causes the thing it watches
+ *    for. The floor is measured against `readAt` on the stored reading as well as against this
+ *    process's own attempts, so it **survives a restart**: `bun --watch` bouncing the server on every
+ *    file save used to mean a request per save, which is exactly how a 429 was earned. Fresh data
+ *    means no request is sent at all.
  * 2. **A degraded reading is visible, never silent.** The primary source is undocumented and will
  *    change. When it does, the fallback answers and the reading is marked `approximate` with the
  *    reason attached, all the way to the meter on screen.
@@ -86,6 +92,14 @@ export class LimitMonitor {
   private readings = new Map<string, AccountUsage>();
   /** accountId -> when it was last *attempted*, in ms. A failed read still spends the interval. */
   private lastAttemptMs = new Map<string, number>();
+  /**
+   * accountId -> the moment this account may be read again after the endpoint refused, in ms.
+   *
+   * Separate from the ordinary floor because it means something different: the floor is politeness,
+   * this is the endpoint having *said* we are asking too often. Retrying that on the normal cadence
+   * answers a 429 with the behaviour that caused it.
+   */
+  private backoffUntilMs = new Map<string, number>();
   private listeners: (() => void)[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   /** One poll at a time: an overlapping sweep would double the request rate this class exists to cap. */
@@ -199,10 +213,35 @@ export class LimitMonitor {
     }
   }
 
-  /** Has this account's interval elapsed? The one rule that keeps us welcome at an undocumented API. */
+  /**
+   * Has this account's interval elapsed? The one rule that keeps us welcome at an undocumented API.
+   *
+   * Three inputs, and the second is the one that was missing: an attempt made by *this* process, the
+   * `readAt` of the reading we are holding (which is on disk, so the floor is not reset by a
+   * restart), and a back-off the endpoint itself asked for. Whichever is latest wins.
+   */
   private isDue(accountId: string): boolean {
-    const last = this.lastAttemptMs.get(accountId);
-    return last === undefined || this.now() - last >= this.minIntervalMs;
+    return this.now() >= this.nextAllowedMs(accountId);
+  }
+
+  /** When this account may next be read, in ms. `0` means "never read, go ahead". */
+  private nextAllowedMs(accountId: string): number {
+    const backoff = this.backoffUntilMs.get(accountId) ?? 0;
+    const attempt = this.lastAttemptMs.get(accountId) ?? 0;
+    // Seconds on the row, milliseconds everywhere here.
+    const read = (this.readings.get(accountId)?.readAt ?? 0) * 1000;
+    const last = Math.max(attempt, read);
+    return Math.max(backoff, last === 0 ? 0 : last + this.minIntervalMs);
+  }
+
+  /**
+   * How long until this account may be read again, in milliseconds — `0` when it is due now.
+   *
+   * Exposed for the same reason the meters are: an operator (and a test) should be able to ask why a
+   * refresh did not happen and get a number rather than a shrug.
+   */
+  msUntilDue(accountId: string): number {
+    return Math.max(0, this.nextAllowedMs(accountId) - this.now());
   }
 
   /**
@@ -219,7 +258,32 @@ export class LimitMonitor {
     let reading: UsageReading;
     try {
       reading = await this.primary.read(account);
+      // A reading that worked clears any back-off: the endpoint is talking to us again.
+      this.backoffUntilMs.delete(accountId);
     } catch (primaryError) {
+      // "You are asking too often" is not "your limits are unknown". Backing off and keeping what we
+      // already have beats replacing a real reading with a guess — an estimate cannot see other
+      // devices, does not know when the window began, and is measured against a budget we assumed, so
+      // swapping it in for a good number makes the meters worse, not merely older.
+      const rateLimited = primaryError instanceof UsageHttpError && primaryError.status === 429;
+      if (rateLimited) {
+        const wait = primaryError.retryAfterMs ?? USAGE_RATE_LIMIT_BACKOFF_MS;
+        this.backoffUntilMs.set(accountId, this.now() + wait);
+        const previous = this.readings.get(accountId);
+        if (previous !== undefined && previous.windows.length > 0) {
+          const minutes = Math.max(1, Math.round(wait / 60_000));
+          const next: AccountUsage = {
+            ...previous,
+            note: `the usage endpoint is rate-limiting us; these meters are the last good reading and `
+              + `the next attempt is in about ${minutes} minute${minutes === 1 ? "" : "s"}`,
+          };
+          if (next.note === previous.note) return false;
+          this.readings.set(accountId, next);
+          return true;
+        }
+        // Nothing to keep: an estimate is thin, but a blank meter reads as "you have used nothing",
+        // which is the wrong direction to be wrong in.
+      }
       try {
         const estimate = await this.fallback.read(account);
         reading = {
