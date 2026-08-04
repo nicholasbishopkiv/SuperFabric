@@ -98,8 +98,12 @@ Vite/vitest stay because vitest is Vite-native and the web bundle is small. Do n
 installs to `bun install`, and do not introduce a second test runner inside a package: the
 server package is `bun test`, `packages/shared` and `packages/web` are vitest.
 
-**Dependency license policy**: third-party libraries must be MIT/Apache-2.0/BSD/ISC —
-no copyleft (GPL/AGPL/SSPL). One deliberate exception: Anthropic's own
+**Dependency license policy**: third-party libraries **that ship in a build artifact**
+must be MIT/Apache-2.0/BSD/ISC — no copyleft (GPL/AGPL/SSPL). Build-time-only tooling is
+judged on whether its licence reaches our users: `lightningcss` (MPL-2.0, pulled by
+`@tailwindcss/vite`) is accepted because it is an unmodified CSS transformer that ships
+nothing into the bundle. File-level copyleft on a tool we do not modify obliges us
+nothing; a copyleft library linked into the product would. One deliberate exception: Anthropic's own
 `@anthropic-ai/claude-agent-sdk` (and the `claude` CLI it drives) are proprietary
 ("© Anthropic PBC, all rights reserved", governed by Anthropic's legal agreements). They
 are the engine this product orchestrates, so the dependency is intrinsic; it is called
