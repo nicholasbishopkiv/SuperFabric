@@ -146,11 +146,12 @@ Clicking opens the existing popover. `UsageMeters` and `BurnRate` do not move an
 duplicated — the readout is a headline over them, not a re-render of the same figures under its
 own rules. It reads the same store fields and the same shared constants.
 
-### Room panel
+### Room panel — already right
 
-A paused agent states its reason in words ("held until the window resets at 14:20") rather than
-only through a status dot, because the room panel is where an operator looks when they notice
-work has stopped.
+An earlier draft of this spec proposed making a paused agent state its reason in words. It already
+does: `AgentLine` renders "resumes in 2 h 14 m", falls back to "waiting for the limit to lift" when
+no reset time is known, and carries the exact instant alongside. Nothing to change beyond the
+tooltip migration every other surface gets.
 
 ### Documentation consequence
 
