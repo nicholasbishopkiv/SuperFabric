@@ -216,6 +216,40 @@ export type SavedAttachment = z.infer<typeof SavedAttachment>;
 export const AttachmentUploadResult = z.object({ saved: z.array(SavedAttachment) });
 export type AttachmentUploadResult = z.infer<typeof AttachmentUploadResult>;
 
+// ---- M3b: the chronicle ----
+
+/**
+ * One hit from the project's chronicle: enough to act on without opening anything.
+ *
+ * The chronicle spans two sources at once — the decisions someone wrote down, and what agents
+ * actually said at the time — and a hit says which it is, because they carry different authority. A
+ * `decision` is reasoning that was committed to a file in the repository (`path`); an `event` is a
+ * line from a session's log, which is evidence rather than a ruling.
+ *
+ * The shape is the server's `Chronicle.search` result, declared here so the two cannot drift: the
+ * server imports this type rather than describing the same fields a second time.
+ */
+export const ChronicleHit = z.object({
+  kind: z.enum(["decision", "event"]),
+  /** The decision's title, or the event's type. */
+  title: z.string(),
+  /** The matching part of the body, with an ellipsis where it was cut. */
+  snippet: z.string(),
+  /** Unix **seconds** — the resolution the chronicle's own timestamps have. */
+  createdAt: z.number().int(),
+  /** Decision id, or the session id whose log this came from. */
+  ref: z.string(),
+  /** Event seq within that session's log; 0 for a decision. */
+  seq: z.number().int(),
+  roomId: z.string().nullable(),
+  /** Absolute path of the ADR file, for a decision. `null` for an event, which has no file. */
+  path: z.string().nullable(),
+});
+export type ChronicleHit = z.infer<typeof ChronicleHit>;
+
+/** How many hits a chronicle search answers with when the client does not say. */
+export const CHRONICLE_SEARCH_LIMIT = 10;
+
 // ---- client -> server ----
 export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("subscribe"), sessionId: z.string(), afterSeq: z.number().int().nonnegative() }),
@@ -308,6 +342,23 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * queue until something changes, or replays an hour of history as packages on the belt.
    */
   z.object({ kind: z.literal("list_messages") }),
+  /**
+   * Search this project's chronicle — the same index `factory_search_history` gives agents.
+   *
+   * A **query**, answered to the asking socket alone: two operators searching different words in two
+   * tabs must not overwrite each other's results, and nobody else's screen should change because
+   * someone typed in a search box.
+   *
+   * An empty query is not an error and not "match everything": it asks for the newest recorded
+   * decisions, so opening the surface shows what this factory has decided rather than an empty box.
+   * Anything an agent could type is accepted verbatim — FTS5 operators are neutralised server-side
+   * (`ftsQuery`), so a stray quote is a search, not a syntax error.
+   */
+  z.object({
+    kind: z.literal("search_chronicle"),
+    query: z.string().max(500).default(""),
+    limit: z.number().int().min(1).max(50).optional(),
+  }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -384,5 +435,19 @@ export const ServerMessage = z.discriminatedUnion("kind", [
    * event log instead.
    */
   z.object({ kind: z.literal("notice"), message: z.string() }),
+  /**
+   * The answer to one `search_chronicle`, **carrying the query it answers**.
+   *
+   * The echo is load-bearing: a search box sends a request per keystroke-ish and the answers come
+   * back over a socket in no guaranteed order, so a client that stored whatever arrived last would
+   * show the results for a word the operator has already finished deleting. With the query on the
+   * frame, an answer that is not the question currently being asked is simply dropped.
+   */
+  z.object({
+    kind: z.literal("chronicle"),
+    /** The query as asked. Empty means "the newest decisions", which is what an empty box shows. */
+    query: z.string(),
+    hits: z.array(ChronicleHit),
+  }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;

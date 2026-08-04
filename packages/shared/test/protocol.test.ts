@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  AGENT_MODELS, ATTACHMENTS_DIRNAME, AttachmentUploadResult, AutonomyMode, ClientMessage,
+  AGENT_MODELS, ATTACHMENTS_DIRNAME, AttachmentUploadResult, AutonomyMode,
+  CHRONICLE_SEARCH_LIMIT, ChronicleHit, ClientMessage,
   DEFAULT_AUTONOMY, MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
   ProjectInfo, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
 } from "../src/protocol.js";
@@ -134,6 +135,50 @@ describe("protocol", () => {
         .toMatchObject({ sessions: [{ isOrchestrator: true }] });
       expect(() => ServerMessage.parse({ kind: "sessions", sessions: [{ ...info, isOrchestrator: "yes" }] }))
         .toThrow();
+    });
+  });
+
+  // ---- M3b: the chronicle on the wire ----
+
+  describe("the chronicle", () => {
+    const HIT = {
+      kind: "decision", title: "Retries live in payments", snippet: "the webhook…",
+      createdAt: 1_770_000_000, ref: "d1", seq: 0, roomId: "r1", path: "/p/docs/decisions/0001-x.md",
+    } as const;
+
+    it("parses search_chronicle, defaulting the query to the newest decisions", () => {
+      // No query at all is a real request, not a malformed one: it is what opening the surface asks.
+      expect(ClientMessage.parse({ kind: "search_chronicle" }))
+        .toEqual({ kind: "search_chronicle", query: "" });
+      expect(ClientMessage.parse({ kind: "search_chronicle", query: "webhook", limit: 5 }))
+        .toEqual({ kind: "search_chronicle", query: "webhook", limit: 5 });
+      // FTS5 operators are the server's problem (`ftsQuery`), so the wire takes them verbatim.
+      expect(ClientMessage.parse({ kind: "search_chronicle", query: 'the "retry policy' }).query)
+        .toBe('the "retry policy');
+      expect(() => ClientMessage.parse({ kind: "search_chronicle", limit: 0 })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "search_chronicle", limit: 51 })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "search_chronicle", query: "x".repeat(501) })).toThrow();
+    });
+
+    it("answers with the hits and the query they answer", () => {
+      const msg = ServerMessage.parse({ kind: "chronicle", query: "webhook", hits: [HIT] });
+      expect(msg).toEqual({ kind: "chronicle", query: "webhook", hits: [HIT] });
+      // The echo is what lets a client drop a stale answer, so it is required rather than optional.
+      expect(() => ServerMessage.parse({ kind: "chronicle", hits: [] })).toThrow();
+      expect(ServerMessage.parse({ kind: "chronicle", query: "", hits: [] }).kind).toBe("chronicle");
+    });
+
+    it("keeps a hit's two sources apart, and only a decision has a file", () => {
+      expect(ChronicleHit.parse({ ...HIT, kind: "event", seq: 12, path: null }))
+        .toMatchObject({ kind: "event", path: null });
+      expect(() => ChronicleHit.parse({ ...HIT, kind: "prompt" })).toThrow();
+      // `path` is nullable but never absent: "no file" is a fact the panel has to be told.
+      const { path: _omitted, ...noPath } = HIT;
+      expect(() => ChronicleHit.parse(noPath)).toThrow();
+    });
+
+    it("has a default result count both sides can agree on", () => {
+      expect(CHRONICLE_SEARCH_LIMIT).toBe(10);
     });
   });
 

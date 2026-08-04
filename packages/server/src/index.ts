@@ -54,7 +54,7 @@ const router = new TaskRouter({
   roomAgents: (roomId) => mgr.roomAgents(roomId),
 });
 mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, { bus, tasks, router, chronicle });
-const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router });
+const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router, chronicle });
 
 const bootProject = projects.defaultProject();
 // Every project needs its central building, including one that existed before this boot.

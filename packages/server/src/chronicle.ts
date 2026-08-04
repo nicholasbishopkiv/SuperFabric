@@ -1,8 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import type { ChronicleHit } from "@superfabric/shared";
 import type { Db } from "./db.js";
 import type { ProjectManager } from "./projectManager.js";
+
+/**
+ * A hit is a **wire** type: the HUD's chronicle surface shows exactly what `factory_search_history`
+ * shows an agent, so the shape is declared once in `@superfabric/shared` and re-exported here rather
+ * than described twice. Two descriptions of one row is how a panel ends up missing the field that
+ * makes a result actionable.
+ */
+export type { ChronicleHit };
 
 /**
  * Where ADRs live inside a project, relative to its root. The same place this repository keeps its
@@ -52,25 +61,6 @@ export interface RecordDecisionOptions {
   decision: string;
   alternatives?: string;
   links?: string[];
-}
-
-/** One hit: enough to act on without opening anything — what, when, who, and the matching text. */
-export interface ChronicleHit {
-  /** `decision` is written-down reasoning; `event` is something that was actually said at the time. */
-  kind: "decision" | "event";
-  /** The decision's title, or the event's type. */
-  title: string;
-  /** The matching part of the body, with an ellipsis where it was cut. */
-  snippet: string;
-  createdAt: number;
-  /** Decision id, or the session id whose log this came from. */
-  ref: string;
-  /** Event seq within that session's log; 0 for a decision. */
-  seq: number;
-  /** The room it came from, when there was one. */
-  roomId: string | null;
-  /** The ADR file, for a decision. `null` for an event, which has no file of its own. */
-  path: string | null;
 }
 
 /** Row shape of `decisions`. */
@@ -220,6 +210,27 @@ export class Chronicle {
     return (this.stmts.list.all(projectId, limit) as DecisionRow[]).map(toDecisionRecord);
   }
 
+  /**
+   * The newest decisions, in the same shape a search returns: what "no query" means.
+   *
+   * A chronicle surface that opened empty would ask the operator to guess a word before it showed
+   * them this project has any recorded reasoning at all — and "what has been decided here?" is the
+   * first question, not a search. The snippet is cut from the *context* (why it was a question)
+   * rather than from the decision, because the title already says what was decided.
+   */
+  recentHits(projectId: string, limit = 10): ChronicleHit[] {
+    return this.list(projectId, limit).map((d) => ({
+      kind: "decision" as const,
+      title: d.title,
+      snippet: firstWords(d.context === "" ? d.decision : d.context),
+      createdAt: d.createdAt,
+      ref: d.id,
+      seq: 0,
+      roomId: d.roomId,
+      path: d.path,
+    }));
+  }
+
   /** `undefined` for an unknown id — the absent-row shape the rest of the package speaks. */
   get(id: string): DecisionRecord | undefined {
     // `== null`, not `=== undefined`: "no such row" is `null` for the driver db.ts uses.
@@ -301,6 +312,17 @@ function adrMarkdown(number: number, d: Omit<DecisionRecord, "number" | "path">)
   if (d.links.length > 0) lines.push("", "## Links", "", ...d.links.map((l) => `- ${l}`));
   lines.push("");
   return lines.join("\n");
+}
+
+/**
+ * The opening of a body, cut to the same length FTS5's `snippet()` produces, so a listed decision
+ * and a matched one look like the same kind of thing in the same list. Whitespace is collapsed
+ * because an ADR's context is markdown with line breaks in it and a one-line result is one line.
+ */
+function firstWords(text: string, tokens = SNIPPET_TOKENS): string {
+  const words = text.replace(/\s+/g, " ").trim().split(" ").filter((w) => w !== "");
+  if (words.length <= tokens) return words.join(" ");
+  return `${words.slice(0, tokens).join(" ")}…`;
 }
 
 function isoDate(unixSeconds: number): string {

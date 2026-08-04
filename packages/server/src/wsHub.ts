@@ -1,4 +1,5 @@
-import { ClientMessage, type ServerMessage } from "@superfabric/shared";
+import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@superfabric/shared";
+import type { Chronicle } from "./chronicle.js";
 import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
 import { ensureOrchestrator } from "./orchestrator.js";
@@ -33,6 +34,12 @@ export interface WsHubOptions {
    * with an error, which is the same shape as a server with no board.
    */
   router?: TaskRouter;
+  /**
+   * The chronicle. Absent => `search_chronicle` is refused with an error rather than answered with
+   * an empty list: "this server records no decisions" and "nobody has decided anything" are
+   * different facts, and a surface that showed the second for the first would be lying.
+   */
+  chronicle?: Chronicle;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -58,6 +65,7 @@ export class WsHub {
   private readonly tasks: TaskStore | undefined;
   private readonly bus: FactoryBus | undefined;
   private readonly router: TaskRouter | undefined;
+  private readonly chronicle: Chronicle | undefined;
 
   constructor(
     private store: EventStore,
@@ -70,6 +78,7 @@ export class WsHub {
     this.tasks = opts.tasks;
     this.bus = opts.bus;
     this.router = opts.router;
+    this.chronicle = opts.chronicle;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -327,6 +336,21 @@ export class WsHub {
         case "list_messages":
           this.safeSend(sock, { kind: "messages", messages: this.busStore().list(this.activeProject(sock)) });
           break;
+        // The chronicle, as the operator's own copy of `factory_search_history`: the same index, the
+        // same hits, answered to the socket that asked. An empty query is "show me what has been
+        // decided here", which is the question someone opening the surface actually has.
+        case "search_chronicle": {
+          const chronicle = this.chronicleStore();
+          const projectId = this.activeProject(sock);
+          const limit = msg.limit ?? CHRONICLE_SEARCH_LIMIT;
+          const hits = msg.query.trim() === ""
+            ? chronicle.recentHits(projectId, limit)
+            : chronicle.search(projectId, msg.query, limit);
+          // The query travels back with its answer so a client can drop the results of a search it
+          // has already moved on from — see `chronicle` in the protocol.
+          this.safeSend(sock, { kind: "chronicle", query: msg.query, hits });
+          break;
+        }
       }
     } catch (err) {
       this.safeSend(sock, { kind: "error", message: String(err) });
@@ -458,6 +482,12 @@ export class WsHub {
   private taskStore(): TaskStore {
     if (this.tasks === undefined) throw new Error("this server has no task board");
     return this.tasks;
+  }
+
+  /** Likewise for the chronicle: no index is not the same answer as an empty index. */
+  private chronicleStore(): Chronicle {
+    if (this.chronicle === undefined) throw new Error("this server has no chronicle");
+    return this.chronicle;
   }
 
   /** Likewise for the bus: "no factory bus here" is an answer, an empty list would be a lie. */
