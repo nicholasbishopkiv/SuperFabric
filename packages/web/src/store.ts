@@ -1,4 +1,5 @@
 import type {
+  AccountInfo,
   ChronicleHit,
   MessageInfo,
   MessageKind,
@@ -146,6 +147,14 @@ const pairKey = (a: string, b: string): string => (a < b ? `${a}|${b}` : `${b}|$
 export interface FabricState {
   /** Every factory this server serves, in the server's order. */
   projects: ProjectInfo[];
+  /**
+   * Every Claude subscription this server knows about, in the server's order.
+   *
+   * **Not cleared when the project changes**, unlike everything below it: an account is
+   * machine-wide, so the same list is the truth on every floor (see `AccountInfo`). It is the one
+   * piece of server state in this store that a factory switch leaves alone.
+   */
+  accounts: AccountInfo[];
   /**
    * The factory this tab is looking at, or null before the server has said. Server-owned: the socket
    * holds the active project, so this is whatever the last `projects` message carried and never
@@ -364,6 +373,7 @@ const EMPTY_PROJECT_STATE = {
 /** Everything except the actions — exported so tests can reset between cases. */
 export const initialFabricState = {
   projects: [] as ProjectInfo[],
+  accounts: [] as AccountInfo[],
   activeProjectId: null as string | null,
   sessions: [] as SessionInfo[],
   rooms: [] as RoomInfo[],
@@ -406,7 +416,7 @@ function contiguousFrom(rows: EventRow[], start: number): number {
 /** Every field a building draws from. Ids are compared separately, by position in the list. */
 function sameRoom(a: RoomInfo, b: RoomInfo): boolean {
   return a.name === b.name && a.path === b.path && a.kind === b.kind
-    && a.agentCount === b.agentCount
+    && a.agentCount === b.agentCount && a.accountId === b.accountId
     && a.position.x === b.position.x && a.position.z === b.position.z;
 }
 
@@ -429,7 +439,7 @@ function sameWaiting(a: readonly WaitingMessage[], b: readonly WaitingMessage[])
 function sameSession(a: SessionInfo, b: SessionInfo): boolean {
   return a.state === b.state && a.status === b.status && a.blocked === b.blocked
     && a.autonomy === b.autonomy && a.model === b.model && a.roomId === b.roomId
-    && a.isOrchestrator === b.isOrchestrator
+    && a.isOrchestrator === b.isOrchestrator && a.accountId === b.accountId
     && a.claudeSessionId === b.claudeSessionId && a.lastSeq === b.lastSeq;
 }
 
@@ -611,6 +621,29 @@ function applyTasks(s: FabricState, incoming: TaskInfo[]): Partial<FabricState> 
   return { tasks };
 }
 
+/** Every field an account row draws from — including where its login has got to. */
+function sameAccount(a: AccountInfo, b: AccountInfo): boolean {
+  return a.label === b.label && a.configDir === b.configDir
+    && a.credentialsPresent === b.credentialsPresent && a.lastUsedAt === b.lastUsedAt
+    && a.login.status === b.login.status && a.login.url === b.login.url
+    && a.login.message === b.login.message;
+}
+
+/**
+ * Same trick as `applyRooms`/`applySessions`/`applyTasks`: the list is rebroadcast whole, and while a
+ * login is running it is rebroadcast on every chunk the CLI prints. Unchanged rows keep their
+ * identity so the account being logged in repaints and the others do not.
+ */
+function applyAccounts(s: FabricState, incoming: AccountInfo[]): Partial<FabricState> | FabricState {
+  const previous = new Map(s.accounts.map((a) => [a.id, a]));
+  const accounts = incoming.map((a) => {
+    const prev = previous.get(a.id);
+    return prev !== undefined && sameAccount(prev, a) ? prev : a;
+  });
+  if (accounts.length === s.accounts.length && accounts.every((a, i) => a === s.accounts[i])) return s;
+  return { accounts };
+}
+
 export const useFabric = create<FabricState>((set, get) => ({
   ...initialFabricState,
 
@@ -623,6 +656,7 @@ export const useFabric = create<FabricState>((set, get) => ({
       if (msg.kind === "sessions") return applySessions(s, msg.sessions);
       if (msg.kind === "rooms") return applyRooms(s, msg.rooms);
       if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
+      if (msg.kind === "accounts") return applyAccounts(s, msg.accounts);
       // An answer to a question nobody is asking any more is dropped: the operator has typed on,
       // and showing them the hits for a prefix of what is in the box would be worse than showing
       // them nothing. See `ChronicleState`.
@@ -872,6 +906,31 @@ export const useRoomIds = (): string[] => useFabric((s) => s.roomIds);
 export const useProjects = (): ProjectInfo[] => useFabric((s) => s.projects);
 
 export const useActiveProjectId = (): string | null => useFabric((s) => s.activeProjectId);
+
+// ---- accounts ----
+//
+// Machine-wide, so none of these takes a project: the same list is the answer on every floor. What
+// *is* per-project is the binding, and that rides on `RoomInfo.accountId` / `SessionInfo.accountId`
+// like any other field of a room or an agent.
+
+export const useAccounts = (): AccountInfo[] => useFabric(useShallow((s) => s.accounts));
+
+/** One account, or `undefined` for `null` and for an id this tab has not been told about. */
+export const useAccount = (accountId: string | null): AccountInfo | undefined =>
+  useFabric((s) => (accountId === null ? undefined : s.accounts.find((a) => a.id === accountId)));
+
+/**
+ * What to call an account in one line. An id we hold no row for is shown as the id rather than as
+ * "none": "this agent is on an account I cannot describe" and "this agent is on no account" are
+ * different facts, and the second is a claim about which subscription is being spent.
+ */
+export function accountLabel(accounts: readonly AccountInfo[], accountId: string | null): string {
+  if (accountId === null) return ACCOUNT_NONE_LABEL;
+  return accounts.find((a) => a.id === accountId)?.label ?? accountId;
+}
+
+/** What "no account" is called wherever it is offered or shown. One string, not four. */
+export const ACCOUNT_NONE_LABEL = "default";
 
 /** The factory this tab is showing, or undefined before the server has said which. */
 export const useActiveProject = (): ProjectInfo | undefined =>

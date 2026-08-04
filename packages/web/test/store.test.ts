@@ -1,8 +1,10 @@
 import type {
-  ChronicleHit, MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo,
+  AccountInfo, ChronicleHit, MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo,
 } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  ACCOUNT_NONE_LABEL,
+  accountLabel,
   agentStatus,
   beltDirections,
   beltFan,
@@ -29,7 +31,7 @@ beforeEach(() => {
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
     selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
-    projects: [], activeProjectId: null,
+    projects: [], activeProjectId: null, accounts: [],
     chronicle: { asked: "", answered: null, hits: [] },
   });
 });
@@ -1315,5 +1317,94 @@ describe("projects", () => {
     apply({ kind: "projects", projects: [project(), other], activeProjectId: "p1" });
     expect(useFabric.getState().projects.map((p) => p.id)).toEqual(["p1", "p2"]);
     expect(useFabric.getState().rooms).toBe(rooms);
+  });
+});
+
+describe("accounts", () => {
+  const account = (over: Partial<AccountInfo> = {}): AccountInfo => ({
+    id: "a1", label: "Work", configDir: "/home/me/.claude-work",
+    credentialsPresent: true, createdAt: 1_800_000_000, lastUsedAt: null,
+    login: { status: "idle", url: null, message: null }, ...over,
+  });
+
+  it("stores the account list", () => {
+    apply({ kind: "accounts", accounts: [account(), account({ id: "a2", label: "Personal" })] });
+    expect(useFabric.getState().accounts.map((a) => a.label)).toEqual(["Work", "Personal"]);
+  });
+
+  it("keeps unchanged rows identical, so one login does not repaint the others", () => {
+    apply({ kind: "accounts", accounts: [account(), account({ id: "a2", label: "Personal" })] });
+    const before = useFabric.getState().accounts;
+
+    // The list is rebroadcast on every chunk the CLI prints while a login runs.
+    apply({
+      kind: "accounts",
+      accounts: [
+        account(),
+        account({
+          id: "a2", label: "Personal", credentialsPresent: false,
+          login: { status: "awaiting_code", url: "https://claude.com/x", message: null },
+        }),
+      ],
+    });
+    const after = useFabric.getState().accounts;
+    expect(after[0]).toBe(before[0]);
+    expect(after[1]).not.toBe(before[1]);
+    expect(after[1]!.login.url).toBe("https://claude.com/x");
+  });
+
+  it("an identical rebroadcast changes nothing at all", () => {
+    apply({ kind: "accounts", accounts: [account()] });
+    const before = useFabric.getState().accounts;
+    apply({ kind: "accounts", accounts: [account()] });
+    expect(useFabric.getState().accounts).toBe(before);
+  });
+
+  it("survives a project switch, because a subscription is not a repository's", () => {
+    const projects = [
+      { id: "p1", name: "shop", root: "/code/shop", lastOpenedAt: null },
+      { id: "p2", name: "vendor", root: "/code/vendor", lastOpenedAt: null },
+    ];
+    apply({ kind: "projects", projects, activeProjectId: "p1" });
+    apply({ kind: "accounts", accounts: [account()] });
+    apply({ kind: "rooms", rooms: [room({ id: "r1" })] });
+    apply({ kind: "projects", projects, activeProjectId: "p2" });
+    // The floor is dropped — and the accounts are not, because they are the same on every floor.
+    expect(useFabric.getState().rooms).toEqual([]);
+    expect(useFabric.getState().accounts.map((a) => a.label)).toEqual(["Work"]);
+  });
+
+  it("a room's binding repaints the room, so a re-bind is not invisible", () => {
+    apply({ kind: "rooms", rooms: [room({ id: "r1" })] });
+    const before = useFabric.getState().rooms[0];
+    apply({ kind: "rooms", rooms: [room({ id: "r1", accountId: "a1" })] });
+    expect(useFabric.getState().rooms[0]).not.toBe(before);
+    expect(useFabric.getState().rooms[0]!.accountId).toBe("a1");
+  });
+
+  it("an agent's binding repaints the agent, for the same reason", () => {
+    apply({ kind: "sessions", sessions: [session({ id: "s1" })] });
+    const before = useFabric.getState().sessions[0];
+    apply({ kind: "sessions", sessions: [session({ id: "s1", accountId: "a1" })] });
+    expect(useFabric.getState().sessions[0]).not.toBe(before);
+    expect(useFabric.getState().sessions[0]!.accountId).toBe("a1");
+  });
+
+  describe("accountLabel", () => {
+    it("names the bound account", () => {
+      expect(accountLabel([account()], "a1")).toBe("Work");
+    });
+
+    it("null is the ambient ~/.claude, and it is called something", () => {
+      expect(accountLabel([account()], null)).toBe(ACCOUNT_NONE_LABEL);
+      expect(ACCOUNT_NONE_LABEL).not.toBe("");
+    });
+
+    it("an id with no row shows the id, never 'default'", () => {
+      // "An account I cannot describe" and "no account" are different facts, and the second is a
+      // claim about whose quota is being spent.
+      expect(accountLabel([account()], "a-gone")).toBe("a-gone");
+      expect(accountLabel([], "a1")).toBe("a1");
+    });
   });
 });

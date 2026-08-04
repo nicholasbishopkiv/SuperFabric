@@ -45,6 +45,9 @@ export function connect(): void {
     // And the board, which is server state like the others: an operator reloading the page must see
     // what the factory is working on without having to wait for a task to change.
     send({ kind: "list_tasks" });
+    // Accounts. Asked for like the rest, and *not* re-asked on `open_project`: a subscription is
+    // machine-wide, so the answer is the same on every floor and the list survives a switch.
+    send({ kind: "list_accounts" });
     // The server hard-terminates sockets on shutdown, so a reconnect must re-ask for the tail of
     // every session we were following — from the last contiguous seq we hold, not from 0.
     const { contiguousSeq } = useFabric.getState();
