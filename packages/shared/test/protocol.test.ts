@@ -5,7 +5,7 @@ import {
   CHRONICLE_SEARCH_LIMIT, ChronicleHit, ClientMessage,
   DEFAULT_AUTONOMY, LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT,
   MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
-  ProjectInfo, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
+  ProjectInfo, RoleSpec, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
   USAGE_POLL_INTERVAL_MS, UsageWindow,
 } from "../src/protocol.js";
 
@@ -626,6 +626,80 @@ describe("protocol", () => {
       expect(LIMIT_PAUSE_PERCENT).toBeLessThan(100);
       // docs/RESEARCH.md §2: ~180 s is what is safe against an endpoint nobody documented.
       expect(USAGE_POLL_INTERVAL_MS).toBeGreaterThanOrEqual(180_000);
+    });
+  });
+
+  describe("roles", () => {
+    const MINIMAL = {
+      id: "architect", name: "Architect", summary: "Shape, not code.",
+      promptAppend: "You are the architect.",
+    } as const;
+
+    it("parses a minimal role, and everything optional is absent rather than guessed", () => {
+      const role = RoleSpec.parse(MINIMAL);
+      // Absent, not defaulted: a role with no model can never be the reason an agent is on one.
+      expect(role.model).toBeUndefined();
+      expect(role.autonomy).toBeUndefined();
+      expect(role.skills).toEqual([]);
+      expect(role.mcpServers).toEqual({});
+      expect(role.allowedTools).toEqual([]);
+    });
+
+    it("rejects an unknown field, because a typo that parses is the worst config-file failure", () => {
+      // `skill:` for `skills:` would otherwise ship a role whose whole point silently never arrives.
+      expect(() => RoleSpec.parse({ ...MINIMAL, skill: ["tdd"] })).toThrow();
+    });
+
+    it("holds the id to something usable as a filename, and the summary to one line's worth", () => {
+      expect(() => RoleSpec.parse({ ...MINIMAL, id: "Architect Room" })).toThrow();
+      expect(() => RoleSpec.parse({ ...MINIMAL, id: "-leading" })).toThrow();
+      expect(() => RoleSpec.parse({ ...MINIMAL, summary: "" })).toThrow();
+      expect(() => RoleSpec.parse({ ...MINIMAL, promptAppend: "" })).toThrow();
+    });
+
+    it("takes the three outside-facing MCP transports and refuses anything else", () => {
+      const role = RoleSpec.parse({
+        ...MINIMAL,
+        mcpServers: { pw: { type: "stdio", command: "npx", args: ["-y", "x"] } },
+      });
+      expect(role.mcpServers.pw).toEqual({ type: "stdio", command: "npx", args: ["-y", "x"], env: {} });
+      expect(RoleSpec.parse({ ...MINIMAL, mcpServers: { r: { type: "http", url: "http://x" } } })
+        .mcpServers.r).toEqual({ type: "http", url: "http://x", headers: {} });
+      // The in-process variant holds a live object, so it cannot come from a file — and the only one
+      // this product has is the factory bus, which a role must never be able to replace.
+      expect(() => RoleSpec.parse({ ...MINIMAL, mcpServers: { f: { type: "sdk", instance: {} } } }))
+        .toThrow();
+    });
+
+    it("puts the library on the wire with its failures attached", () => {
+      const msg = ServerMessage.parse({
+        kind: "roles",
+        roles: [MINIMAL],
+        problems: [{ file: "/p/roles/broken.yaml", message: "is not valid YAML" }],
+      });
+      expect(msg).toMatchObject({ kind: "roles", problems: [{ file: "/p/roles/broken.yaml" }] });
+      expect(ClientMessage.parse({ kind: "list_roles" }).kind).toBe("list_roles");
+    });
+
+    it("carries a role onto a new agent, and lets a live one be cleared with null", () => {
+      expect(ClientMessage.parse({ kind: "create_session", roomId: "r1", roleId: "architect" }))
+        .toMatchObject({ roleId: "architect" });
+      // Omitted is a plain agent, which is what every session before roles was. Absent rather than
+      // defaulted, so `CreateSessionOptions.roleId` stays "the caller said nothing".
+      expect(ClientMessage.parse({ kind: "create_session", roomId: "r1" }))
+        .not.toHaveProperty("roleId");
+      expect(ClientMessage.parse({ kind: "set_role", sessionId: "s1", roleId: null }).kind)
+        .toBe("set_role");
+      expect(() => ClientMessage.parse({ kind: "set_role", sessionId: "s1", roleId: "Not An Id" }))
+        .toThrow();
+    });
+
+    it("reports a session's role, defaulting to none for a row written before roles existed", () => {
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [SESSION_INFO] }))
+        .toMatchObject({ sessions: [{ roleId: null }] });
+      expect(ServerMessage.parse({
+        kind: "sessions", sessions: [{ ...SESSION_INFO, roleId: "architect" }],
+      })).toMatchObject({ sessions: [{ roleId: "architect" }] });
     });
   });
 });

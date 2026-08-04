@@ -305,6 +305,135 @@ export const RoomInfo = z.object({
 });
 export type RoomInfo = z.infer<typeof RoomInfo>;
 
+// ---- M1c: roles ----
+
+/**
+ * A role's id: the filename-ish handle an operator types, and the value stored on a session row.
+ *
+ * Constrained like `RoomName` and for a weaker but real version of the same reason — a role is a file
+ * (`roles/<id>.yaml`), and an id that cannot be a filename would make the library's own convention
+ * unusable. It is not used to *build* a path (the loader reads whatever files are in the directory and
+ * takes the id from inside them), so this is a legibility rule rather than a containment one.
+ */
+export const RoleId = z.string().min(1).max(64).regex(
+  /^[a-z0-9][a-z0-9-]*$/,
+  "lowercase letters, digits and dashes only; must start with a letter or digit",
+);
+export type RoleId = z.infer<typeof RoleId>;
+
+/**
+ * The name of a skill a role wants, which is the **directory name** it is installed under.
+ *
+ * A plain name rather than a pack-qualified one, because that is the mechanic: a skill lands in
+ * `<room>/.claude/skills/<name>/` and Claude Code running in that folder finds it there. The server
+ * resolves the name against the skill directories on the machine (see `SkillLibrary`), so a role can
+ * only ever name a skill that someone has actually installed — and a name that resolves to nothing is
+ * reported rather than silently doing nothing.
+ */
+export const RoleSkillName = z.string().min(1).max(64).regex(
+  /^[a-z0-9][a-z0-9._-]*$/,
+  "lowercase letters, digits, dot, dash and underscore only; must not start with a separator",
+);
+
+/**
+ * An MCP server a role brings with it.
+ *
+ * The three *outside-facing* transports the SDK understands, and deliberately not the in-process
+ * (`sdk`) one: that variant holds a live object, so it cannot come from a file — and the only
+ * in-process server this product has is the factory bus, which every roomed agent gets anyway and
+ * which a role can never take away (see `SessionManager.startExecutor`).
+ *
+ * Anything here is *trusted*: the SDK skips its approval flow for servers we pass. That is why the
+ * shape is closed rather than a passthrough — an operator writing one of these into a role file is
+ * making a decision, and it should look like one.
+ */
+export const RoleMcpServer = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("stdio"),
+    command: z.string().min(1),
+    args: z.array(z.string()).default([]),
+    env: z.record(z.string(), z.string()).default({}),
+  }).strict(),
+  z.object({
+    type: z.literal("http"),
+    url: z.string().min(1),
+    headers: z.record(z.string(), z.string()).default({}),
+  }).strict(),
+  z.object({
+    type: z.literal("sse"),
+    url: z.string().min(1),
+    headers: z.record(z.string(), z.string()).default({}),
+  }).strict(),
+]);
+export type RoleMcpServer = z.infer<typeof RoleMcpServer>;
+
+/**
+ * A role: what an agent arrives as, so an operator who does not know Claude Code's configuration
+ * surface can still get an architect rather than a blank session.
+ *
+ * **`.strict()` is load-bearing.** A role is a file a human writes by hand, and the worst failure
+ * available to a hand-written config file is a typo that parses: `skill:` instead of `skills:` would
+ * silently ship a role with no skills and nothing anywhere would say so. An unknown field is an error
+ * that names the file.
+ *
+ * Everything except `id`, `name`, `summary` and `promptAppend` is optional, and an absent field means
+ * "this role has no opinion" — not a value. That is what lets an explicit operator choice beat a
+ * preset: a role with no `model` cannot be the reason an agent is on the wrong one.
+ */
+export const RoleSpec = z.object({
+  id: RoleId,
+  /** What the picker shows. Title case, a couple of words. */
+  name: z.string().min(1).max(60),
+  /** One line of "why would I pick this one", shown beside the name. */
+  summary: z.string().min(1).max(200),
+  /**
+   * The charter, appended to the agent's system prompt. A charter and not a manual: it says what the
+   * role owns, what it must not do, and how it hands off. Every turn that agent ever takes pays for
+   * this text, so length here is a tax rather than a service.
+   */
+  promptAppend: z.string().min(1).max(4000),
+  /**
+   * The model this role wants. **Absent means the role has no opinion**, and a model the operator
+   * chose explicitly always wins over one a preset suggested.
+   */
+  model: ModelId.optional(),
+  /** Skills to install into the agent's folder, by directory name. */
+  skills: z.array(RoleSkillName).max(20).default([]),
+  /**
+   * Extra MCP servers, by name. Merged with the factory's own in-process bus, which is never
+   * removed — a name collision loses to the factory, not the other way round.
+   */
+  mcpServers: z.record(z.string().min(1).max(64), RoleMcpServer).default({}),
+  /**
+   * Tool names this role pre-approves. The SDK's `allowedTools` is an **auto-allow list**, not a
+   * restriction: an entry here is a privilege grant that skips the approval card, so MCP tools must
+   * be written in the namespaced form the model actually sees (`mcp__<server>__<tool>`). None of the
+   * shipped presets uses it; it is the operator's own extension point.
+   */
+  allowedTools: z.array(z.string().min(1).max(120)).max(50).default([]),
+  /**
+   * How much rope this role wants. Applied **only when an agent is created and the operator named
+   * none** — picking a role on a live agent never changes what it is allowed to do, because a
+   * privilege level that moves as a side effect of a dropdown is not one the operator chose.
+   */
+  autonomy: AutonomyMode.optional(),
+}).strict();
+export type RoleSpec = z.infer<typeof RoleSpec>;
+
+/**
+ * A role file that could not be loaded, named so the operator can go and fix it.
+ *
+ * Reported rather than skipped, and this type exists to make that possible on the wire: a preset that
+ * silently vanished because of a stray tab is the failure mode a config format has to design against.
+ */
+export const RoleProblem = z.object({
+  /** Absolute path of the file. */
+  file: z.string(),
+  /** What is wrong with it, in the parser's own words. */
+  message: z.string(),
+});
+export type RoleProblem = z.infer<typeof RoleProblem>;
+
 // ---- M3a: tasks and the factory bus ----
 
 /** The board's columns. `blocked` specifically means "waiting on another room", see `TaskInfo`. */
@@ -436,6 +565,12 @@ export const ClientMessage = z.discriminatedUnion("kind", [
      * the room's account; a roomless session, or a room with none, => the ambient `~/.claude`.
      */
     accountId: z.string().optional(),
+    /**
+     * Start this agent as a role: its charter, its skills, and — unless something above says
+     * otherwise — its model and autonomy. Omitted => a plain agent, which is what every session
+     * before M1c was.
+     */
+    roleId: RoleId.optional(),
   }),
   z.object({ kind: z.literal("set_autonomy"), sessionId: z.string(), autonomy: AutonomyMode }),
   /**
@@ -453,7 +588,29 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * the account actually in force can then never disagree.
    */
   z.object({ kind: z.literal("set_session_account"), sessionId: z.string(), accountId: z.string().nullable() }),
+  /**
+   * Give a live agent a role, or take it away (`null` => a plain agent again).
+   *
+   * The fourth member of the `set_autonomy`/`set_model`/`set_session_account` family and restarted for
+   * the same reason: a role composes the system prompt, the model and the tool servers, all of which
+   * are `Options` fields fixed for the lifetime of a `query()`. The conversation is resumed, so the
+   * agent keeps what it knows and changes what it is.
+   *
+   * What it deliberately does **not** change is the agent's autonomy: a role's `autonomy` applies when
+   * an agent is created, never afterwards. Escalating what a running agent may do from a dropdown
+   * labelled with a job title is not a decision the operator made.
+   */
+  z.object({ kind: z.literal("set_role"), sessionId: z.string(), roleId: RoleId.nullable() }),
   z.object({ kind: z.literal("list_sessions") }),
+  /**
+   * The role library: the presets this server shipped, plus the operator's own overrides, plus any
+   * file that failed to load.
+   *
+   * Not scoped to a project — a role is a file on the machine, like an account is a directory on it —
+   * so the answer is the same on every floor. Answered to the socket that asked, like every other
+   * listing.
+   */
+  z.object({ kind: z.literal("list_roles") }),
   /**
    * Give this factory its orchestrator, or hand back the one it already has.
    *
@@ -608,6 +765,15 @@ export const SessionInfo = z.object({
   /** The room this agent works in, or null for a roomless session (every M0 session). */
   roomId: z.string().nullable(),
   /**
+   * The role this agent arrived as, or `null` for a plain one.
+   *
+   * The id rather than the whole spec: roles are a machine-wide list the client already holds, and a
+   * copy of the charter on every session row would go stale the moment the operator edited the file.
+   * Persisted and re-applied on resume, like `autonomy`, `model` and `accountId` — an agent restarted
+   * by a reboot comes back as the architect it was, not as a blank session in the architect's room.
+   */
+  roleId: z.string().nullable().default(null),
+  /**
    * This agent is the factory's orchestrator: the senior agent that routes work, unblocks rooms and
    * decides direction. It is an ordinary session in every other respect — same runtime, same event
    * log, same room (the project room) — so this is a flag on `SessionInfo` rather than a separate
@@ -667,6 +833,13 @@ export const ServerMessage = z.discriminatedUnion("kind", [
    * would rebroadcast every account row (and every in-flight login's state) on every tick.
    */
   z.object({ kind: z.literal("usage"), usage: z.array(AccountUsage) }),
+  /**
+   * The role library. Machine-wide like `accounts`, and carrying its own failures: a preset that did
+   * not load is a fact the operator has to be able to see, and the alternative — a list that is
+   * quietly one entry shorter than the folder — is exactly the failure a hand-written config format
+   * has to design against.
+   */
+  z.object({ kind: z.literal("roles"), roles: z.array(RoleSpec), problems: z.array(RoleProblem) }),
   z.object({ kind: z.literal("tasks"), tasks: z.array(TaskInfo) }),
   /**
    * The bus's traffic. This is what drives the conveyor animation, so it carries `deliveredAt`:
