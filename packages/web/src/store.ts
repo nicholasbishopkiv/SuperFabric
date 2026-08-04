@@ -1,13 +1,18 @@
 import type {
+  AccountBurn,
   AccountInfo,
+  AccountMetrics,
   AccountUsage,
   ChronicleHit,
+  CostRollups,
+  FactoryMetrics,
   MessageInfo,
   MessageKind,
   OnboardingState,
   ProjectInfo,
   RoleProblem,
   RoleSpec,
+  RoomCost,
   RoomInfo,
   SavedAttachment,
   ScenePosition,
@@ -225,6 +230,16 @@ export interface FabricState {
    * server's three-minute poll. Machine-wide like the accounts, so a factory switch leaves it alone.
    */
   usage: AccountUsage[];
+  /**
+   * Burn rate and cost, or null before the server has said.
+   *
+   * Per project, unlike `usage` — the account half of the frame is machine-wide and identical on every
+   * floor, but the room half belongs to one factory (see `FactoryMetrics`), so a factory switch clears
+   * it and waits for the new floor's own answer. Null rather than an empty shape: "nothing has been
+   * measured yet" and "you have spent nothing" are different facts, and the second is the dangerous one
+   * to draw.
+   */
+  metrics: FactoryMetrics | null;
   /**
    * The role library, in the server's order (by id).
    *
@@ -484,6 +499,9 @@ const EMPTY_PROJECT_STATE = {
   // Decisions belong to a project's own repository, so the hits from the factory we have just left
   // describe files that are not on this floor at all.
   chronicle: { asked: "", answered: null, hits: [] } as ChronicleState,
+  // The room half of a metrics frame is this floor's spend; carrying it across would attribute one
+  // factory's cost to another's departments.
+  metrics: null as FactoryMetrics | null,
   waiting: [] as WaitingMessage[],
   animatedMessages: {} as Record<string, true>,
   // The next project's first `messages` snapshot is history, not news — the same reason a reconnect
@@ -508,6 +526,7 @@ export const initialFabricState = {
   projects: [] as ProjectInfo[],
   accounts: [] as AccountInfo[],
   usage: [] as AccountUsage[],
+  metrics: null as FactoryMetrics | null,
   roles: [] as RoleSpec[],
   roleProblems: [] as RoleProblem[],
   activeProjectId: null as string | null,
@@ -959,6 +978,46 @@ function applyUsage(s: FabricState, incoming: AccountUsage[]): Partial<FabricSta
   return { usage };
 }
 
+/** Every field a cost figure or a projection is drawn from. */
+function sameBurn(a: AccountBurn, b: AccountBurn): boolean {
+  return a.windowKey === b.windowKey && a.windowLabel === b.windowLabel
+    && a.percentPerHour === b.percentPerHour && a.secondsToLimit === b.secondsToLimit
+    && a.resetsFirst === b.resetsFirst && a.approximate === b.approximate
+    && a.samples === b.samples && a.unknown === b.unknown;
+}
+
+function sameRollups(a: CostRollups, b: CostRollups): boolean {
+  return a.day.usd === b.day.usd && a.day.turns === b.day.turns
+    && a.week.usd === b.week.usd && a.week.turns === b.week.turns;
+}
+
+/**
+ * Same identity-preserving trick as `applyUsage`: the frame arrives on every poll *and* on every turn
+ * boundary, and most of it is unchanged each time. An account whose numbers did not move keeps its
+ * object, so the popover repaints the row that changed rather than all of them.
+ */
+function applyMetrics(s: FabricState, incoming: FactoryMetrics): Partial<FabricState> | FabricState {
+  const previous = s.metrics;
+  if (previous === null) return { metrics: incoming };
+  const byId = new Map(previous.accounts.map((a) => [a.accountId, a]));
+  const accounts = incoming.accounts.map((a) => {
+    const prev = byId.get(a.accountId);
+    return prev !== undefined && sameBurn(prev.burn, a.burn) && sameRollups(prev.cost, a.cost) ? prev : a;
+  });
+  const byRoom = new Map(previous.rooms.map((r) => [r.roomId, r]));
+  const rooms = incoming.rooms.map((r) => {
+    const prev = byRoom.get(r.roomId);
+    return prev !== undefined && sameRollups(prev.cost, r.cost) ? prev : r;
+  });
+  const unchanged = accounts.length === previous.accounts.length
+    && accounts.every((a, i) => a === previous.accounts[i])
+    && rooms.length === previous.rooms.length
+    && rooms.every((r, i) => r === previous.rooms[i])
+    && sameRollups(previous.ambient, incoming.ambient);
+  if (unchanged) return s;
+  return { metrics: { accounts, ambient: incoming.ambient, rooms } };
+}
+
 export const useFabric = create<FabricState>((set, get) => ({
   ...initialFabricState,
 
@@ -983,6 +1042,10 @@ export const useFabric = create<FabricState>((set, get) => ({
       if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
       if (msg.kind === "accounts") return applyAccounts(s, msg.accounts);
       if (msg.kind === "usage") return applyUsage(s, msg.usage);
+      // The whole frame every time, like the room list: one message rebuilds the surface and there is
+      // nothing to merge. It arrives on a poll and on every turn boundary, so identity is preserved
+      // where nothing moved — otherwise a popover repaints three accounts because a fourth spent a cent.
+      if (msg.kind === "metrics") return applyMetrics(s, msg.metrics);
       // Answered once per connect and only changed by the operator editing a file, so there is
       // nothing here to coalesce or to preserve identity through — the whole list is the answer.
       if (msg.kind === "roles") return { roles: msg.roles, roleProblems: msg.problems };
@@ -1364,6 +1427,20 @@ export const useAccountUsage = (accountId: string): AccountUsage | undefined =>
 
 /** What "no account" is called wherever it is offered or shown. One string, not four. */
 export const ACCOUNT_NONE_LABEL = "default";
+
+/** One account's projection and spend, or `undefined` before the server has measured anything. */
+export const useAccountMetrics = (accountId: string): AccountMetrics | undefined =>
+  useFabric((s) => s.metrics?.accounts.find((a) => a.accountId === accountId));
+
+/** Spend by agents on the operator's own `~/.claude`, or null before the server has said. */
+export const useAmbientCost = (): CostRollups | null => useFabric((s) => s.metrics?.ambient ?? null);
+
+/** This floor's rooms that have cost anything, most expensive week first. Empty before the first frame. */
+export const useRoomCosts = (): RoomCost[] =>
+  useFabric(useShallow((s) => s.metrics?.rooms ?? EMPTY_ROOM_COSTS));
+
+/** A stable empty array, so a selector returning "nothing yet" is not a new object every render. */
+const EMPTY_ROOM_COSTS: RoomCost[] = [];
 
 // ---- roles ----
 //
