@@ -164,6 +164,76 @@ plain non-empty string, so an id we have never heard of still works. `Query.supp
 `server/notes/agent-sdk-api.md`) is the authoritative list for the installed CLI and could populate
 this dynamically later.
 
+## Roles (per agent)
+
+A **role** is what an agent arrives as, and it is a **file** rather than a row: `roles/*.yaml` at the
+repo root are the shipped presets (ten job roles plus `onboarding`, the one the factory puts on an
+agent itself), `<data dir>/roles/*.yaml` override them by `id`, and an edited
+file is picked up without a restart. `roles/README.md` is the format; `RoleSpec` in
+`packages/shared/src/protocol.ts` is the schema and it is **`.strict()`** — an unknown field is an
+error naming the file, because `skill:` for `skills:` would otherwise ship a preset whose whole point
+silently never arrives. A malformed file is reported next to the list (`{kind:"roles", roles,
+problems}`), never dropped from it.
+
+`sessions.role_id` is the fourth member of the `autonomy`/`model`/`account_id` family — persisted,
+re-applied on resume, changed by restarting the executor (`set_role`), and holding the *id* rather
+than the charter so an edited preset is not frozen onto every agent created before it. Applying one
+composes, in `SessionManager.startExecutor`:
+
+- **prompt** — the role's `promptAppend`; an orchestrator keeps its own charter too, joined seat-first.
+  (The room's own charter is its folder's `CLAUDE.md` and reaches the agent through
+  `settingSources: ["project","local"]`, so nothing composes it here.)
+- **model** — the role's, *only* when `sessions.model` is NULL. **An explicit operator choice always
+  beats a preset**, and the role's model is never written onto the row: it is a suggestion, and
+  freezing it would turn it into a choice nobody made. Same for `autonomy`, except that it is applied
+  **only at creation** — raising what a running agent may do because someone picked a job title from a
+  dropdown is not a decision the operator made.
+- **tools** — the role's `mcpServers` merged with the factory's in-process bus, which is spread last
+  and therefore **can never be removed or shadowed by a role**; an agent deaf to its own factory would
+  look like an agent that simply never replies. `allowedTools` is the SDK's *auto-allow* list, i.e. a
+  privilege grant, and none of the shipped presets uses it.
+- **skills** — copied into `<room>/.claude/skills/<name>/` so the repository stays self-contained and a
+  plain `claude` session in that folder gets them too. **A directory already there is never touched**
+  (the charter's never-overwrite rule, applied to a folder), and a name that resolves to nothing on
+  this machine is said out loud in the agent's own log rather than being a silent no-op.
+
+## Onboarding (first contact)
+
+Point the factory at a folder nobody has written down and an agent interviews you about it, writes its
+`CLAUDE.md` and `README.md`, and proposes the first rooms. Four things decide the whole shape:
+
+- **Un-onboarded means no `CLAUDE.md` at the project root.** That is the only test (`PROJECT_CHARTER_FILE`
+  in the protocol; `OnboardingManager.isOnboarded` re-stats it on every ask, because the thing that
+  changes it is an agent writing a file). No folder-contents heuristic, no file count — a guess would
+  offer to interview someone about a repository they documented last year, and they could not correct
+  it. Deleting the file is how you ask for the offer back.
+- **The onboarder is an ordinary session with a role and a one-shot job**, exactly as the orchestrator
+  is: `roles/onboarding.yaml` carries the charter, `start_onboarding` creates a session with that role
+  in the project room and sends it one turn. No parallel runtime, same event log, same console. The
+  charter says **one question per turn** in as many words — an agent that dumps twelve questions into
+  one turn has failed the job the role exists for.
+- **The rooms are a proposal.** `factory_suggest_rooms` — offered only to a session whose row carries
+  the onboarding role — records a list and creates nothing: no folder, no row, no charter. The UI shows
+  an accept/edit list; approving calls the ordinary `RoomManager.createRoom`, so name safety, root
+  containment and never-overwriting-a-charter still hold *because it is the same code path*. A factory
+  that reorganised itself on an interview's say-so is not what an operator wants on first contact. One
+  refused name does not sink the rest: that suggestion stays `proposed` with the reason on it.
+- **The docs are the agent's own work**, written with its own file tools into its own cwd (the project
+  room's folder is the project root). There is no special write path, and there should not be one.
+
+The UI surfaces it prominently **only** while the project is un-onboarded — plus an outstanding
+proposal, which outranks everything because the interview writes the docs *before* it proposes rooms.
+Once `CLAUDE.md` exists and nothing is waiting on a decision, the surface is gone.
+
+**Do not invent skill names.** `SkillLibrary` resolves a name against the machine's own skill
+directories (`~/.claude/skills`, the plugin caches; `SUPERFABRIC_SKILL_PATH` replaces the search path)
+and a role referencing something that does not exist is worse than one referencing nothing.
+`test/shippedRoles.test.ts` holds a verified list; adding a reference means adding an entry to it.
+
+**The role files are YAML and cost no dependency**: Bun 1.3+ ships `Bun.YAML.parse`, typed by
+`bun-types`, and the loader is server-side only. YAML rather than JSON because a charter written as a
+JSON string literal with `\n` for every line break is a file nobody edits twice.
+
 ## Accounts and logging one in
 
 An account is a `CLAUDE_CONFIG_DIR` on disk plus a row. Adding one creates the folder; logging in
@@ -222,9 +292,10 @@ Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folder
 floor)**, **M1b (several projects in one server, settable room folders, attachments, and the HUD
 rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M2 (multi-account, the
 in-app login, the limit monitor and the pause/resume scheduler)**, **M3a (the factory bus, tasks, and
-packages that ride real messages)** and **M3b (the orchestrator, task auto-routing and the
-Chronicle)** are complete — see `docs/ROADMAP.md` for the acceptance evidence of each. Next: the rest
-of M1 (roles library, onboarding agent), then M4 (a container per session).
+packages that ride real messages)**, **M3b (the orchestrator, task auto-routing and the
+Chronicle)** and **M1c (the roles library and the onboarding agent)** are complete — see
+`docs/ROADMAP.md` for the acceptance evidence of each, including the live onboarding transcript.
+Next: M4 (a container per session).
 
 ## Running it
 
@@ -260,6 +331,9 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
 
 ## Layout
 
+- `roles/` — the shipped role presets, one YAML file each (ten job roles plus `onboarding`), plus
+  `roles/README.md` (the format, and how to write your own). Content, not code: an operator is meant
+  to read and fork these.
 - `packages/shared` — zod protocol shared by server and web (`SessionEvent`,
   `ClientMessage`, `ServerMessage`).
 - `packages/server` — `db.ts` (schema + `PRAGMA user_version` migrations; **the only file that
@@ -276,11 +350,18 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   honestly-approximate JSONL estimate behind it) · `limitMonitor.ts` (per-account polling at the
   180 s floor, persisted snapshots, and the immediate mark from a 429) · `scheduler.ts` (80 % warn,
   95 % pause at a turn boundary, resume at `resets_at` — and no rotation, ever)
+  · `roleLibrary.ts` (roles as files: the shipped `roles/*.yaml`, the operator's overrides, and a
+  signature-based reload so an edited preset needs no restart) · `skills.ts` (resolving a skill name
+  against the machine's own skill directories, and copying one into a room's `.claude/skills/`
+  without ever overwriting what is there)
   · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
   each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
   `busTools.ts` (the bus as an in-process MCP server, one per session's room — seven tools for a
   room, nine for the orchestrator) · `orchestrator.ts` (the role prompt, and `ensureOrchestrator`:
-  the only supported way to make one) · `router.ts` (routing as a bus round trip — ask, and move
+  the only supported way to make one) · `onboarding.ts` (first contact: whether a project has been
+  written down, the interview as an ordinary roled session in the project room, and the room
+  *proposals* — recorded by a tool, turned into folders only by the operator, through `createRoom`)
+  · `router.ts` (routing as a bus round trip — ask, and move
   the card only when it answers) · `chronicle.ts` (ADR files in the project's own
   `docs/decisions/`, plus one FTS5 query spanning decisions **and** the event log; the triggers in
   `db.ts` keep the index in step, not this class) ·
@@ -304,6 +385,11 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   popover (`UsageMeters.tsx` — hatched bars and a `≈` wherever a figure is a guess),
   window-wide paste/drop target, the one `NoticeBar`, and `Panel.tsx`
   — the shared collapsible edge-panel chrome all three edges are built from) ·
+  the role picker (`RoleSelect.tsx` — name plus its one-line summary, on the room panel's
+  "New agents arrive as" line and on every agent row),
+  `Onboarding.tsx` (first contact, over the floor: the offer on an un-onboarded project, the
+  "under way" strip, and the accept/edit room list — `onboardingSurface` is the one pure function
+  that decides which of the four, so "prominent only when un-onboarded" is testable),
   `ui/*` (shadcn components vendored as our own source: button, input, select, popover, badge).
   **Styling is Tailwind v4** (`src/index.css`, `@theme`, no config file). Chrome colours are
   declared there and are deliberately neutral; every colour that *means* something —

@@ -728,6 +728,7 @@ describe("db", () => {
       v8.exec("DROP TABLE usage_snapshots");
       v8.exec("ALTER TABLE sessions DROP COLUMN paused_at");
       v8.exec("ALTER TABLE sessions DROP COLUMN paused_until");
+      v8.exec("ALTER TABLE sessions DROP COLUMN role_id");
       v8.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
       v8.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
         .run("r1", "p1", "payments", "/code/shop/payments");
@@ -747,6 +748,9 @@ describe("db", () => {
       expect(db.prepare("SELECT state, paused_at, paused_until FROM sessions WHERE id = 's1'").get())
         .toEqual({ state: "active", paused_at: null, paused_until: null });
       expect((db.prepare("SELECT COUNT(*) c FROM usage_snapshots").get() as { c: number }).c).toBe(0);
+      // And it is a plain agent, not a role: NULL is what every session written before roles existed
+      // meant, and an upgrade must not invent one.
+      expect(db.prepare("SELECT role_id FROM sessions WHERE id = 's1'").get()).toEqual({ role_id: null });
       db.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

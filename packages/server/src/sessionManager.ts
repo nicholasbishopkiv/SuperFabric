@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
+import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { AccountManager } from "./accountManager.js";
 import { FACTORY_MCP_SERVER_NAME, busTools } from "./busTools.js";
 import type { Chronicle } from "./chronicle.js";
@@ -8,12 +9,17 @@ import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
 import { classifyExecutorError } from "./executors/claudeCode.js";
 import type { FactoryBus, RoomAgent } from "./factoryBus.js";
+import { ONBOARDING_ROLE_ID, type OnboardingManager } from "./onboarding.js";
 import { ORCHESTRATOR_SYSTEM_PROMPT } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
+import type { RoleLibrary } from "./roleLibrary.js";
 import type { RoomManager } from "./roomManager.js";
 import type { TaskRouter } from "./router.js";
+import { describeInstall, type SkillLibrary } from "./skills.js";
 import type { TaskStore } from "./taskStore.js";
-import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
+import {
+  AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type RoleSpec, type SessionInfo,
+} from "@superfabric/shared";
 
 /**
  * How many prompts may pile up while one session's executor restarts before further ones are
@@ -65,6 +71,15 @@ export interface CreateSessionOptions {
    * by hand; it is the thing that also puts the session in the project room.
    */
   isOrchestrator?: boolean;
+  /**
+   * Start this agent as a role: its charter, its skills, and — only where the caller has said nothing
+   * — its model and its autonomy. Omitted => a plain agent.
+   *
+   * An id this server does not have is **refused**, for the same reason an unknown account is: an
+   * agent that quietly starts as nothing when the operator asked for an architect is an agent whose
+   * behaviour has no visible explanation.
+   */
+  roleId?: string;
 }
 
 /**
@@ -85,6 +100,25 @@ export interface SessionManagerOptions {
    * `tasks` are optional.
    */
   accounts?: AccountManager;
+  /**
+   * The role library. Absent => `roleId` is refused and every session is a plain one, which is the
+   * pre-M1c shape and a valid server rather than a broken one — the same arrangement `accounts`,
+   * `bus` and `tasks` have.
+   */
+  roles?: RoleLibrary;
+  /**
+   * Where skills come from. Absent => a role still composes its prompt, model and tool servers, but
+   * nothing is copied into the room. Separate from `roles` because they genuinely can differ: a
+   * server can have the library and no skill packs installed, and "the charter arrived, the skills did
+   * not" is a better outcome than refusing the role.
+   */
+  skills?: SkillLibrary;
+  /**
+   * Onboarding. Absent => `factory_suggest_rooms` is in nobody's tool list, which is the pre-M1c
+   * shape and a valid server rather than a broken one — the same arrangement `roles` and `chronicle`
+   * have. Only a session wearing the onboarding role is offered it (see `busToolServers`).
+   */
+  onboarding?: OnboardingManager;
   /**
    * A session was refused with a rate-limit error.
    *
@@ -117,6 +151,8 @@ interface RunSpec {
   /** The account this agent runs on; null is the ambient `~/.claude`. */
   accountId: string | null;
   isOrchestrator: boolean;
+  /** The role this agent arrived as; null is a plain agent. Resolved to a spec at start time. */
+  roleId: string | null;
 }
 
 /** The spec that brings a stored session back exactly as it was. */
@@ -129,6 +165,7 @@ function specOf(row: SessionRow): RunSpec {
     model: row.model,
     accountId: row.account_id,
     isOrchestrator: isOrchestratorRow(row),
+    roleId: row.role_id,
   };
 }
 
@@ -195,8 +232,8 @@ export class SessionManager {
   ) {
     this.stmts = {
       insertSession: db.prepare(
-        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator, account_id)"
-        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator, account_id, role_id)"
+        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
       activeSessions: db.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE state = 'active'`),
@@ -207,9 +244,16 @@ export class SessionManager {
       orchestratorOf: db.prepare(
         "SELECT id FROM sessions WHERE project_id = ? AND is_orchestrator = 1 ORDER BY created_at, rowid LIMIT 1",
       ),
+      // "Is an interview running on this factory?" — the newest *live* one, because onboarding is a
+      // one-shot job and a finished one is history rather than an agent to hand a second click to.
+      onboarderOf: db.prepare(
+        "SELECT id FROM sessions WHERE project_id = ? AND role_id = ? AND state = 'active'"
+        + " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      ),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       setModel: db.prepare("UPDATE sessions SET model = ? WHERE id = ?"),
       setAccount: db.prepare("UPDATE sessions SET account_id = ? WHERE id = ?"),
+      setRole: db.prepare("UPDATE sessions SET role_id = ? WHERE id = ?"),
       // Pausing and coming back. `state` alone would be enough to stop `resumeAll` re-spawning a
       // paused agent; the two timestamps are what an unattended resume and a countdown are made of.
       markPaused: db.prepare(
@@ -244,7 +288,14 @@ export class SessionManager {
    * some other directory.
    */
   createSession(opts: CreateSessionOptions = {}): string {
-    const autonomy = opts.autonomy ?? DEFAULT_AUTONOMY;
+    // The role is resolved before anything is written, so an unknown id fails the call rather than
+    // leaving a session row behind that nobody asked for.
+    const role = opts.roleId === undefined ? undefined : this.requireRole(opts.roleId);
+    // An explicit choice always beats a preset — and here the operator's silence is what lets the
+    // role speak. The result is written to the row, so from now on it *is* the agent's autonomy and a
+    // later change of role never moves it again: a privilege level that shifted as a side effect of
+    // picking a job title would not be a level the operator chose.
+    const autonomy = opts.autonomy ?? role?.autonomy ?? DEFAULT_AUTONOMY;
     let roomId: string | null = null;
     let cwd = opts.cwd ?? process.cwd();
     let projectId = opts.projectId ?? this.projects.defaultProject().id;
@@ -289,15 +340,92 @@ export class SessionManager {
     if (accountId !== null && accountId !== undefined) this.requireAccount(accountId);
 
     const id = randomUUID();
+    // Deliberately *not* `?? role.model`: NULL on the row means "the operator pinned nothing", and
+    // the role's suggestion is applied at start time from the role itself (see `startExecutor`).
+    // Baking it into the column would turn a suggestion into a choice, and clearing the role would
+    // then leave the agent silently pinned to a model nobody picked.
     const model = opts.model ?? null;
     const spec: RunSpec = {
       cwd, resume: null, autonomy, roomId, model, accountId: accountId ?? null, isOrchestrator,
+      roleId: role?.id ?? null,
     };
     this.stmts.insertSession.run(
-      id, projectId, cwd, autonomy, roomId, model, isOrchestrator ? 1 : 0, spec.accountId,
+      id, projectId, cwd, autonomy, roomId, model, isOrchestrator ? 1 : 0, spec.accountId, spec.roleId,
     );
+    // Before the executor starts, so a skill this agent is meant to have is on disk by the time the
+    // CLI reads the folder rather than one turn later.
+    this.installRoleSkills(id, cwd, role);
     this.startExecutor(id, spec);
     return id;
+  }
+
+  /**
+   * Refuse a role this server does not have.
+   *
+   * Only for ids arriving from *outside*. A stored `role_id` is never re-validated for the same
+   * reason a stored `account_id` is not: the session row outlives the file it names, and an agent
+   * must still come back after the operator deleted or renamed a preset — as a plain agent, and
+   * saying so (see `roleOf`).
+   */
+  private requireRole(roleId: string): RoleSpec {
+    const roles = this.opts.roles;
+    if (roles === undefined) throw new Error("this server has no role library");
+    const role = roles.get(roleId);
+    if (role === undefined) throw new Error(`unknown role ${roleId}`);
+    return role;
+  }
+
+  /**
+   * The role a stored session should come back as, or `undefined`.
+   *
+   * A stored id that no longer resolves is **not** an error: the operator may have deleted the file,
+   * and refusing to boot the agent over it would be the worst available reaction. It is said out loud
+   * in the session's own log instead, once, at the moment it matters — the alternative is an agent
+   * that used to be an architect quietly behaving like a blank session with nothing to explain it.
+   */
+  private roleOf(sessionId: string, roleId: string | null): RoleSpec | undefined {
+    if (roleId === null) return undefined;
+    const role = this.opts.roles?.get(roleId);
+    if (role !== undefined) return role;
+    this.store.append(sessionId, {
+      type: "session_status",
+      status: "starting",
+      detail: `role ${roleId} is no longer in the role library — starting as a plain agent`,
+    });
+    return undefined;
+  }
+
+  /**
+   * Copy a role's skills into the folder this agent works in, and say what actually happened.
+   *
+   * Reported into the session's own log rather than returned, because the interesting cases are the
+   * partial ones: a pack this machine does not have, or a directory the operator has already edited
+   * and which is therefore left alone. "The role was applied" with three of its four skills missing is
+   * the kind of half-truth that makes an operator distrust the whole feature.
+   */
+  private installRoleSkills(sessionId: string, cwd: string, role: RoleSpec | undefined): void {
+    if (role === undefined || role.skills.length === 0) return;
+    const skills = this.opts.skills;
+    if (skills === undefined) {
+      this.store.append(sessionId, {
+        type: "session_status",
+        status: "starting",
+        detail: `role ${role.name}: this server installs no skills, so ${role.skills.join(", ")} `
+          + "did not arrive",
+      });
+      return;
+    }
+    let line: string | null;
+    try { line = describeInstall(skills.installInto(cwd, role.skills)); }
+    catch (err) {
+      // Writing into the operator's repository can fail (read-only checkout, a full disk). It must
+      // not stop the agent starting — the charter and the model are the larger half of a role.
+      line = `could not be installed: ${String(err)}`;
+    }
+    if (line === null) return;
+    this.store.append(sessionId, {
+      type: "session_status", status: "starting", detail: `role ${role.name} skills — ${line}`,
+    });
   }
 
   /**
@@ -321,6 +449,19 @@ export class SessionManager {
   orchestratorFor(projectId: string): string | undefined {
     // `== null`, not `=== undefined`: "no such row" is `null` for the driver db.ts uses.
     const row = this.stmts.orchestratorOf.get(projectId) as { id: string } | null;
+    return row == null ? undefined : row.id;
+  }
+
+  /**
+   * The live agent interviewing the operator about this project, or `undefined`.
+   *
+   * Read off the row's `role_id` rather than off a flag of its own: the onboarder *is* an agent
+   * wearing a role, and a second column saying the same thing could disagree with it. Only an active
+   * session counts — a finished interview is history, and `start_onboarding` on a project whose
+   * onboarder has stopped should stand up a new one rather than hand back a corpse.
+   */
+  onboarderFor(projectId: string): string | undefined {
+    const row = this.stmts.onboarderOf.get(projectId, ONBOARDING_ROLE_ID) as { id: string } | null;
     return row == null ? undefined : row.id;
   }
 
@@ -417,6 +558,42 @@ export class SessionManager {
     }
 
     await this.restartExecutor(id, handle, { ...specOf(row), accountId }, `account: ${label}`);
+  }
+
+  /**
+   * Give a live agent a role, or take it away (`null` => a plain agent again).
+   *
+   * The fourth member of the `setAutonomy`/`setModel`/`setAccount` family, with the same shape for the
+   * same mechanical reason: a role composes `systemPrompt`, `model`, `mcpServers` and `allowedTools`,
+   * every one of which is fixed for the lifetime of a `query()`. So the executor is restarted and the
+   * conversation resumed — the agent keeps what it knows and changes what it is.
+   *
+   * **Autonomy is deliberately not touched.** A role's `autonomy` applies when an agent is created and
+   * never again: raising what a running agent may do because someone picked "DevOps" from a dropdown
+   * is not a decision the operator made, and it would be invisible next to the change they did make.
+   *
+   * The new role is persisted first, so even a failed restart leaves the next boot starting the agent
+   * as what the operator asked for.
+   */
+  async setRole(id: string, roleId: string | null): Promise<void> {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    const role = roleId === null ? undefined : this.requireRole(roleId);
+    this.stmts.setRole.run(roleId, id);
+    // Before the restart, so the folder is right by the time the replacement executor reads it.
+    this.installRoleSkills(id, row.cwd, role);
+
+    const label = role === undefined ? "none" : role.name;
+    const handle = this.handles.get(id);
+    if (handle === undefined) {
+      this.store.append(id, {
+        type: "session_status", status: "idle",
+        detail: `role: ${label} (applies when the session next starts)`,
+      });
+      return;
+    }
+
+    await this.restartExecutor(id, handle, { ...specOf(row), roleId }, `role: ${label}`);
   }
 
   /** An account's label for the log, falling back to its id if the row has since gone. */
@@ -526,6 +703,7 @@ export class SessionManager {
     sessionId: string,
     roomId: string | null,
     isOrchestrator: boolean,
+    isOnboarder: boolean,
   ): Record<string, ReturnType<typeof busTools>> {
     const { bus, tasks } = this.opts;
     if (roomId === null || bus === undefined || tasks === undefined) return {};
@@ -537,9 +715,13 @@ export class SessionManager {
         // ordinary agent's tool list simply does not contain the routing tools. (Calling one anyway
         // is still refused inside the handler — see `busTools`.)
         isOrchestrator,
+        // Same mechanism, same source: the session's own row. It buys the one extra tool an
+        // interview needs — proposing rooms — and nothing else about what this agent may do.
+        isOnboarder,
         sessionId,
         ...(this.opts.router !== undefined ? { router: this.opts.router } : {}),
         ...(this.opts.chronicle !== undefined ? { chronicle: this.opts.chronicle } : {}),
+        ...(this.opts.onboarding !== undefined ? { onboarding: this.opts.onboarding } : {}),
         // factory_report_status is a line in this session's own log: the operator reads the agent's
         // own words next to everything else it did, rather than in a separate channel.
         reportStatus: (summary) => {
@@ -556,6 +738,7 @@ export class SessionManager {
 
   private startExecutor(id: string, spec: RunSpec) {
     const { cwd, resume, autonomy, roomId, model, accountId, isOrchestrator } = spec;
+    const role = this.roleOf(id, spec.roleId);
     const generation = (this.generation.get(id) ?? 0) + 1;
     this.generation.set(id, generation);
     // The account, as the one thing the provider seam understands: a directory. `undefined` (no
@@ -566,15 +749,34 @@ export class SessionManager {
     // limit monitor will poll. Only for an account that actually resolved to a directory.
     if (accountId !== null && configDir !== undefined) this.opts.accounts?.touch(accountId);
 
+    // The charter, as a system-prompt append. This — plus the flag and the extra tools — is the
+    // entire difference between the orchestrator and any other session, and now between an architect
+    // and any other room agent: same manager, same executor, same event log.
+    const appendSystemPrompt = composeAppend(isOrchestrator, role);
+    // A role's model is a *suggestion*; `sessions.model` is a *choice*. NULL on the row means nobody
+    // chose, which is the one case where the preset gets to decide — and clearing the pin later hands
+    // the decision back to the role rather than to a value frozen at creation.
+    const effectiveModel = model ?? role?.model ?? null;
+    // The factory's own in-process server is spread **last** and therefore wins any name collision: a
+    // role must never be able to unplug an agent from the bus its whole department runs on, whether by
+    // listing a server called `factory` or by any other route. Everything else a role brings is
+    // outside-facing (stdio/http/sse), so it stays gated by `canUseTool` like every other outside tool.
+    const mcpServers: Record<string, McpServerConfig> = {
+      ...(role?.mcpServers ?? {}),
+      // The role, not the id off the wire: a stored `role_id` whose file has gone resolves to no role
+      // at all (see `roleOf`), and an agent that is no longer an onboarder must not keep the tool.
+      ...this.busToolServers(id, roomId, isOrchestrator, role?.id === ONBOARDING_ROLE_ID),
+    };
+
     const handle = this.executor.start(
       {
-        cwd, resumeSessionId: resume, autonomy, model,
+        cwd, resumeSessionId: resume, autonomy, model: effectiveModel,
         ...(configDir !== undefined ? { configDir } : {}),
-        mcpServers: this.busToolServers(id, roomId, isOrchestrator),
-        // The role, as a system-prompt append. This — plus the flag and the extra tools — is the
-        // entire difference between the orchestrator and any other session: same manager, same
-        // executor, same event log.
-        ...(isOrchestrator ? { appendSystemPrompt: ORCHESTRATOR_SYSTEM_PROMPT } : {}),
+        mcpServers,
+        ...(appendSystemPrompt !== undefined ? { appendSystemPrompt } : {}),
+        ...(role !== undefined && role.allowedTools.length > 0
+          ? { allowedTools: role.allowedTools }
+          : {}),
       },
       {
         onEvent: (event) => {
@@ -867,7 +1069,7 @@ export class SessionManager {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
       autonomy: string; model: string | null; room_id: string | null; last_seq: number;
       status: string | null; blocked: number; is_orchestrator: number; account_id: string | null;
-      paused_until: number | null;
+      role_id: string | null; paused_until: number | null;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
@@ -877,6 +1079,7 @@ export class SessionManager {
       model: r.model,
       roomId: r.room_id,
       accountId: r.account_id,
+      roleId: r.role_id,
       pausedUntil: r.paused_until,
       status: asStatus(r.status),
       blocked: r.blocked === 1,
@@ -891,7 +1094,27 @@ export class SessionManager {
  * per-session property cannot be remembered in `resumeAll` and forgotten in `setModel`.
  */
 const SESSION_COLUMNS =
-  "id, state, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator, account_id";
+  "id, state, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator, account_id, role_id";
+
+/**
+ * What an agent's system prompt is appended with: the orchestrator's charter, the role's, or both.
+ *
+ * **Both, when both apply, and in that order.** They answer different questions — "you are this
+ * factory's orchestrator, here is how routing works" and "you are an architect, here is what you own"
+ * — and dropping either would leave an agent missing something true about itself. The orchestrator's
+ * comes first because it is the stronger claim: it says which *seat* the agent is in, and the role
+ * only says how it works.
+ *
+ * (This is a different case from the executor's `appendSystemPrompt ?? defaults.appendSystemPrompt`,
+ * which picks rather than joins. Two answers to "what is this session for", one per-session and one
+ * process-wide, genuinely are rival claims; these two are not.)
+ */
+function composeAppend(isOrchestrator: boolean, role: RoleSpec | undefined): string | undefined {
+  const parts: string[] = [];
+  if (isOrchestrator) parts.push(ORCHESTRATOR_SYSTEM_PROMPT);
+  if (role !== undefined) parts.push(role.promptAppend);
+  return parts.length === 0 ? undefined : parts.join("\n\n---\n\n");
+}
 
 /**
  * The session listing, with a caller-chosen `WHERE`. The clause is a literal from the two call sites
@@ -902,6 +1125,7 @@ function sessionListSql(where: string): string {
     SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
            s.autonomy AS autonomy, s.model AS model, s.room_id AS room_id,
            s.is_orchestrator AS is_orchestrator, s.account_id AS account_id,
+           s.role_id AS role_id,
            s.paused_until AS paused_until,
            COALESCE(MAX(e.seq), 0) AS last_seq,
            -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
@@ -939,6 +1163,8 @@ interface SessionRow {
   is_orchestrator: number;
   /** NULL is "the ambient `~/.claude`", not a missing value. */
   account_id: string | null;
+  /** NULL is "a plain agent", not a missing value. An id whose file has gone resolves to the same. */
+  role_id: string | null;
 }
 
 /**

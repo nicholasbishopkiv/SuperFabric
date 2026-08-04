@@ -4,6 +4,7 @@ import { ChroniclePanel } from "./hud/ChroniclePanel";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
 import { FitButton } from "./hud/FitButton";
 import { NoticeBar } from "./hud/NoticeBar";
+import { Onboarding } from "./hud/Onboarding";
 import { RoomPanel } from "./hud/RoomPanel";
 import { TaskPanel } from "./hud/TaskPanel";
 import { TopLeftBar } from "./hud/TopLeftBar";
@@ -38,6 +39,10 @@ export default function App() {
       {/* The one place the server speaks: `error` and `notice`, centred in the strip the panels
           leave free. No panel renders either any more — see `NoticeBar`. */}
       <NoticeBar />
+      {/* First contact, and only then: a project with a CLAUDE.md never sees this at all. It is over
+          the floor rather than in a panel because on an un-onboarded factory the floor is empty and
+          the interview is the only thing there is to do. */}
+      <Onboarding />
       {/* Last, so it paints over the panel's own corner. */}
       <FitButton />
       {/* Not a panel: a window-wide paste/drop surface that only draws anything while a file is

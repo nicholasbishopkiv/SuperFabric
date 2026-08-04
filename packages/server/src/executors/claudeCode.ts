@@ -218,6 +218,11 @@ export class ClaudeCodeExecutor implements Executor {
     // `{ type: "sdk", instance }` entry is one variant of its config union — the tools run in this
     // process, with no transport and no subprocess.
     if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0) options.mcpServers = opts.mcpServers;
+    // A role's pre-approved tools. Set only when there are some, so a session with no role tells the
+    // CLI nothing about allow-lists and every gated call still reaches `canUseTool` exactly as before.
+    if (opts.allowedTools !== undefined && opts.allowedTools.length > 0) {
+      options.allowedTools = [...opts.allowedTools];
+    }
     // Per-session model wins; then the process-wide default; then the CLI's own. Left unset rather
     // than guessed at, because an id the CLI does not know is a 404 mid-turn.
     const model = opts.model ?? this.defaults.model;

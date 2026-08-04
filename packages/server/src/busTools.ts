@@ -1,9 +1,12 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { McpSdkServerConfigWithInstance, SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
-import { MessageKind, TaskStatus, type MessageInfo } from "@superfabric/shared";
+import {
+  MAX_ROOM_SUGGESTIONS, MessageKind, RoomName, TaskStatus, type MessageInfo,
+} from "@superfabric/shared";
 import { z } from "zod";
 import type { Chronicle } from "./chronicle.js";
 import type { FactoryBus } from "./factoryBus.js";
+import type { OnboardingManager } from "./onboarding.js";
 import type { RoomManager } from "./roomManager.js";
 import type { TaskRouter } from "./router.js";
 import type { TaskStore } from "./taskStore.js";
@@ -47,6 +50,22 @@ export interface BusToolsDeps {
    * session that owns this tool set and never from tool input.
    */
   sessionId?: string;
+  /**
+   * Onboarding. Present **and** `isOnboarder` => this session gets `factory_suggest_rooms`. Absent =>
+   * the tool is not in anybody's list, for the same reason an absent chronicle removes the decision
+   * tools: a tool that cannot record what it promises is worse than no tool.
+   */
+  onboarding?: OnboardingManager;
+  /**
+   * This session is the project's onboarding agent — read from its own row's `role_id`, like `roomId`
+   * and `isOrchestrator`, and never from tool input.
+   *
+   * Unlike the orchestrator's tools this is a question of *relevance*, not of privilege, and the
+   * handler therefore does not refuse other callers: `factory_suggest_rooms` creates nothing, changes
+   * nothing on the floor and grants nobody anything — it writes down a proposal the operator has to
+   * approve. There is no authority here to gate.
+   */
+  isOnboarder?: boolean;
 }
 
 /** How many delivered messages `factory_inbox` shows alongside the queue. */
@@ -254,6 +273,9 @@ export function busToolDefinitions(deps: BusToolsDeps): SdkMcpToolDefinition<any
   const roomTools = [
     send, inbox, taskUpdate, reportStatusTool, askOrchestrator,
     ...(deps.chronicle !== undefined ? chronicleToolDefinitions(deps, deps.chronicle) : []),
+    ...(deps.isOnboarder === true && deps.onboarding !== undefined
+      ? [suggestRoomsToolDefinition(deps, deps.onboarding)]
+      : []),
   ];
   // The tool surface is per session: an ordinary agent's list simply does not contain these. The
   // handlers refuse anyway (see `orchestratorToolDefinitions`) — a tool that is only kept out of
@@ -377,6 +399,51 @@ export function chronicleToolDefinitions(
   );
 
   return [recordDecision, searchHistory];
+}
+
+/**
+ * The onboarding agent's one extra tool: **propose** the factory's first rooms.
+ *
+ * It creates nothing. No folder, no row in `rooms`, no charter written anywhere — it records a list
+ * the operator then reads, edits and approves, and approving is what runs the ordinary `createRoom`.
+ * The description says so in as many words, because an agent that believes it has just reorganised
+ * the repository will go on to act as though those folders exist.
+ *
+ * Exported separately so the "records without creating" property can be tested for what it is, rather
+ * than inferred from a tool list.
+ */
+export function suggestRoomsToolDefinition(
+  deps: BusToolsDeps,
+  onboarding: OnboardingManager,
+): SdkMcpToolDefinition<any> {
+  const { rooms, roomId } = deps;
+  return factoryTool(
+    "factory_suggest_rooms",
+    "Propose the departments this project should be split into. This does NOT create anything: the "
+      + "operator sees your list, edits it and approves the rooms they want, and only then are the "
+      + "folders made. Suggest a handful, not an org chart; name each after the work it owns rather "
+      + "than after a technology, and give each one line saying what it is responsible for. Call it "
+      + "once, when the interview has told you enough to be specific.",
+    {
+      rooms: z.array(z.object({
+        name: RoomName.describe(
+          "The folder this room would be: lowercase letters, digits, dot, dash and underscore.",
+        ),
+        charter: z.string().min(1).max(300).describe(
+          "One line: what this department owns. It becomes the first line of the room's CLAUDE.md.",
+        ),
+      })).min(1).max(MAX_ROOM_SUGGESTIONS).describe("The rooms you are proposing, in reading order."),
+    },
+    (args) => {
+      const projectId = rooms.projectOf(roomId);
+      if (projectId === undefined) throw new Error(`unknown room ${roomId}`);
+      const recorded = onboarding.suggest(projectId, deps.sessionId ?? null, args.rooms);
+      return `Proposed ${recorded.length} room(s) to the operator: `
+        + `${recorded.map((r) => r.name).join(", ")}. Nothing has been created — they are waiting for `
+        + "approval, and the operator may rename or drop any of them. Do not act as though these "
+        + "folders exist.";
+    },
+  );
 }
 
 /**

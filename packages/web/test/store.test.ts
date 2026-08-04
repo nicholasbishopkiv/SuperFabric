@@ -1,5 +1,6 @@
 import type {
-  AccountInfo, AccountUsage, ChronicleHit, MessageInfo, ProjectInfo, RoomInfo, SessionInfo, TaskInfo,
+  AccountInfo, AccountUsage, ChronicleHit, MessageInfo, ProjectInfo, RoleSpec, RoomInfo, SessionInfo,
+  TaskInfo,
 } from "@superfabric/shared";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
@@ -16,6 +17,8 @@ import {
   orchestratorSession,
   roomAgents,
   roomlessSessions,
+  roleLabel,
+  ROLE_NONE_LABEL,
   roomPosition,
   roomStatusMap,
   TASK_STATUS_ORDER,
@@ -32,7 +35,7 @@ beforeEach(() => {
     ...initialFabricState,
     events: {}, lastSeq: {}, contiguousSeq: {}, needsResync: {}, sessions: [], rooms: [], roomIds: [],
     selectedRoomId: null, drag: null, roomStatus: {}, conveyors: [], packages: [], packagedPairs: {},
-    projects: [], activeProjectId: null, accounts: [], usage: [],
+    projects: [], activeProjectId: null, accounts: [], usage: [], roles: [], roleProblems: [],
     chronicle: { asked: "", answered: null, hits: [] },
   });
 });
@@ -40,7 +43,7 @@ beforeEach(() => {
 /** A `SessionInfo` with every field the protocol requires; cases override just what they are about. */
 const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
-  autonomy: "auto", model: null, roomId: null, accountId: null, pausedUntil: null,
+  autonomy: "auto", model: null, roomId: null, accountId: null, roleId: null, pausedUntil: null,
   status: "idle", blocked: false, isOrchestrator: false, ...over,
 });
 
@@ -1408,6 +1411,63 @@ describe("accounts", () => {
       // claim about whose quota is being spent.
       expect(accountLabel([account()], "a-gone")).toBe("a-gone");
       expect(accountLabel([], "a1")).toBe("a1");
+    });
+  });
+});
+
+describe("roles", () => {
+  const role = (over: Partial<RoleSpec> = {}): RoleSpec => ({
+    id: "architect", name: "Architect", summary: "Shape, not code.",
+    promptAppend: "You are the architect.", skills: [], mcpServers: {}, allowedTools: [], ...over,
+  });
+
+  it("stores the library and the files that did not load", () => {
+    apply({
+      kind: "roles",
+      roles: [role(), role({ id: "qa", name: "QA", summary: "Evidence." })],
+      problems: [{ file: "/p/roles/broken.yaml", message: "is not valid YAML" }],
+    });
+    expect(useFabric.getState().roles.map((r) => r.id)).toEqual(["architect", "qa"]);
+    // The problems ride with the list: a picker one entry shorter than the folder tells the operator
+    // nothing they can act on.
+    expect(useFabric.getState().roleProblems).toHaveLength(1);
+  });
+
+  it("survives a project switch, because a role is a file on the machine", () => {
+    const projects = [
+      { id: "p1", name: "shop", root: "/code/shop", lastOpenedAt: null },
+      { id: "p2", name: "vendor", root: "/code/vendor", lastOpenedAt: null },
+    ];
+    apply({ kind: "projects", projects, activeProjectId: "p1" });
+    apply({ kind: "roles", roles: [role()], problems: [] });
+    apply({ kind: "rooms", rooms: [room({ id: "r1" })] });
+    apply({ kind: "projects", projects, activeProjectId: "p2" });
+    expect(useFabric.getState().rooms).toEqual([]);
+    expect(useFabric.getState().roles.map((r) => r.id)).toEqual(["architect"]);
+  });
+
+  it("an agent's role repaints the agent, so a change of role is not invisible", () => {
+    apply({ kind: "sessions", sessions: [session({ id: "s1" })] });
+    const before = useFabric.getState().sessions[0];
+    apply({ kind: "sessions", sessions: [session({ id: "s1", roleId: "architect" })] });
+    expect(useFabric.getState().sessions[0]).not.toBe(before);
+    expect(useFabric.getState().sessions[0]!.roleId).toBe("architect");
+  });
+
+  describe("roleLabel", () => {
+    it("names the role", () => {
+      expect(roleLabel([role()], "architect")).toBe("Architect");
+    });
+
+    it("null is a plain agent, and it is called something", () => {
+      expect(roleLabel([role()], null)).toBe(ROLE_NONE_LABEL);
+      expect(ROLE_NONE_LABEL).not.toBe("");
+    });
+
+    it("an id with no spec shows the id, never 'no role'", () => {
+      // A preset the operator deleted out from under a running agent must not read as "plain".
+      expect(roleLabel([role()], "gone")).toBe("gone");
+      expect(roleLabel([], "architect")).toBe("architect");
     });
   });
 });
