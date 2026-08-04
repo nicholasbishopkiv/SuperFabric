@@ -1,7 +1,15 @@
 import type { TaskInfo, TaskStatus } from "@superfabric/shared";
-import { FlagIcon, ListChecksIcon, PlusIcon } from "lucide-react";
+import { FlagIcon, ListChecksIcon, PlusIcon, SignpostIcon } from "lucide-react";
 import { memo, useState } from "react";
-import { TASK_STATUS_ORDER, tasksByStatus, useFabric, useHudInsets, useTasks } from "../store";
+import {
+  TASK_STATUS_ORDER,
+  tasksByStatus,
+  unassignedTasks,
+  useFabric,
+  useHasOrchestrator,
+  useHudInsets,
+  useTasks,
+} from "../store";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
@@ -54,6 +62,48 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
  */
 const STATUS_TINT: Partial<Record<TaskStatus, string>> = { blocked: "text-status-blocked" };
 
+/**
+ * The unassigned card's affordance: ask the orchestrator where this belongs.
+ *
+ * **It asks; it never assigns.** `route_task` sends the orchestrator a message describing the task
+ * and the floor, and the card stays visibly unassigned until it actually answers — routing is a
+ * model decision, so it is allowed to be slow, and a board that moved the card optimistically would
+ * be claiming a decision nobody has made. With no orchestrator there is nothing to ask, so the note
+ * that has always explained an unassigned card stays exactly where it was, now saying what to do
+ * about it.
+ */
+function RouteIt({ taskId }: { taskId: string }) {
+  const hasOrchestrator = useHasOrchestrator();
+  const connected = useFabric((s) => s.connected);
+
+  if (!hasOrchestrator) {
+    return (
+      <span
+        className="italic text-fg-faint"
+        title="Unassigned. Routing needs an orchestrator — create one in the project room's panel."
+      >
+        unassigned — no orchestrator
+      </span>
+    );
+  }
+
+  return (
+    <button
+      onClick={() => send({ kind: "route_task", taskId })}
+      disabled={!connected}
+      title="Ask the orchestrator which room this belongs to. It stays unassigned until it answers."
+      className={cn(
+        "inline-flex items-center gap-0.5 rounded-[2px] text-accent underline underline-offset-2",
+        "outline-none hover:text-accent/80 focus-visible:ring-1 focus-visible:ring-accent",
+        "disabled:pointer-events-none disabled:opacity-40",
+      )}
+    >
+      <SignpostIcon className="size-2.5" />
+      route it
+    </button>
+  );
+}
+
 /** One card. Subscribes to nothing: the board hands it the task, and identity is preserved upstream. */
 const TaskCard = memo(function TaskCard({ task }: { task: TaskInfo }) {
   const room = useFabric((s) => s.rooms.find((r) => r.id === task.roomId));
@@ -73,8 +123,9 @@ const TaskCard = memo(function TaskCard({ task }: { task: TaskInfo }) {
       <div className="mt-0.5 flex flex-wrap items-center gap-1 text-2xs">
         {room === undefined ? (
           // Not a failure and not a placeholder: an unrouted task is the intended state of a task
-          // nobody has assigned yet. See the note in the new-task popover.
-          <span className="italic text-fg-faint">unassigned</span>
+          // nobody has assigned yet — and with an orchestrator on the floor it is one click from
+          // being decided. See `RouteIt`.
+          <RouteIt taskId={task.id} />
         ) : (
           <button
             onClick={() => selectRoom(room.id)}
@@ -144,6 +195,7 @@ const NO_ROOM = "__none__";
 
 function NewTask({ connected }: { connected: boolean }) {
   const rooms = useFabric((s) => s.rooms);
+  const hasOrchestrator = useHasOrchestrator();
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [detail, setDetail] = useState("");
@@ -208,7 +260,11 @@ function NewTask({ connected }: { connected: boolean }) {
             </Button>
           </div>
           <FieldNote>
-            A task with no room stays unassigned — routing arrives with the orchestrator (M3b).
+            {hasOrchestrator
+              ? "A task with no room goes to the orchestrator, which decides where it belongs and "
+                + "tells that room. It stays unassigned on the board until it answers."
+              : "A task with no room stays unassigned: routing needs an orchestrator, and this "
+                + "factory has none. Create one in the project room's panel."}
           </FieldNote>
         </form>
       </PopoverContent>
@@ -225,6 +281,9 @@ export function TaskPanel() {
   const groups = tasksByStatus(tasks);
   const unfinished = tasks.filter((t) => t.status !== "done").length;
   const blocked = tasks.filter((t) => t.blockedOnMessageId !== null).length;
+  // Unassigned cards are scattered across the status groups (most are `open`, but an agent can move
+  // one before anybody routed it), so the count belongs in the header where it can be seen at once.
+  const unassigned = unassignedTasks(tasks).length;
 
   return (
     <EdgePanel
@@ -252,6 +311,14 @@ export function TaskPanel() {
             <Badge variant="warn" title={`${blocked} waiting on another room`}>
               <FlagIcon />
               {blocked}
+            </Badge>
+          )}
+          {unassigned > 0 && (
+            <Badge
+              title={`${unassigned} task${unassigned === 1 ? "" : "s"} with no room — "route it" on the card asks the orchestrator`}
+            >
+              <SignpostIcon />
+              {unassigned} unassigned
             </Badge>
           )}
           <span className="ml-auto">

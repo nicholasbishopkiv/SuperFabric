@@ -17,6 +17,7 @@ import {
   roomPosition,
   TASK_STATUS_ORDER,
   tasksByStatus,
+  unassignedTasks,
   useFabric,
 } from "../src/store";
 
@@ -955,6 +956,18 @@ describe("the task board", () => {
     const groups = tasksByStatus(useFabric.getState().tasks);
     expect(groups.map((g) => g.status)).toEqual([...TASK_STATUS_ORDER]);
     expect(groups.map((g) => g.tasks.map((t) => t.id))).toEqual([[], [], ["b", "c"], [], ["a"]]);
+  });
+
+  it("collects the cards nobody owns yet, which is what the board offers to route", () => {
+    const tasks = [
+      task({ id: "t1", roomId: null }),
+      task({ id: "t2", roomId: "r1" }),
+      task({ id: "t3", roomId: null, status: "in_progress" }),
+      // Finished and never routed is history, not work waiting on a decision.
+      task({ id: "t4", roomId: null, status: "done" }),
+    ];
+    expect(unassignedTasks(tasks).map((t) => t.id)).toEqual(["t1", "t3"]);
+    expect(unassignedTasks([])).toEqual([]);
   });
 
   it("counts a room's unfinished tasks, and only that room's", () => {

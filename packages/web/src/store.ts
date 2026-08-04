@@ -1054,6 +1054,14 @@ export function tasksByStatus(tasks: readonly TaskInfo[]): { status: TaskStatus;
 }
 
 /**
+ * The cards nobody owns yet. `done` is excluded: a finished card that was never routed is history,
+ * not work waiting on a decision, and counting it would make the board nag about nothing.
+ */
+export function unassignedTasks(tasks: readonly TaskInfo[]): TaskInfo[] {
+  return tasks.filter((t) => t.roomId === null && t.status !== "done");
+}
+
+/**
  * How many tasks a room still owes. `done` is excluded on purpose: the badge is a workload, and a
  * room whose every card is finished should read as clear rather than as busy.
  */
