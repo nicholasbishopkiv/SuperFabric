@@ -12,6 +12,7 @@ import { LimitMonitor } from "./limitMonitor.js";
 import { FactoryBus } from "./factoryBus.js";
 import { ProjectManager } from "./projectManager.js";
 import { RoomManager } from "./roomManager.js";
+import { LimitScheduler } from "./scheduler.js";
 import { TaskRouter } from "./router.js";
 import { SessionManager } from "./sessionManager.js";
 import { TaskStore } from "./taskStore.js";
@@ -77,6 +78,12 @@ mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
 // can call back — nothing here runs until a socket sends something.
 let hub!: WsHub;
 limits = new LimitMonitor(db, accounts, { onChange: () => hub.announceUsage() });
+// Utilisation into action: warn at 80 %, hold at 95 % (at a turn boundary, never mid-turn), and
+// bring everyone back when the window rolls. It never moves an agent to another subscription — see
+// the class comment, and `docs/RESEARCH.md` §5 for why that line is where it is.
+const scheduler = new LimitScheduler({
+  monitor: limits, sessions: mgr, accounts, onChange: () => hub.announceSessions(),
+});
 const logins = new AccountLoginManager({ accounts, onChange: () => hub.announceAccounts() });
 // So one `AccountInfo` describes the whole account — the row, whether it has credentials, and where
 // its login has got to — rather than the UI joining two lists that can disagree.
@@ -103,6 +110,7 @@ watchAccountDirs();
 // The meters. `start()` reads everything due immediately and then no faster than
 // `USAGE_POLL_INTERVAL_MS` per account — the floor that keeps us welcome at an undocumented endpoint.
 limits.start();
+scheduler.start();
 
 const bootProject = projects.defaultProject();
 // Every project needs its central building, including one that existed before this boot.
@@ -188,6 +196,7 @@ async function shutdown(signal: string): Promise<void> {
   logins.stopAll();
   credentials.close();
   limits.stop();
+  scheduler.stop();
 
   console.log("shutdown: closing fastify");
   await app.close();

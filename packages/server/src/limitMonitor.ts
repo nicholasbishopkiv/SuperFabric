@@ -43,6 +43,7 @@ function emptyUsage(accountId: string): AccountUsage {
     note: null,
     limited: false,
     limitedUntil: null,
+    limitedBy: null,
   };
 }
 
@@ -56,6 +57,7 @@ interface SnapshotRow {
   note: string | null;
   limited: number;
   limited_until: string | null;
+  limited_by: string | null;
 }
 
 export interface LimitMonitorOptions {
@@ -102,14 +104,15 @@ export class LimitMonitor {
 
     this.stmts = {
       insert: db.prepare(
-        "INSERT INTO usage_snapshots (account_id, read_at, source, approximate, windows, note, limited, limited_until)"
-        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO usage_snapshots (account_id, read_at, source, approximate, windows, note, limited, limited_until, limited_by)"
+        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ),
       // The newest row per account, in one statement: a per-account query inside a loop is
       // O(accounts) round trips on every boot for a list that is three rows long, and the shape
       // generalises to a machine with twenty.
       newest: db.prepare(`
-        SELECT s.account_id, s.read_at, s.source, s.approximate, s.windows, s.note, s.limited, s.limited_until
+        SELECT s.account_id, s.read_at, s.source, s.approximate, s.windows, s.note, s.limited,
+               s.limited_until, s.limited_by
         FROM usage_snapshots s
         JOIN (SELECT account_id, MAX(read_at) AS read_at FROM usage_snapshots GROUP BY account_id) n
           ON n.account_id = s.account_id AND n.read_at = s.read_at
@@ -264,11 +267,15 @@ export class LimitMonitor {
       note: reading.note,
       limited,
       limitedUntil: limited ? worst!.resetsAt : null,
+      // A fresh reading replaces whatever a 429 said: the endpoint is the better witness once it has
+      // spoken again, and an account that recovered must not stay marked by an error from an hour ago.
+      limitedBy: limited ? "window" : null,
     };
     this.readings.set(accountId, usage);
     this.stmts.insert.run(
       accountId, readAt, usage.source, usage.approximate ? 1 : 0,
       JSON.stringify(usage.windows), usage.note, usage.limited ? 1 : 0, usage.limitedUntil,
+      usage.limitedBy,
     );
   }
 
@@ -291,9 +298,13 @@ export class LimitMonitor {
       ...previous,
       limited: true,
       limitedUntil: previous.limitedUntil ?? worst?.resetsAt ?? null,
+      // The distinction the scheduler branches on: this is the provider refusing, not a meter
+      // reading, so it may pause agents even when the meters are only an estimate.
+      limitedBy: "rate_limit_error",
       note: reason ?? previous.note,
     };
-    if (previous.limited && next.note === previous.note && next.limitedUntil === previous.limitedUntil) {
+    if (previous.limited && previous.limitedBy === "rate_limit_error"
+      && next.note === previous.note && next.limitedUntil === previous.limitedUntil) {
       return;
     }
     this.readings.set(accountId, next);
@@ -338,5 +349,6 @@ function rowToUsage(row: SnapshotRow): AccountUsage {
     note: row.note,
     limited: row.limited === 1,
     limitedUntil: row.limited_until,
+    limitedBy: row.limited_by === "rate_limit_error" || row.limited_by === "window" ? row.limited_by : null,
   };
 }

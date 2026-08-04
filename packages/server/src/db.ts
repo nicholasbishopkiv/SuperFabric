@@ -183,6 +183,26 @@ const MIGRATIONS: readonly Migration[] = [
     -- "the newest reading for this account", which is the only query the UI path makes.
     CREATE INDEX IF NOT EXISTS usage_snapshots_account ON usage_snapshots (account_id, read_at DESC);
   `,
+  // 11 — M2 the scheduler: when an agent was paused for a limit, and when it is expected back.
+  //
+  // `sessions.state = 'paused'` already existed (it is in the M0 enum) and `resumeAll` already only
+  // starts `'active'` rows, so pausing needs no new state — what it needs is the two facts a
+  // countdown and an unattended resume are made of. Both NULL for every session that is not paused,
+  // which is all of them until a limit is reached.
+  //
+  // **`paused_until` NULL on a paused row is meaningful, not missing**: it is what a 429 with no
+  // known reset time leaves behind, and the scheduler reads it as "hold until a reading says
+  // otherwise" rather than as "resume now". `paused_at` is what makes a *stale* reading unable to
+  // resume anyone — only a reading taken after the pause can say the window has rolled.
+  // `usage_snapshots.limited_by` rides along because it is the other half of the same feature: the
+  // scheduler branches on *how* we know an account is spent (a reading, or the provider refusing a
+  // turn) and a restart that forgot which would show the operator the wrong reason for a stopped
+  // agent. NULL for every row written by migration 10, which is what "not limited" already meant.
+  `
+    ALTER TABLE sessions ADD COLUMN paused_at INTEGER;
+    ALTER TABLE sessions ADD COLUMN paused_until INTEGER;
+    ALTER TABLE usage_snapshots ADD COLUMN limited_by TEXT;
+  `,
 ];
 
 /**

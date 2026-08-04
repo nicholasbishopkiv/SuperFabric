@@ -529,6 +529,14 @@ export class WsHub {
    * Public entry point for "the meters changed", on the same coalescing window as every other pushed
    * list: a poll finishing and a 429 landing in the same second cost one frame, not two.
    */
+  /**
+   * Public entry point for "an agent's state changed for a reason that came from outside a socket" —
+   * the scheduler pausing or resuming one. Coalesced like every other pushed list.
+   */
+  announceSessions(): void {
+    this.scheduleBroadcast("sessions");
+  }
+
   announceUsage(): void {
     this.scheduleBroadcast("usage");
   }

@@ -160,6 +160,16 @@ export class SessionManager {
    * is in flight, so `prompt()` can tell "restarting" from "not running" without a second flag.
    */
   private heldPrompts = new Map<string, string[]>();
+  /**
+   * sessionId -> a pause armed while that agent had a turn in flight.
+   *
+   * **An agent is never cut off mid-thought.** The bus already refuses to inject a message into a
+   * working agent and drains its queue at `turn_complete`; a pause is the same discipline pointed the
+   * other way, and for a stronger reason — interrupting a turn to save quota would throw away the
+   * tokens that turn already spent. So the pause waits for the boundary the runner already knows how
+   * to find.
+   */
+  private pausePending = new Map<string, { until: number | null; reason: string }>();
   private readonly stmts;
 
   constructor(
@@ -187,6 +197,22 @@ export class SessionManager {
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       setModel: db.prepare("UPDATE sessions SET model = ? WHERE id = ?"),
       setAccount: db.prepare("UPDATE sessions SET account_id = ? WHERE id = ?"),
+      // Pausing and coming back. `state` alone would be enough to stop `resumeAll` re-spawning a
+      // paused agent; the two timestamps are what an unattended resume and a countdown are made of.
+      markPaused: db.prepare(
+        "UPDATE sessions SET state = 'paused', paused_at = ?, paused_until = ? WHERE id = ? AND state = 'active'",
+      ),
+      markResumed: db.prepare(
+        "UPDATE sessions SET state = 'active', paused_at = NULL, paused_until = NULL WHERE id = ?",
+      ),
+      pausedSessions: db.prepare(
+        `SELECT ${SESSION_COLUMNS}, paused_at, paused_until FROM sessions WHERE state = 'paused' ORDER BY created_at, rowid`,
+      ),
+      // "Who is running on this subscription?" — the question the scheduler asks about every account
+      // it is about to warn or hold.
+      activeOnAccount: db.prepare(
+        "SELECT id FROM sessions WHERE account_id = ? AND state = 'active' ORDER BY created_at, rowid",
+      ),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
       // `status` and `blocked` are derived from the log by correlated subqueries rather than a
       // second round of queries per row, for the same reason — the 3D floor asks for this list on
@@ -549,6 +575,14 @@ export class SessionManager {
           }
           if (event.type === "turn_complete") {
             this.turnInFlight.delete(id);
+            // The turn boundary is also where an armed pause lands. Before the bus flush, so a
+            // message is never delivered to an agent that is about to stop and would not answer it.
+            const pending = this.pausePending.get(id);
+            if (pending !== undefined) {
+              this.pausePending.delete(id);
+              void this.applyPause(id, pending.until, pending.reason);
+              return;
+            }
             // The turn boundary: the one moment a message from another room may be injected into
             // this agent without interrupting anything. Delivery is idempotent, so flushing here on
             // every boundary costs nothing when the room's queue is empty.
@@ -646,6 +680,109 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Hold an agent because its account is at its limit — **at the next turn boundary, never mid-turn**.
+   *
+   * A turn already in flight is left to finish: interrupting it would throw away the tokens it has
+   * already spent, which is the opposite of the point, and it would cut the agent off mid-sentence in
+   * a transcript the operator later has to read. So a working agent has the pause *armed* and the
+   * `turn_complete` the runner already watches for is what applies it — exactly how the bus decides
+   * when it may inject a message.
+   *
+   * `until` is unix **seconds**, or `null` for "nobody knows when this lifts" (a 429 with no reading
+   * behind it). Null is a real state and the scheduler reads it as "hold until a reading says
+   * otherwise" — it is never treated as "resume now".
+   *
+   * Idempotent: a session already paused, or already armed, is not paused twice.
+   */
+  async pauseSession(
+    id: string,
+    until: number | null,
+    reason: string,
+  ): Promise<"paused" | "at-turn-boundary" | "already-paused"> {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    if (row.state === "paused" || this.pausePending.has(id)) return "already-paused";
+
+    if (this.turnInFlight.has(id)) {
+      this.pausePending.set(id, { until, reason });
+      // Said out loud now rather than at the boundary: the operator watching an agent work has to be
+      // able to see that it is about to stop, and why.
+      this.store.append(id, {
+        type: "session_status",
+        status: "working",
+        detail: `${reason} — pausing at the end of this turn`,
+      });
+      return "at-turn-boundary";
+    }
+
+    await this.applyPause(id, until, reason);
+    return "paused";
+  }
+
+  /**
+   * Actually stop an agent and record that it is held.
+   *
+   * The order is the design: the row and the log say "paused" *before* the executor is torn down, so
+   * a client watching the floor never sees an agent vanish and reappear as paused a second later. The
+   * stop races the same timeout `stopAll` uses — a wedged CLI subprocess must not wedge a pause that
+   * exists to save quota.
+   */
+  private async applyPause(id: string, until: number | null, reason: string): Promise<void> {
+    const changed = this.stmts.markPaused.run(Math.floor(Date.now() / 1000), until, id).changes;
+    // A session that is not 'active' any more (it errored, or shutdown beat us here) is not paused.
+    if (changed === 0) return;
+
+    const handle = this.handles.get(id);
+    this.handles.delete(id);
+    this.turnInFlight.delete(id);
+    this.pausePending.delete(id);
+    this.denyPendingApprovals(id);
+    this.store.append(id, { type: "session_status", status: "paused", detail: reason });
+    if (handle !== undefined) await this.stopWithTimeout(handle, 5000).catch(() => {});
+  }
+
+  /**
+   * Bring a paused agent back, resuming the conversation it was holding.
+   *
+   * `options.resume` is what makes this a *continuation* rather than a new agent wearing the same
+   * name: the spec is rebuilt from the row, so the model, the autonomy, the room, the role and the
+   * account all come back as they were, and `claude_session_id` carries the transcript. The agent is
+   * then told what happened to it — being silently restarted after an unexplained gap is how an agent
+   * repeats work it already did.
+   */
+  resumeSession(id: string, reason: string): boolean {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    if (row.state !== "paused") return false;
+    if (this.stopping) return false;
+
+    this.stmts.markResumed.run(id);
+    this.store.append(id, { type: "session_status", status: "starting", detail: reason });
+    this.startExecutor(id, specOf(row));
+    return true;
+  }
+
+  /** Every agent currently held, with what a resume has to decide from. */
+  pausedSessions(): { id: string; accountId: string | null; pausedAt: number | null; pausedUntil: number | null }[] {
+    return (this.stmts.pausedSessions.all() as (SessionRow & { paused_at: number | null; paused_until: number | null })[])
+      .map((r) => ({
+        id: r.id, accountId: r.account_id, pausedAt: r.paused_at, pausedUntil: r.paused_until,
+      }));
+  }
+
+  /**
+   * The live agents running on one account.
+   *
+   * Only sessions with an executor: a row marked active whose process is gone cannot be warned (there
+   * is nothing to inject a turn into) and pausing it would be recording a stop that never happened.
+   */
+  liveSessionsOnAccount(accountId: string): string[] {
+    return (this.stmts.activeOnAccount.all(accountId) as { id: string }[])
+      .map((r) => r.id)
+      .filter((id) => this.handles.has(id));
+  }
+
   async interrupt(id: string): Promise<void> { await this.handles.get(id)?.interrupt(); }
 
   /**
@@ -659,6 +796,10 @@ export class SessionManager {
     const handles = [...this.handles.values()];
     this.handles.clear();
     this.turnInFlight.clear();
+    // An armed pause belongs to a turn boundary that will never arrive now. The session stays
+    // 'active' and comes back on the next boot, where the scheduler will decide again from a fresh
+    // reading — writing 'paused' here would hold an agent for a limit that may have rolled overnight.
+    this.pausePending.clear();
     await Promise.allSettled(handles.map((h) => this.stopWithTimeout(h, timeoutMs)));
   }
 
@@ -698,6 +839,7 @@ export class SessionManager {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
       autonomy: string; model: string | null; room_id: string | null; last_seq: number;
       status: string | null; blocked: number; is_orchestrator: number; account_id: string | null;
+      paused_until: number | null;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
@@ -707,6 +849,7 @@ export class SessionManager {
       model: r.model,
       roomId: r.room_id,
       accountId: r.account_id,
+      pausedUntil: r.paused_until,
       status: asStatus(r.status),
       blocked: r.blocked === 1,
       isOrchestrator: r.is_orchestrator === 1,
@@ -719,7 +862,8 @@ export class SessionManager {
  * back exactly as it was. One list, used by every statement that reads a session row, so adding a
  * per-session property cannot be remembered in `resumeAll` and forgotten in `setModel`.
  */
-const SESSION_COLUMNS = "id, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator, account_id";
+const SESSION_COLUMNS =
+  "id, state, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator, account_id";
 
 /**
  * The session listing, with a caller-chosen `WHERE`. The clause is a literal from the two call sites
@@ -730,6 +874,7 @@ function sessionListSql(where: string): string {
     SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
            s.autonomy AS autonomy, s.model AS model, s.room_id AS room_id,
            s.is_orchestrator AS is_orchestrator, s.account_id AS account_id,
+           s.paused_until AS paused_until,
            COALESCE(MAX(e.seq), 0) AS last_seq,
            -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
            (SELECT json_extract(st.payload, '$.status')
@@ -755,6 +900,8 @@ function sessionListSql(where: string): string {
 interface SessionRow {
   id: string;
   cwd: string;
+  /** active | paused | done | error. The one column `pauseSession`/`resumeSession` branch on. */
+  state: string;
   claude_session_id: string | null;
   autonomy: string;
   /** NULL is "the CLI's own default", not a missing value. */

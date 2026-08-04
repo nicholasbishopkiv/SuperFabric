@@ -39,8 +39,8 @@ beforeEach(() => {
 /** A `SessionInfo` with every field the protocol requires; cases override just what they are about. */
 const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
-  autonomy: "auto", model: null, roomId: null, accountId: null, status: "idle", blocked: false,
-  isOrchestrator: false, ...over,
+  autonomy: "auto", model: null, roomId: null, accountId: null, pausedUntil: null,
+  status: "idle", blocked: false, isOrchestrator: false, ...over,
 });
 
 const room = (over: Partial<RoomInfo> = {}): RoomInfo => ({

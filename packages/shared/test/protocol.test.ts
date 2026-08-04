@@ -604,6 +604,23 @@ describe("protocol", () => {
       expect(ClientMessage.parse({ kind: "list_usage" }).kind).toBe("list_usage");
     });
 
+    it("says *how* an account is known to be limited, because the scheduler branches on it", () => {
+      // A reading from the estimate may never cut an agent off; the provider refusing a turn may.
+      expect(AccountUsage.parse(USAGE).limitedBy).toBeNull();
+      expect(AccountUsage.parse({ ...USAGE, limited: true, limitedBy: "rate_limit_error" }).limitedBy)
+        .toBe("rate_limit_error");
+      expect(() => AccountUsage.parse({ ...USAGE, limitedBy: "vibes" })).toThrow();
+    });
+
+    it("carries a paused agent's countdown, and allows a pause with no known end", () => {
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [SESSION_INFO] }))
+        .toMatchObject({ sessions: [{ pausedUntil: null }] });
+      expect(ServerMessage.parse({
+        kind: "sessions",
+        sessions: [{ ...SESSION_INFO, state: "paused", status: "paused", pausedUntil: 1_754_269_200 }],
+      })).toMatchObject({ sessions: [{ pausedUntil: 1_754_269_200 }] });
+    });
+
     it("keeps the thresholds and the poll floor in one place for both sides", () => {
       expect(LIMIT_WARN_PERCENT).toBeLessThan(LIMIT_PAUSE_PERCENT);
       expect(LIMIT_PAUSE_PERCENT).toBeLessThan(100);

@@ -233,6 +233,16 @@ export const AccountUsage = z.object({
   limited: z.boolean(),
   /** ISO-8601 instant the limit is expected to lift, or null when nothing said when. */
   limitedUntil: z.string().nullable(),
+  /**
+   * *How* we know this account is at its limit, or null when it is not.
+   *
+   * The distinction is load-bearing rather than informational. `window` is a reading — and a reading
+   * from the estimate is a guess, which must never be allowed to cut an agent off mid-thought.
+   * `rate_limit_error` is the provider itself refusing a turn: not an estimate at all, and reason
+   * enough to pause whatever the meters happen to say. The scheduler branches on exactly this, and
+   * the UI says which so an operator is never left wondering why work stopped.
+   */
+  limitedBy: z.enum(["window", "rate_limit_error"]).nullable().default(null),
 });
 export type AccountUsage = z.infer<typeof AccountUsage>;
 
@@ -614,6 +624,16 @@ export const SessionInfo = z.object({
    * the same subscription, which is the property the whole multi-account feature rests on.
    */
   accountId: z.string().nullable().default(null),
+  /**
+   * When this agent is expected to come back, as unix **seconds** — non-null only while it is
+   * paused, and only when something knows the answer.
+   *
+   * `null` on a paused agent is a real state rather than a missing value: an account marked by a 429
+   * with no reading behind it has no known reset time, and the scheduler holds it until a reading
+   * says the window rolled. The UI shows a countdown for the first and "waiting for the limit to
+   * lift" for the second — inventing a time for the second would be a promise nobody made.
+   */
+  pausedUntil: z.number().int().nullable().default(null),
   /**
    * Derived from the session's own event log: the latest `session_status`, or `idle` when it has
    * none. The 3D floor needs the *current* status of every agent, and subscribing to every session
