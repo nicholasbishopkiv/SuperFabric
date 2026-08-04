@@ -34,6 +34,8 @@ import { waitFor } from "./_waitFor.js";
  */
 
 const SOCKET_DIR = "/data/.fabrica/run";
+/** This server instance's identity: its data directory. See `LABEL_INSTANCE`. */
+const INSTANCE = "/data/.fabrica";
 const WORKSPACE = "/code/shop/payments";
 const CONFIG = "/home/me/.claude-work";
 
@@ -52,7 +54,7 @@ function harness(opts: { images?: string[]; attachTimeoutMs?: number } = {}): Ha
   const events: SessionEvent[] = [];
   const approvals: Harness["approvals"] = [];
   const executor = new ContainerExecutor({
-    docker, hub, socketDir: SOCKET_DIR,
+    docker, hub, instanceId: INSTANCE, socketDir: SOCKET_DIR,
     attachTimeoutMs: opts.attachTimeoutMs ?? 250,
     stopGraceSeconds: 1,
   });
@@ -130,7 +132,7 @@ describe("ContainerExecutor: what it asks Docker for", () => {
     const docker = new FakeDocker({ images: [RUNNER_IMAGE_TAG] });
     const hub = new RunnerHub();
     const executor = new ContainerExecutor({
-      docker, hub, socketDir: SOCKET_DIR, memoryMb: 512, cpus: 0.5, pids: 64, attachTimeoutMs: 50,
+      docker, hub, instanceId: INSTANCE, socketDir: SOCKET_DIR, memoryMb: 512, cpus: 0.5, pids: 64, attachTimeoutMs: 50,
     });
     executor.start(startOptions(), { onEvent: () => {}, requestApproval: async () => "deny" });
     await waitFor(() => expect(docker.containers.size).toBe(1));
@@ -153,7 +155,7 @@ describe("ContainerExecutor: what it asks Docker for", () => {
   it("uses the TCP fallback when an operator asked for one, and only then adds the host alias", async () => {
     const docker = new FakeDocker({ images: [RUNNER_IMAGE_TAG] });
     const executor = new ContainerExecutor({
-      docker, hub: new RunnerHub(), socketDir: SOCKET_DIR, attachTimeoutMs: 50,
+      docker, hub: new RunnerHub(), instanceId: INSTANCE, socketDir: SOCKET_DIR, attachTimeoutMs: 50,
       serverUrl: "ws://host.docker.internal:4620/runner",
     });
     executor.start(startOptions(), { onEvent: () => {}, requestApproval: async () => "deny" });
@@ -282,7 +284,7 @@ describe("ContainerExecutor: when it cannot start", () => {
     const docker = new FakeDocker({ images: [RUNNER_IMAGE_TAG] });
     const events: SessionEvent[] = [];
     new ContainerExecutor({
-      docker, hub: new RunnerHub(), socketDir: SOCKET_DIR, attachTimeoutMs: 60,
+      docker, hub: new RunnerHub(), instanceId: INSTANCE, socketDir: SOCKET_DIR, attachTimeoutMs: 60,
       serverUrl: "ws://host.docker.internal:4620/runner",
     }).start(startOptions(), { onEvent: (e) => events.push(e), requestApproval: async () => "deny" });
     await waitFor(() => {
@@ -329,8 +331,9 @@ describe("ContainerExecutor: a container that outlived the server", () => {
     expect(back.attached).toBe(true);
     expect(h.docker.containers.size).toBe(1);
 
-    // And it is the same conversation: the provider id it already knew resolves the promise.
-    back.providerSession("claude-abc");
+    // And it is the same conversation. The re-attaching runner does **not** re-send its
+    // `provider_session` frame — the previous server incarnation acknowledged it, so the runner
+    // dropped it — so this resolving at all is the point: it comes from what we are resuming.
     expect(await handle.providerSessionId).toBe("claude-abc");
     await handle.stop();
   });
@@ -387,6 +390,31 @@ describe("ContainerExecutor: cleaning up after a boot", () => {
     // `RestartPolicy: unless-stopped` is what makes a container survive a machine reboot; without
     // this reaper it is also what would make an abandoned one come back forever.
     expect(mine.container.removed).toBe(false);
+  });
+
+  it("never touches another server instance's containers", async () => {
+    // The bug this exists for cost a working agent during the M4 acceptance run: `reapOrphans` was
+    // machine-wide, and a second server — `wsOrigin.test.ts` spawns one with an empty data dir —
+    // booted, found no sessions of its own, and destroyed the first server's container.
+    const theirs = harness();
+    const victim = await startAndAttach(theirs, { sessionKey: "their-session" });
+    await victim.handle.detach!();
+
+    const other = new ContainerExecutor({
+      docker: theirs.docker, hub: new RunnerHub(), instanceId: "/somewhere/else/.fabrica",
+      socketDir: SOCKET_DIR, attachTimeoutMs: 50,
+    });
+    // A brand-new factory with no sessions at all: the most dangerous possible caller.
+    expect(await other.reapOrphans(new Set())).toEqual([]);
+    expect(victim.container.removed).toBe(false);
+    expect(victim.container.running).toBe(true);
+
+    // And it will not adopt one either, even for a session id that matches.
+    const events: SessionEvent[] = [];
+    other.start(startOptions({ sessionKey: "their-session" }),
+      { onEvent: (e) => events.push(e), requestApproval: async () => "deny" });
+    await waitFor(() => expect(theirs.docker.containers.size).toBe(2));
+    expect(victim.container.removed).toBe(false);
   });
 
   it("a daemon it cannot reach is not a reason to fail a boot", async () => {

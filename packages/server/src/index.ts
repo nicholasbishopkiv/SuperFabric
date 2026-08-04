@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import Docker from "dockerode";
 import Fastify from "fastify";
@@ -116,6 +116,10 @@ const runnerListener = await startRunnerListener({
 const containerExecutor = new ContainerExecutor({
   docker: new Docker() as unknown as DockerLike,
   hub: runnerHub,
+  // What identifies *this* factory to the daemon. The data directory, canonicalised, because that is
+  // what a server instance is — one `fabrica.db`, one set of sessions — and because without it the
+  // boot-time orphan sweep is machine-wide and a second server destroys the first one's agents.
+  instanceId: realpathSync(dataDir),
   socketDir: runnerSocketDir,
   ...(runnerTcpPort !== undefined
     ? { serverUrl: `ws://host.docker.internal:${runnerTcpPort}/runner` }

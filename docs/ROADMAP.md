@@ -454,7 +454,18 @@ account with no inference at all.
 - **`reapOrphans` at boot**, required by `RestartPolicy: unless-stopped` — the policy that makes a
   container survive a machine reboot is also what would resurrect an abandoned one forever.
 
-1092 → **1158 tests green** (shared 82, server 761 + 1 skipped live-quota test, web 285,
+**One bug the acceptance run itself found, and it was the important kind.** A container left
+running by a graceful shutdown was stopped four minutes later, with nothing running that could have
+asked for it — traced through `docker events` (`container kill signal=15`) to `reapOrphans` being
+**machine-wide**: `test/wsOrigin.test.ts` spawns a real server with an empty data directory, that
+server boots, sees no active sessions of its own, and destroys every contained agent on the machine.
+The same would happen to an operator running two factories from two data directories. Containers now
+carry a `superfabric.instance` label — the data directory, canonicalised, because that *is* what a
+server instance is — and both the orphan sweep and the re-attach lookup are scoped to it. Verified
+end to end afterwards: with a second server's containers running, the full suite (which spawns that
+real server) leaves them untouched.
+
+1092 → **1159 tests green** (shared 82, server 762 + 1 skipped live-quota test, web 285,
 agent-runner 30).
 
 ## M5 — Polish and the "living factory"

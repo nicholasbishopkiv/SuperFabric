@@ -31,6 +31,9 @@ import { waitFor } from "./_waitFor.js";
  * (the two `starting` lines a container emits about itself) or a bug.
  */
 
+/** This server instance's identity: its data directory. See `LABEL_INSTANCE`. */
+const INSTANCE = "/data/.fabrica";
+
 /** A local executor that emits exactly what the runner will, so the two logs are comparable. */
 class ScriptedHostExecutor implements Executor {
   readonly name = "scripted-host";
@@ -140,7 +143,7 @@ describe("a contained session and a host session are the same session", () => {
     const docker = new FakeDocker({ images: [RUNNER_IMAGE_TAG] });
     const hub = new RunnerHub();
     const contained = new ContainerExecutor({
-      docker, hub, socketDir: "/data/run", attachTimeoutMs: 3000, stopGraceSeconds: 1,
+      docker, hub, instanceId: INSTANCE, socketDir: "/data/run", attachTimeoutMs: 3000, stopGraceSeconds: 1,
     });
     const b = build({ runtime: "container", host: new ScriptedHostExecutor(), container: contained });
     const containedSession = b.mgr.createSession({ roomId: b.roomId });
@@ -195,7 +198,7 @@ describe("a contained session and a host session are the same session", () => {
   it("passes the room's account to the container, and the session id it needs to be found again", async () => {
     const docker = new FakeDocker({ images: [RUNNER_IMAGE_TAG] });
     const contained = new ContainerExecutor({
-      docker, hub: new RunnerHub(), socketDir: "/data/run", attachTimeoutMs: 200,
+      docker, hub: new RunnerHub(), instanceId: INSTANCE, socketDir: "/data/run", attachTimeoutMs: 200,
     });
     const b = build({ runtime: "container", host: new ScriptedHostExecutor(), container: contained });
     const id = b.mgr.createSession({ roomId: b.roomId });
@@ -214,7 +217,7 @@ describe("choosing a runtime", () => {
     const host = new ScriptedHostExecutor();
     const docker = new FakeDocker({ images: [RUNNER_IMAGE_TAG] });
     const contained = new ContainerExecutor({
-      docker, hub: new RunnerHub(), socketDir: "/data/run", attachTimeoutMs: 200,
+      docker, hub: new RunnerHub(), instanceId: INSTANCE, socketDir: "/data/run", attachTimeoutMs: 200,
     });
     const b = build({ runtime: "host", host, container: contained });
     const onHost = b.mgr.createSession({ roomId: b.roomId });
@@ -236,7 +239,7 @@ describe("choosing a runtime", () => {
     const host = new ScriptedHostExecutor();
     const docker = new FakeDocker({ images: [RUNNER_IMAGE_TAG] });
     const contained = new ContainerExecutor({
-      docker, hub: new RunnerHub(), socketDir: "/data/run", attachTimeoutMs: 200,
+      docker, hub: new RunnerHub(), instanceId: INSTANCE, socketDir: "/data/run", attachTimeoutMs: 200,
     });
     const b = build({ runtime: "container", host, container: contained });
     b.mgr.createSession({ cwd: b.dir });

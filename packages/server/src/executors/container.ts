@@ -72,6 +72,23 @@ export interface DockerLike {
 
 /** Marks a container as ours, so cleanup can find every one of them and nothing else. */
 export const LABEL_RUNNER = "superfabric.runner";
+/**
+ * Which **server instance** a container belongs to — its data directory, canonicalised.
+ *
+ * Not decoration, and learned the hard way: without it `reapOrphans` is machine-wide, and a *second*
+ * SuperFabric on the same machine — a second factory an operator started with another
+ * `SUPERFABRIC_DATA`, or `test/wsOrigin.test.ts`, which spawns a real server with an empty one —
+ * boots, finds no active sessions of its own, and cheerfully destroys every working contained agent
+ * the first server owns. That is exactly what happened during the M4 acceptance run: a container
+ * left running by a graceful shutdown was stopped four minutes later by the test suite, from a
+ * server instance that had never heard of it.
+ *
+ * The data directory is the right identity because it *is* what a server instance is: one
+ * `fabrica.db`, one set of sessions. Two servers sharing a data directory are one factory in two
+ * processes and may legitimately reap each other's orphans; two with different ones must never touch
+ * each other's containers, whatever their session ids look like.
+ */
+export const LABEL_INSTANCE = "superfabric.instance";
 /** The SuperFabric session a container belongs to. What makes re-attaching after a restart possible. */
 export const LABEL_SESSION = "superfabric.session";
 /** The attachment id the runner inside is using. Diagnostics; the token is read from the env. */
@@ -115,6 +132,11 @@ const DEFAULT_STOP_GRACE_S = 10;
 export interface ContainerExecutorOptions {
   docker: DockerLike;
   hub: RunnerHub;
+  /**
+   * Identity of this server instance — its data directory. Stamped on every container and required
+   * of every container this executor will adopt or destroy. See `LABEL_INSTANCE`.
+   */
+  instanceId: string;
   /** Absolute path of the directory holding the runner socket, on the host. Bind-mounted read-only. */
   socketDir: string;
   /**
@@ -223,6 +245,16 @@ export class ContainerExecutor implements Executor {
             onBye: (reason) => log(`runner ${existing.attachmentId} said goodbye: ${reason}`),
           },
         });
+        // The provider session id, from the row rather than from the wire.
+        //
+        // A re-attaching runner will *not* re-send it: the previous server incarnation acknowledged
+        // that frame, so the runner has already forgotten it, and the new hub's `ackedSeq` of 0
+        // asks only for what is still unacknowledged. Resolving it from what we are resuming keeps
+        // `ExecutorHandle.providerSessionId` a promise that settles — the alternative is one dangling
+        // promise per restart, and a handle whose contract is quietly untrue for contained sessions.
+        if (opts.resumeSessionId !== null && opts.resumeSessionId !== undefined) {
+          resolveProviderSession(opts.resumeSessionId);
+        }
         ev.onEvent({
           type: "session_status",
           status: "starting",
@@ -318,7 +350,12 @@ export class ContainerExecutor implements Executor {
     try {
       found = await this.opts.docker.listContainers({
         all: true,
-        filters: JSON.stringify({ label: [`${LABEL_RUNNER}=1`] }),
+        // **Scoped to this server instance.** See `LABEL_INSTANCE`: a machine-wide sweep here
+        // destroys another factory's working agents, and the label is the only thing standing
+        // between "tidy up after myself" and that.
+        filters: JSON.stringify({
+          label: [`${LABEL_RUNNER}=1`, `${LABEL_INSTANCE}=${this.opts.instanceId}`],
+        }),
       });
     } catch (err) {
       // No daemon, or no permission to talk to it. A factory with no container rooms is a perfectly
@@ -328,6 +365,9 @@ export class ContainerExecutor implements Executor {
     }
     const removed: string[] = [];
     for (const summary of found) {
+      // Belt and braces over the daemon's own filter: a container that does not carry *this*
+      // instance's label is not ours to destroy, whatever the query returned.
+      if (summary.Labels?.[LABEL_INSTANCE] !== this.opts.instanceId) continue;
       const session = summary.Labels?.[LABEL_SESSION];
       if (session !== undefined && keep.has(session)) continue;
       await this.destroy(this.opts.docker.getContainer(summary.Id)).catch(() => {});
@@ -360,6 +400,7 @@ export class ContainerExecutor implements Executor {
       name: `superfabric-${attachmentId.slice(0, 12)}`,
       Labels: {
         [LABEL_RUNNER]: "1",
+        [LABEL_INSTANCE]: this.opts.instanceId,
         [LABEL_ATTACHMENT]: attachmentId,
         [LABEL_SPEC]: spec,
         ...(opts.sessionKey !== undefined ? { [LABEL_SESSION]: opts.sessionKey } : {}),
@@ -506,7 +547,13 @@ export class ContainerExecutor implements Executor {
   ): Promise<{ container: DockerContainerLike; attachmentId: string; token: string } | null> {
     const found = await this.opts.docker.listContainers({
       all: true,
-      filters: JSON.stringify({ label: [`${LABEL_RUNNER}=1`, `${LABEL_SESSION}=${sessionKey}`] }),
+      filters: JSON.stringify({
+        label: [
+          `${LABEL_RUNNER}=1`,
+          `${LABEL_INSTANCE}=${this.opts.instanceId}`,
+          `${LABEL_SESSION}=${sessionKey}`,
+        ],
+      }),
     });
     let adoptable: { container: DockerContainerLike; attachmentId: string; token: string } | null = null;
     for (const summary of found) {
