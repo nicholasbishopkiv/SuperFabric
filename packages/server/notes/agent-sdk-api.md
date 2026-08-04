@@ -311,6 +311,35 @@ error subtypes exist beyond `'success'`. `usage` is `NonNullableUsage` (all fiel
 `webSearchRequests`, `costUSD`, `contextWindow`, `maxOutputTokens`, `canonicalModel?`, `provider?`) —
 useful if Task 9 needs per-model cost attribution instead of just the aggregate `total_cost_usd`.
 
+#### What `total_cost_usd` counts — **cumulative per `query()`, not per turn** (M5)
+
+Established on 2026-08-04 while building the burn-rate metrics, from the CLI bundle itself
+(`/opt/claude-code/bin/claude`, 2.1.220) rather than by spending quota:
+
+- the `result` object is built per turn (`duration_ms` derives from a per-turn `startedAt`, and the
+  turn-setup-failure path builds one with `num_turns: 0`), **but** `total_cost_usd` is filled from an
+  accumulator whose other consumer is the `error_max_budget_usd` check;
+- `Options.maxBudgetUsd` is documented in `sdk.d.ts` as *"Maximum budget in USD for the **query**. The
+  query will stop if this budget is exceeded"*, and the CLI compares **that same accumulator** against
+  it. An accumulator that is reset every turn could not enforce a per-query budget.
+
+So: within one `query()`, `total_cost_usd` is monotonically non-decreasing across turns. SuperFabric
+keeps one `query()` alive per session (streaming input) and restarts it on `set_model`/`set_autonomy`/
+`set_role`/`set_session_account`/pause/resume, so the observable series per session is a rising counter
+that **drops back near zero at each restart**.
+
+Consequences, both of which `metricsStore.ts` implements:
+
+1. **Never sum `turn_complete.costUsd`.** A ten-turn session would report several times what it spent.
+   A turn's cost is `costUsd` minus the previous `turn_complete`'s in the same session.
+2. **A decrease is a restart, not a refund.** When the value is lower than its predecessor, the whole
+   value is that turn's cost (a fresh `query()` counting from zero).
+
+Not verified against a live turn — that would cost quota, and the CLI's own budget semantics are a
+stronger witness than one observation would be. If a future CLI changes this, the symptom is a cost
+figure that is far too low (deltas of a per-turn series), and the fix is one `CASE` in
+`metricsStore.ts`. The figure is labelled approximate on every surface partly for this reason.
+
 `TerminalReason` (why the loop ended) is a large enum: `'blocking_limit' | 'rapid_refill_breaker' |
 'prompt_too_long' | 'image_error' | 'model_error' | 'api_error' | 'malformed_tool_use_exhausted' |
 'aborted_streaming' | 'aborted_tools' | 'stop_hook_prevented' | 'hook_stopped' | 'tool_deferred' |

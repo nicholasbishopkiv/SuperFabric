@@ -276,6 +276,7 @@ export const LIMIT_PAUSE_PERCENT = 95;
  */
 export const USAGE_POLL_INTERVAL_MS = 180_000;
 
+
 // ---- rooms ----
 
 /**
@@ -651,6 +652,133 @@ export type ChronicleHit = z.infer<typeof ChronicleHit>;
 /** How many hits a chronicle search answers with when the client does not say. */
 export const CHRONICLE_SEARCH_LIMIT = 10;
 
+// ---- M5: burn rate and cost ----
+
+/**
+ * How fast one account is spending its quota, and therefore how long it has left.
+ *
+ * **The number an operator acts on is `secondsToLimit`** — "at this rate you have about two hours" —
+ * not a token total. Everything else on this type exists to say how much that projection is worth.
+ *
+ * It is computed from `usage_snapshots`, i.e. from **real utilisation history** read from Anthropic's
+ * own endpoint, not from a cost model and not from a pricing table. That is what makes it a
+ * measurement rather than an arithmetic exercise: two readings of the same window, minutes apart, are
+ * a rate.
+ *
+ * **A projection nobody can make says so.** `secondsToLimit` is null and `unknown` carries the reason
+ * in words whenever there is too little history, the readings span too little time, or utilisation is
+ * not rising. A guess dressed as an hour figure would be worse than a blank, because the operator
+ * would plan their afternoon around it.
+ */
+export const AccountBurn = z.object({
+  accountId: z.string(),
+  /**
+   * The window this projection is about: the one that will be spent **soonest**, which is not always
+   * the fullest one — a 5-hour window at 60 % and rising fast runs out before a weekly at 90 % that
+   * has barely moved. Null when there is no projection.
+   */
+  windowKey: z.string().nullable(),
+  windowLabel: z.string().nullable(),
+  /** Percentage points per hour, from the least-squares slope of the readings. Null when unknown. */
+  percentPerHour: z.number().nullable(),
+  /**
+   * Seconds from the newest reading until that window reaches the pause threshold
+   * (`LIMIT_PAUSE_PERCENT`) at the current rate — the point at which the scheduler stops the agents,
+   * which is what the operator actually cares about, not 100 %. Null when unknown. Zero when the
+   * threshold is already reached.
+   */
+  secondsToLimit: z.number().int().nullable(),
+  /**
+   * The window rolls before this rate would exhaust it. Good news, and worth saying: an operator told
+   * "two hours" would otherwise stop handing out work when in fact the quota refills first.
+   */
+  resetsFirst: z.boolean(),
+  /**
+   * The readings behind this rate were estimates, so the rate is one too. Carried separately from
+   * `AccountUsage.approximate` because a projection can be built from a *mix* — one estimate anywhere
+   * in the series is enough to mark the whole thing.
+   */
+  approximate: z.boolean(),
+  /** How many readings the rate was computed from, and over how long. The projection's own footing. */
+  samples: z.number().int().nonnegative(),
+  spanSeconds: z.number().int().nonnegative(),
+  /** Why there is no projection, in the operator's own words, or null when there is one. */
+  unknown: z.string().nullable(),
+});
+export type AccountBurn = z.infer<typeof AccountBurn>;
+
+/**
+ * What some turns cost, as the provider reported it.
+ *
+ * **This is a cost-*equivalent*, and it is approximate for three separate reasons** — which is why
+ * every surface showing it marks it, exactly as the limit meters mark an estimate:
+ *
+ * 1. On a subscription no money changes hands per turn. This is what the same work would have cost
+ *    through the API, which is the only cost figure that exists.
+ * 2. It is reconstructed from `turn_complete.costUsd`, which the CLI reports **cumulatively per
+ *    `query()`** rather than per turn (see `packages/server/notes/agent-sdk-api.md`, "What
+ *    `total_cost_usd` counts"), so a per-turn figure is a difference between consecutive readings.
+ *    A turn whose result carried no cost contributes nothing.
+ * 3. **No pricing table is involved anywhere.** SuperFabric never multiplies tokens by a rate — the
+ *    number comes from Anthropic's own CLI. That is deliberate: a hard-coded per-model price would be
+ *    wrong within weeks and there would be no way to tell.
+ */
+export const CostRollup = z.object({
+  /** US dollars, summed from the provider's own figures. */
+  usd: z.number().nonnegative(),
+  /** Turns that reported a cost. Zero is "nothing was recorded", not "the work was free". */
+  turns: z.number().int().nonnegative(),
+});
+export type CostRollup = z.infer<typeof CostRollup>;
+
+/** The two windows the metrics surface shows. Fixed, because two numbers is what fits beside a meter. */
+export const CostRollups = z.object({
+  /** The last 24 hours. */
+  day: CostRollup,
+  /** The last 7 days, matching the weekly limit window's own shape. */
+  week: CostRollup,
+});
+export type CostRollups = z.infer<typeof CostRollups>;
+
+/** One account's metrics: the projection, and what its turns cost. */
+export const AccountMetrics = z.object({
+  accountId: z.string(),
+  burn: AccountBurn,
+  cost: CostRollups,
+});
+export type AccountMetrics = z.infer<typeof AccountMetrics>;
+
+/** What one room's agents cost. The name is not carried: the client already holds the room list. */
+export const RoomCost = z.object({
+  roomId: z.string(),
+  cost: CostRollups,
+});
+export type RoomCost = z.infer<typeof RoomCost>;
+
+/**
+ * The metrics frame: per account, per room, and the ambient `~/.claude`.
+ *
+ * **Addressed per project even though the account half is machine-wide.** Every other machine-wide
+ * listing (`accounts`, `usage`, `roles`) goes to every socket unscoped, and this one carries a
+ * per-project half — a room belongs to exactly one floor — so it has to be built per project. The
+ * account figures are then identical on every floor, which is correct and costs one extra frame per
+ * project rather than a second polling surface and a second message for one popover.
+ */
+export const FactoryMetrics = z.object({
+  /** One entry per configured account, in the account list's own order. */
+  accounts: z.array(AccountMetrics),
+  /**
+   * Spend by agents on the ambient `~/.claude` — the ones with no account bound, which is what every
+   * session before M2 was and what a factory that has configured no accounts still is. Reported
+   * separately rather than folded into `accounts`, because there is no account row to hang it on and
+   * inventing one would put a subscription in the list that the operator never added.
+   */
+  ambient: CostRollups,
+  /** This factory's rooms that have cost anything, most expensive week first. */
+  rooms: z.array(RoomCost),
+});
+export type FactoryMetrics = z.infer<typeof FactoryMetrics>;
+
 // ---- client -> server ----
 export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("subscribe"), sessionId: z.string(), afterSeq: z.number().int().nonnegative() }),
@@ -767,6 +895,18 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * poller owns when that happens; this hands back the newest snapshot it took.
    */
   z.object({ kind: z.literal("list_usage") }),
+  /**
+   * Burn rate and cost: how fast each account is spending, how long it has at that rate, and what
+   * this floor's work has cost.
+   *
+   * A **query** over state the server already holds — like `list_usage`, it never triggers a read of
+   * the usage endpoint. The projection comes from the readings the poller has already taken, and the
+   * cost from the event log; asking cannot spend a request against a rate-limited API.
+   *
+   * Scoped to the asking socket's project, because the room half of the answer is (see
+   * `FactoryMetrics`).
+   */
+  z.object({ kind: z.literal("list_metrics") }),
   z.object({
     kind: z.literal("create_account"),
     label: z.string().min(1).max(120),
@@ -1050,5 +1190,10 @@ export const ServerMessage = z.discriminatedUnion("kind", [
     query: z.string(),
     hits: z.array(ChronicleHit),
   }),
+  /**
+   * Burn rate and cost. Pushed on the same occasions as `usage` (a poll finished, a 429 landed) plus
+   * on a turn boundary, because a turn is what changes the cost half.
+   */
+  z.object({ kind: z.literal("metrics"), metrics: FactoryMetrics }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;

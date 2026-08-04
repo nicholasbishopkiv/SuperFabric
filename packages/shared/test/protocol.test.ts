@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
-  ACCOUNT_CREDENTIALS_FILE, AGENT_MODELS, ATTACHMENTS_DIRNAME, AccountInfo, AccountUsage,
+  ACCOUNT_CREDENTIALS_FILE, AGENT_MODELS, ATTACHMENTS_DIRNAME, AccountBurn, AccountInfo, AccountUsage,
   AttachmentUploadResult, AutonomyMode,
   CHRONICLE_SEARCH_LIMIT, ChronicleHit, ClientMessage,
-  DEFAULT_AUTONOMY, LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT,
+  DEFAULT_AUTONOMY, FACTORY_EXPORT_FORMAT, FACTORY_EXPORT_NOTE, FACTORY_EXPORT_VERSION, FactoryExport,
+  FactoryMetrics, LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT,
   MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
   ProjectInfo, RoleSpec, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
   USAGE_POLL_INTERVAL_MS, UsageWindow,
@@ -732,4 +733,52 @@ describe("protocol", () => {
       })).toMatchObject({ sessions: [{ roleId: "architect" }] });
     });
   });
+  /**
+   * M5: burn rate and cost.
+   *
+   * The wire's job here is to make an unknown projection *representable* — a null hour figure with a
+   * reason beside it — because a schema that required a number would have forced a guess into it.
+   */
+  describe("burn rate and cost", () => {
+    const BURN = {
+      accountId: "a1", windowKey: "five_hour", windowLabel: "5-hour", percentPerHour: 12.5,
+      secondsToLimit: 7200, resetsFirst: false, approximate: false, samples: 21, spanSeconds: 3600,
+      unknown: null,
+    } as const;
+    const ROLLUPS = { day: { usd: 0.42, turns: 3 }, week: { usd: 1.75, turns: 11 } } as const;
+
+    it("carries a projection, and carries the absence of one just as precisely", () => {
+      expect(AccountBurn.parse(BURN).secondsToLimit).toBe(7200);
+      // The shape that matters: no figure, and the reason in the operator's words. A schema that made
+      // `secondsToLimit` required would have forced a guess into this position.
+      const unknown = AccountBurn.parse({
+        ...BURN, windowKey: null, windowLabel: null, percentPerHour: null, secondsToLimit: null,
+        samples: 1, spanSeconds: 0, unknown: "only 1 reading of 5-hour so far — a rate needs two",
+      });
+      expect(unknown.secondsToLimit).toBeNull();
+      expect(unknown.unknown).toContain("a rate needs two");
+    });
+
+    it("puts the metrics on the wire with the ambient account reported separately", () => {
+      const metrics = FactoryMetrics.parse({
+        accounts: [{ accountId: "a1", burn: BURN, cost: ROLLUPS }],
+        ambient: ROLLUPS,
+        rooms: [{ roomId: "r1", cost: ROLLUPS }],
+      });
+      expect(metrics.accounts[0]!.cost.week.usd).toBe(1.75);
+      // Agents on the operator's own `~/.claude` have no account row to hang spend on, so they get
+      // their own bucket rather than an invented entry in the account list.
+      expect(metrics.ambient.day.turns).toBe(3);
+      expect(ServerMessage.parse({ kind: "metrics", metrics }).kind).toBe("metrics");
+      expect(ClientMessage.parse({ kind: "list_metrics" }).kind).toBe("list_metrics");
+    });
+
+    it("refuses a negative dollar figure and a utilisation-free projection", () => {
+      expect(() => FactoryMetrics.parse({
+        accounts: [], ambient: { day: { usd: -1, turns: 0 }, week: { usd: 0, turns: 0 } }, rooms: [],
+      })).toThrow();
+    });
+
+  });
+
 });
