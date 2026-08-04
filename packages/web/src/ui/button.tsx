@@ -1,6 +1,7 @@
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 import type * as React from "react";
+import { Hint } from "./tooltip";
 import { cn } from "./utils";
 
 /**
@@ -51,15 +52,25 @@ const buttonVariants = cva(
 export type ButtonProps = React.ComponentProps<"button"> &
   VariantProps<typeof buttonVariants> & { asChild?: boolean };
 
-export function Button({ className, variant, size, asChild = false, ...props }: ButtonProps) {
+/**
+ * `title` is not passed through to the DOM: it becomes a real tooltip.
+ *
+ * The wrapping happens **inside** the button rather than at the call site, and that is what makes
+ * `<PopoverTrigger asChild><Button title="…"/></PopoverTrigger>` keep working — Radix still clones
+ * the `Button` element and its injected props still land on the real `<button>`, because `Hint` sits
+ * under them rather than between them. Wrapping the other way round would have put a plain function
+ * component in the middle of that chain and quietly dropped the trigger's handlers and ref.
+ */
+export function Button({ className, variant, size, asChild = false, title, ...props }: ButtonProps) {
   const Comp = asChild ? Slot : "button";
-  return (
+  const button = (
     <Comp
       data-slot="button"
       className={cn(buttonVariants({ variant, size }), className)}
       {...props}
     />
   );
+  return <Hint text={title}>{button}</Hint>;
 }
 
 export { buttonVariants };

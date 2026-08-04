@@ -1,5 +1,6 @@
 import { STATUS_COLOR } from "../scene/palette";
 import type { FactoryStatus } from "../store";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 
 /**
@@ -20,16 +21,19 @@ export function StatusDot({
   className?: string;
 }) {
   return (
-    <span
-      title={title ?? status}
-      aria-label={status}
-      className={cn("inline-block size-2 shrink-0 rounded-full", className)}
-      style={{
-        background: STATUS_COLOR[status],
-        // An idle dot must not read as a light that is on; no halo says "known, quiet". A paused
-        // one keeps a faint halo: it *is* an unusual state, even though it is a calm one.
-        boxShadow: status === "idle" ? "none" : `0 0 ${status === "paused" ? 4 : 7}px ${STATUS_COLOR[status]}`,
-      }}
-    />
+    // `aria-label` stays alongside the tooltip: a tooltip is not an accessible name, and this dot
+    // has no text of its own for a screen reader to fall back on.
+    <Hint text={title ?? status}>
+      <span
+        aria-label={status}
+        className={cn("inline-block size-2 shrink-0 rounded-full", className)}
+        style={{
+          background: STATUS_COLOR[status],
+          // An idle dot must not read as a light that is on; no halo says "known, quiet". A paused
+          // one keeps a faint halo: it *is* an unusual state, even though it is a calm one.
+          boxShadow: status === "idle" ? "none" : `0 0 ${status === "paused" ? 4 : 7}px ${STATUS_COLOR[status]}`,
+        }}
+      />
+    </Hint>
   );
 }

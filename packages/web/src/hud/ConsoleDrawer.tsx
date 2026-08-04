@@ -20,6 +20,7 @@ import { Input } from "../ui/input";
 import { ScrollArea } from "../ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import { Tabs, TabsList, TabsTrigger } from "../ui/tabs";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 import { send, subscribe } from "../wsClient";
 import { AutonomySelect, BypassWarning } from "./AutonomySelect";
@@ -58,12 +59,9 @@ function PackageSender() {
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      <span
-        className="text-2xs text-fg-faint"
-        title="No message behind it — real bus traffic animates on its own."
-      >
-        Belt demo
-      </span>
+      <Hint text="No message behind it — real bus traffic animates on its own.">
+        <span className="text-2xs text-fg-faint">Belt demo</span>
+      </Hint>
       <Select value={source} onValueChange={setFrom}>
         <SelectTrigger aria-label="Package from" className="w-28">
           <SelectValue />
@@ -116,15 +114,17 @@ function StagedRow() {
         >
           <PaperclipIcon />
           <span className="truncate">{a.name}</span>
-          <button
-            type="button"
-            aria-label={`Remove ${a.name}`}
-            title="Take it out of the message — the file stays on disk"
-            onClick={() => unstage(a.path)}
-            className="shrink-0 rounded-full p-0.5 hover:bg-accent/25"
-          >
-            <XIcon className="size-2.5" />
-          </button>
+          {/* `aria-label` stays: a tooltip is not an accessible name, and this button is an icon. */}
+          <Hint text="Take it out of the message — the file stays on disk">
+            <button
+              type="button"
+              aria-label={`Remove ${a.name}`}
+              onClick={() => unstage(a.path)}
+              className="shrink-0 rounded-full p-0.5 hover:bg-accent/25"
+            >
+              <XIcon className="size-2.5" />
+            </button>
+          </Hint>
         </Badge>
       ))}
       {uploading && <span className="text-2xs text-fg-faint">saving…</span>}
@@ -234,12 +234,12 @@ export function ConsoleDrawer() {
       summary={sessions.length}
       summaryTitle={`Open the console — ${sessions.length} session${sessions.length === 1 ? "" : "s"}`}
       headerExtra={
+        <Hint text={connected ? "Connected to the server" : "The socket dropped — retrying"}>
         <span
           className={cn(
             "ml-auto inline-flex items-center gap-1 text-2xs",
             connected ? "text-status-working" : "text-status-error",
           )}
-          title={connected ? "Connected to the server" : "The socket dropped — retrying"}
         >
           <span
             className={cn(
@@ -249,6 +249,7 @@ export function ConsoleDrawer() {
           />
           {connected ? "connected" : "reconnecting…"}
         </span>
+        </Hint>
       }
       className="w-[min(520px,44vw)]"
       contentClassName="overflow-hidden"

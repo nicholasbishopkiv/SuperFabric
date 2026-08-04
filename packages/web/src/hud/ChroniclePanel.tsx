@@ -6,6 +6,7 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 import { searchChronicle } from "../wsClient";
 
@@ -87,10 +88,10 @@ function HitRow({ hit }: { hit: ChronicleHit }) {
           </div>
           <p className="mt-0.5 break-words text-2xs leading-snug text-fg-muted">{hit.snippet}</p>
           {hit.path !== null && (
+            <Hint text={`Copy ${hit.path} — the ADR file is in the repository, open it in your editor`}>
             <button
               type="button"
               onClick={() => copyPath(hit.path!)}
-              title={`Copy ${hit.path} — the ADR file is in the repository, open it in your editor`}
               className={cn(
                 "mt-1 flex max-w-full items-center gap-1 rounded-[2px] text-left font-mono text-2xs",
                 "underline underline-offset-2 outline-none focus-visible:ring-1 focus-visible:ring-accent",
@@ -100,6 +101,7 @@ function HitRow({ hit }: { hit: ChronicleHit }) {
               <CopyIcon className="size-2.5 shrink-0" />
               <span className="truncate">{copied ? "path copied" : hit.path}</span>
             </button>
+            </Hint>
           )}
         </div>
       </div>
