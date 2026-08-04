@@ -45,6 +45,11 @@
   --text-xs--line-height: 1.0625rem;
   --text-sm: 0.8125rem; /* 13px — the HUD's body size */
   --text-sm--line-height: 1.15rem;
+  /* 15px — an entity's own name: a room, an account, a session. The one step *up*, and deliberately
+     the only one: three sizes within two points of each other gave the eye no entry point, and a
+     fourth would start competing with the floor. Controls never use it — see `ui/button.tsx`. */
+  --text-md: 0.9375rem;
+  --text-md--line-height: 1.3rem;
 
   --animate-pop: pop 110ms ease-out;
 }
@@ -91,6 +96,28 @@
      this class, and a test holds the two together. */
   .sf-scene-overlay {
     pointer-events: none !important;
+  }
+
+  /**
+   * The frame, shaded.
+   *
+   * The slab is a pale warm concrete (`scene/palette.ts` argues for it, and is right) and the panels
+   * are a cool near-black. Before this they met at a hard edge and the two halves of the screen read
+   * as different applications. Darkening the *viewport's* corners is the cheapest honest fix: the
+   * scene keeps every colour it had, and nothing about the floor's own reading changes.
+   *
+   * `pointer-events: none` is load-bearing rather than tidy. This is a full-viewport element over
+   * the canvas, so hit-testing would make the whole floor undraggable — the same class of bug
+   * `scene/SceneOverlay.tsx` exists to prevent, arriving from the other direction.
+   *
+   * `z-10` puts it above the canvas and below every panel (`z-30`) and the top strip (`z-40`).
+   */
+  .floor-vignette {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    pointer-events: none;
+    background: radial-gradient(ellipse at 50% 45%, transparent 45%, rgba(9, 13, 18, 0.45) 100%);
   }
 
   /* Panels scroll a lot and are small; the platform scrollbar is too wide and too bright for one. */

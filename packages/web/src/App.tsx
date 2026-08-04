@@ -26,6 +26,10 @@ export default function App() {
   return (
     <>
       <FactoryScene />
+      {/* Shades the frame so the warm slab does not run flush into a cool near-black panel. Purely
+          decorative, never hit-tested — see `.floor-vignette` in `index.css`, where the
+          `pointer-events` rule is the load-bearing part. */}
+      <div className="floor-vignette" aria-hidden />
       {/* Three overlays, three edges: rooms on the left, the one-agent console on the right, the
           task board along the bottom between them. The top edge carries only the two switchers —
           which factory this tab is looking at, and which accounts it can run agents on — and is

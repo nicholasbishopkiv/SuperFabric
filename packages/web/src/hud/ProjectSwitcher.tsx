@@ -4,6 +4,7 @@ import { useActiveProject, useFabric, useProjects } from "../store";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 import { createProject, deleteProject, openProject } from "../wsClient";
 import { ConfirmDelete } from "./ConfirmDelete";
@@ -90,10 +91,10 @@ export function ProjectSwitcher() {
                       : "border-transparent hover:border-line hover:bg-fg/5",
                   )}
                 >
+                  <Hint text={p.root}>
                   <button
                     onClick={() => switchTo(p.id)}
                     disabled={!connected}
-                    title={p.root}
                     className={cn(
                       "min-w-0 flex-1 px-2 py-1 text-left outline-none",
                       "focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-40",
@@ -104,6 +105,7 @@ export function ProjectSwitcher() {
                     </div>
                     <div className="break-all font-mono text-2xs text-fg-muted">{p.root}</div>
                   </button>
+                  </Hint>
                   {/* Removing a factory belongs next to the factory, not in a settings screen — but
                       it must never be the control the pointer lands on while switching, so it stays
                       out of sight until this row is hovered or something in it has focus. */}

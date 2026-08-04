@@ -15,6 +15,7 @@ import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 import { send } from "../wsClient";
 import { EdgePanel } from "./Panel";
@@ -63,6 +64,22 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
 const STATUS_TINT: Partial<Record<TaskStatus, string>> = { blocked: "text-status-blocked" };
 
 /**
+ * What an empty column says.
+ *
+ * It used to say `—`, five times over, which is how a board with three tasks on it read as a board
+ * that was broken. A dash is not an empty state: it is the absence of one, and at this size it looks
+ * like a value that failed to load. Each of these is a small piece of good news — *nothing is
+ * blocked* is a thing an operator is glad to read — so they are worth the words.
+ */
+const EMPTY_LABEL: Record<TaskStatus, string> = {
+  open: "nothing open",
+  in_progress: "nobody working",
+  blocked: "nothing blocked",
+  review: "nothing to review",
+  done: "nothing finished yet",
+};
+
+/**
  * The unassigned card's affordance: ask the orchestrator where this belongs.
  *
  * **It asks; it never assigns.** `route_task` sends the orchestrator a message describing the task
@@ -78,29 +95,27 @@ function RouteIt({ taskId }: { taskId: string }) {
 
   if (!hasOrchestrator) {
     return (
-      <span
-        className="italic text-fg-faint"
-        title="Unassigned. Routing needs an orchestrator — create one in the project room's panel."
-      >
-        unassigned — no orchestrator
-      </span>
+      <Hint text="Unassigned. Routing needs an orchestrator — create one in the project room's panel.">
+        <span className="italic text-fg-faint">unassigned — no orchestrator</span>
+      </Hint>
     );
   }
 
   return (
-    <button
-      onClick={() => send({ kind: "route_task", taskId })}
-      disabled={!connected}
-      title="Ask the orchestrator which room this belongs to. It stays unassigned until it answers."
-      className={cn(
-        "inline-flex items-center gap-0.5 rounded-[2px] text-accent underline underline-offset-2",
-        "outline-none hover:text-accent/80 focus-visible:ring-1 focus-visible:ring-accent",
-        "disabled:pointer-events-none disabled:opacity-40",
-      )}
-    >
-      <SignpostIcon className="size-2.5" />
-      route it
-    </button>
+    <Hint text="Ask the orchestrator which room this belongs to. It stays unassigned until it answers.">
+      <button
+        onClick={() => send({ kind: "route_task", taskId })}
+        disabled={!connected}
+        className={cn(
+          "inline-flex items-center gap-0.5 rounded-[2px] text-accent underline underline-offset-2",
+          "outline-none hover:text-accent/80 focus-visible:ring-1 focus-visible:ring-accent",
+          "disabled:pointer-events-none disabled:opacity-40",
+        )}
+      >
+        <SignpostIcon className="size-2.5" />
+        route it
+      </button>
+    </Hint>
   );
 }
 
@@ -117,9 +132,9 @@ const TaskCard = memo(function TaskCard({ task }: { task: TaskInfo }) {
         blocked ? "border-status-blocked/60" : "border-line",
       )}
     >
-      <div className="truncate text-xs text-fg" title={task.detail === "" ? task.title : task.detail}>
-        {task.title}
-      </div>
+      <Hint text={task.detail === "" ? task.title : task.detail}>
+        <div className="truncate text-xs text-fg">{task.title}</div>
+      </Hint>
       <div className="mt-0.5 flex flex-wrap items-center gap-1 text-2xs">
         {room === undefined ? (
           // Not a failure and not a placeholder: an unrouted task is the intended state of a task
@@ -127,27 +142,27 @@ const TaskCard = memo(function TaskCard({ task }: { task: TaskInfo }) {
           // being decided. See `RouteIt`.
           <RouteIt taskId={task.id} />
         ) : (
-          <button
-            onClick={() => selectRoom(room.id)}
-            title={`Show the ${room.name} room on the floor`}
-            className="rounded-[2px] text-accent underline underline-offset-2 hover:text-accent/80"
-          >
-            {room.name}
-          </button>
+          <Hint text={`Show the ${room.name} room on the floor`}>
+            <button
+              onClick={() => selectRoom(room.id)}
+              className="rounded-[2px] text-accent underline underline-offset-2 hover:text-accent/80"
+            >
+              {room.name}
+            </button>
+          </Hint>
         )}
         {task.agentId !== null && (
-          <code className="font-mono text-fg-faint" title={task.agentId}>
-            {task.agentId.slice(0, 8)}
-          </code>
+          <Hint text={task.agentId}>
+            <code className="font-mono text-fg-faint">{task.agentId.slice(0, 8)}</code>
+          </Hint>
         )}
         {blocked && (
-          <span
-            className="inline-flex items-center gap-0.5 text-status-blocked"
-            title={`Waiting on bus message ${task.blockedOnMessageId}`}
-          >
-            <FlagIcon className="size-2.5" />
-            waiting on another room
-          </span>
+          <Hint text={`Waiting on bus message ${task.blockedOnMessageId}`}>
+            <span className="inline-flex items-center gap-0.5 text-status-blocked">
+              <FlagIcon className="size-2.5" />
+              waiting on another room
+            </span>
+          </Hint>
         )}
       </div>
     </li>
@@ -167,10 +182,18 @@ function StatusGroup({ status, tasks }: { status: TaskStatus; tasks: TaskInfo[] 
         )}
       >
         {STATUS_LABEL[status]}
-        <span className="font-normal tabular-nums text-fg-faint">{tasks.length}</span>
+        {tasks.length > 0 && (
+          <Badge className="font-normal" variant={status === "blocked" ? "warn" : "neutral"}>
+            {tasks.length}
+          </Badge>
+        )}
       </h3>
+      {/* A dashed slot the size of a card, rather than a sentence floating beside four bordered ones:
+          the column keeps its shape, and the shape says "a card could go here". */}
       {tasks.length === 0 ? (
-        <div className="text-2xs text-fg-faint/60">—</div>
+        <div className="rounded-[4px] border border-dashed border-line-strong/70 px-2 py-1.5 text-2xs text-fg-faint">
+          {EMPTY_LABEL[status]}
+        </div>
       ) : (
         <ul className="space-y-1">
           {tasks.map((t) => (

@@ -4,6 +4,8 @@ import { CircleAlertIcon, PauseIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { STATUS_COLOR } from "../scene/palette";
 import { Badge } from "../ui/badge";
+import { Progress } from "../ui/progress";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 
 /**
@@ -100,41 +102,40 @@ function Meter({ window, approximate, now }: { window: UsageWindow; approximate:
           {approximate ? "≈" : ""}{Math.round(window.utilization)}%
         </span>
       </div>
-      <div
-        className="relative mt-0.5 h-1.5 overflow-hidden rounded-full bg-panel-sunken"
-        role="meter"
-        aria-label={`${window.label}${approximate ? " (estimated)" : ""}`}
-        aria-valuenow={Math.round(window.utilization)}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        title={window.detail ?? undefined}
-      >
-        <div
-          className="h-full rounded-full transition-[width] duration-500"
-          style={{
-            width: `${percent}%`,
-            // Solid for a reading, hatched for a guess. The texture is the point: it survives a
-            // screenshot, a colour-blind reader and a glance from across the desk, none of which a
-            // tooltip does.
+      <Hint text={window.detail}>
+        <Progress
+          className="mt-0.5"
+          value={percent}
+          aria-label={`${window.label}${approximate ? " (estimated)" : ""}`}
+          // Solid for a reading, hatched for a guess. The texture is the point: it survives a
+          // screenshot, a colour-blind reader and a glance from across the desk, none of which a
+          // tooltip does.
+          fill={{
             background: approximate
               ? `repeating-linear-gradient(115deg, ${color} 0 3px, transparent 3px 6px)`
               : color,
             opacity: approximate ? 0.85 : 1,
           }}
-        />
-        {/* The two lines the scheduler actually acts on, drawn from the server's own constants. */}
-        {[LIMIT_WARN_PERCENT, LIMIT_PAUSE_PERCENT].map((mark) => (
-          <span
-            key={mark}
-            aria-hidden
-            className="absolute top-0 h-full w-px bg-fg/25"
-            style={{ left: `${mark}%` }}
-            title={mark === LIMIT_WARN_PERCENT ? "agents are warned here" : "agents are paused here"}
-          />
-        ))}
-      </div>
+        >
+          {/* The two lines the scheduler actually acts on, drawn from the server's own constants. */}
+          {[LIMIT_WARN_PERCENT, LIMIT_PAUSE_PERCENT].map((mark) => (
+            <Hint
+              key={mark}
+              text={mark === LIMIT_WARN_PERCENT ? "agents are warned here" : "agents are paused here"}
+            >
+              <span
+                aria-hidden
+                className="absolute top-0 h-full w-px bg-fg/25"
+                style={{ left: `${mark}%` }}
+              />
+            </Hint>
+          ))}
+        </Progress>
+      </Hint>
       <div className="mt-0.5 flex gap-1 text-2xs text-fg-faint">
-        <span title={reset.title}>{reset.short}</span>
+        <Hint text={reset.title}>
+          <span>{reset.short}</span>
+        </Hint>
         {window.detail !== null && <span className="ml-auto truncate">{window.detail}</span>}
       </div>
     </li>

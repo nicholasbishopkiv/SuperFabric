@@ -2,6 +2,7 @@ import type { AccountBurn, CostRollups } from "@superfabric/shared";
 import { LIMIT_PAUSE_PERCENT } from "@superfabric/shared";
 import { CircleHelpIcon, FlameIcon, RotateCcwIcon } from "lucide-react";
 import { STATUS_COLOR } from "../scene/palette";
+import { Hint } from "../ui/tooltip";
 
 /**
  * How long this account has, and what its work has cost.
@@ -75,7 +76,8 @@ function CostLine({ cost }: { cost: CostRollups }) {
     + "pricing table. On a subscription no money changes hands per turn, so this is a cost-equivalent, "
     + "and a turn whose result reported no cost is not counted.";
   return (
-    <div className="mt-0.5 flex items-baseline gap-1.5 text-2xs text-fg-faint" title={title}>
+    <Hint text={title}>
+    <div className="mt-0.5 flex items-baseline gap-1.5 text-2xs text-fg-faint">
       <span>cost-equivalent</span>
       <span className="ml-auto shrink-0 font-mono tabular-nums text-fg-muted">
         ≈{formatUsd(cost.day.usd)} <span className="text-fg-faint">/ 24 h</span>
@@ -84,6 +86,7 @@ function CostLine({ cost }: { cost: CostRollups }) {
         ≈{formatUsd(cost.week.usd)} <span className="text-fg-faint">/ 7 d</span>
       </span>
     </div>
+    </Hint>
   );
 }
 
@@ -119,17 +122,20 @@ export function BurnRate({ burn, cost }: { burn: AccountBurn | undefined; cost: 
           <span className="text-2xs text-fg-muted">
             at this {burn.approximate ? "estimated " : ""}rate
           </span>
-          <span
-            className="font-mono text-xs font-semibold tabular-nums"
-            style={{ color: urgencyColor(burn.secondsToLimit) }}
-            title={
+          <Hint
+            text={
               `${burn.windowLabel ?? "this window"} reaches ${LIMIT_PAUSE_PERCENT} % — the point at `
               + "which agents on this account are paused — from "
               + `${burn.samples} readings over ${Math.round(burn.spanSeconds / 60)} min`
             }
           >
-            {formatRemaining(burn.secondsToLimit)}
-          </span>
+            <span
+              className="font-mono text-xs font-semibold tabular-nums"
+              style={{ color: urgencyColor(burn.secondsToLimit) }}
+            >
+              {formatRemaining(burn.secondsToLimit)}
+            </span>
+          </Hint>
           <span className="ml-auto shrink-0 font-mono text-2xs tabular-nums text-fg-faint">
             {burn.windowLabel} ·{" "}
             {/* The mark travels with the figure wherever the figure goes: a rate off estimated

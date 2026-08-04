@@ -1,5 +1,6 @@
 import { cva, type VariantProps } from "class-variance-authority";
 import type * as React from "react";
+import { Hint } from "./tooltip";
 import { cn } from "./utils";
 
 /**
@@ -26,10 +27,16 @@ const badgeVariants = cva(
   },
 );
 
+/** `title` becomes a real tooltip rather than reaching the DOM — see `ui/button.tsx` for why here. */
 export function Badge({
   className,
   variant,
+  title,
   ...props
 }: React.ComponentProps<"span"> & VariantProps<typeof badgeVariants>) {
-  return <span data-slot="badge" className={cn(badgeVariants({ variant }), className)} {...props} />;
+  return (
+    <Hint text={title}>
+      <span data-slot="badge" className={cn(badgeVariants({ variant }), className)} {...props} />
+    </Hint>
+  );
 }

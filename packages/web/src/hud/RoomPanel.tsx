@@ -28,6 +28,7 @@ import {
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 import { send } from "../wsClient";
 import { AccountSelect } from "./AccountSelect";
@@ -81,21 +82,24 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
 
   return (
     <li>
+      <Hint text={room.path}>
       <button
         onClick={() => selectRoom(roomId)}
-        title={room.path}
         className={cn(
-          "flex w-full items-center gap-2 rounded-[3px] border px-2 py-1 text-left text-sm",
+          "flex w-full items-center gap-2 rounded-[4px] border px-2 py-1.5 text-left text-sm",
           "outline-none transition-colors focus-visible:ring-1 focus-visible:ring-accent",
+          // A room is an entity, so it stands on a surface of its own rather than on the panel — the
+          // middle level of the hierarchy `ui/card.tsx` describes. Before this the list and the form
+          // above it were the same colour, and a department read as a line of text.
           // Selection is cyan everywhere, on the floor and in this list: the two are the same
           // `selectedRoomId`, so they must not be two different colours.
           selected
             ? "border-accent/70 bg-accent/12 text-accent"
-            : "border-transparent text-fg hover:border-line hover:bg-fg/5",
+            : "border-line/70 bg-panel-raised/55 text-fg hover:border-line-strong/70",
         )}
       >
         <StatusDot status={status} />
-        <span className={cn("truncate", selected && "font-semibold")}>{room.name}</span>
+        <span className={cn("truncate text-md", selected && "font-semibold")}>{room.name}</span>
         {room.kind === "project" && (
           <span className="shrink-0 text-2xs text-fg-faint">project</span>
         )}
@@ -121,18 +125,20 @@ const RoomRow = memo(function RoomRow({ roomId }: { roomId: string }) {
               {tasks}
             </Badge>
           )}
-          <span
-            className={cn(
-              "inline-flex items-center gap-0.5 text-2xs tabular-nums",
-              agents > 0 ? "text-fg-muted" : "text-fg-faint",
-            )}
-            title={`${agents} live agent${agents === 1 ? "" : "s"}`}
-          >
-            <BotIcon className="size-3" />
-            {agents}
-          </span>
+          <Hint text={`${agents} live agent${agents === 1 ? "" : "s"}`}>
+            <span
+              className={cn(
+                "inline-flex items-center gap-0.5 text-2xs tabular-nums",
+                agents > 0 ? "text-fg-muted" : "text-fg-faint",
+              )}
+            >
+              <BotIcon className="size-3" />
+              {agents}
+            </span>
+          </Hint>
         </span>
       </button>
+      </Hint>
     </li>
   );
 });
@@ -181,9 +187,9 @@ function OrchestratorLine({ connected }: { connected: boolean }) {
       <FlagIcon className="size-3 shrink-0 text-accent" />
       <span>
         The orchestrator is{" "}
-        <code className="font-mono text-fg-muted" title={orchestrator.id}>
-          {orchestrator.id.slice(0, 8)}
-        </code>{" "}
+        <Hint text={orchestrator.id}>
+          <code className="font-mono text-fg-muted">{orchestrator.id.slice(0, 8)}</code>
+        </Hint>{" "}
         — the figure carrying the standard.
       </span>
     </FieldNote>
@@ -239,25 +245,26 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
     // keeps them both readable instead of squeezing each into a few characters.
     <div className="flex flex-wrap items-center gap-1.5 rounded-[3px] border border-line/60 bg-panel-sunken/40 px-1.5 py-1">
       <StatusDot status={status} title={`${status} · ${agent.state}`} />
-      <code className="font-mono text-2xs text-fg" title={agent.id}>
-        {agent.id.slice(0, 8)}
-      </code>
+      <Hint text={agent.id}>
+        <code className="font-mono text-2xs text-fg">{agent.id.slice(0, 8)}</code>
+      </Hint>
       <span className="text-2xs text-fg-muted">{status}</span>
       {/* A held agent says *when it comes back*, not merely that it stopped. "Paused" with no
           horizon reads as broken; a countdown reads as a thing that is being handled. */}
       {status === "paused" && (
-        <span
-          className="text-2xs text-status-paused"
-          title={
+        <Hint
+          text={
             agent.pausedUntil === null
               ? "Held because its account is at its limit. Nothing said when that lifts, so it resumes as soon as a reading says the window has rolled."
               : new Date(agent.pausedUntil * 1000).toLocaleString()
           }
         >
+        <span className="text-2xs text-status-paused">
           {agent.pausedUntil === null
             ? "waiting for the limit to lift"
             : `resumes ${formatCountdown(new Date(agent.pausedUntil * 1000), now)}`}
         </span>
+        </Hint>
       )}
       {/* Which CLI this agent is. Only when it is not the default: a badge on every row would be
           noise on the machines where every agent is a Claude one, and its absence is unambiguous. */}
@@ -732,9 +739,9 @@ function UnassignedSessions() {
         {sessions.map((s) => (
           <div key={s.id} className="flex flex-wrap items-center gap-1.5">
             <StatusDot status={agentStatus(s)} title={`${agentStatus(s)} · ${s.state}`} />
-            <code className="font-mono text-2xs text-fg" title={s.id}>
-              {s.id.slice(0, 8)}
-            </code>
+            <Hint text={s.id}>
+              <code className="font-mono text-2xs text-fg">{s.id.slice(0, 8)}</code>
+            </Hint>
             <span className="text-2xs text-fg-muted">{s.state}</span>
             {/* The only place a roomless agent can be ended or removed: no building draws it, so
                 there is no room panel to do it from. */}
@@ -807,21 +814,26 @@ export function RoomPanel() {
       <div className="px-3 pb-2">
         <form onSubmit={submit}>
           <div className="flex gap-1.5">
-            <Input
-              name="roomName"
-              value={name}
-              onChange={(e) => {
-                setName(e.target.value);
-                setProblem(null);
-              }}
-              placeholder="new room name…"
-            />
+            {/* The rule is a hint rather than a permanent note. It used to sit under the field as two
+                lines of grey text that were on screen whether or not anyone was typing — which is
+                how a panel ends up with its help weighing as much as its content. It is needed at
+                exactly one moment, and `nameProblem` already catches the moment it is broken. */}
+            <Hint text={`The name is the folder name: ${NAME_RULE}.`} side="bottom">
+              <Input
+                name="roomName"
+                value={name}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  setProblem(null);
+                }}
+                placeholder="new room name…"
+              />
+            </Hint>
             <Button type="submit" variant="accent" disabled={!connected} className="shrink-0">
               <PlusIcon />
               Create
             </Button>
           </div>
-          <FieldNote>The name is the folder name: {NAME_RULE}.</FieldNote>
           {/* The default is `<project>/<name>`, which is what "room = folder" means most of the
               time. A department that lives in a separate repository is the exception, so the field
               for it is out of the way until it is asked for. */}

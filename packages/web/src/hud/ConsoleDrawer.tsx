@@ -17,10 +17,14 @@ import { useFabric, useStagedAttachments } from "../store";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { ScrollArea } from "../ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
+import { Tabs, TabsList, TabsTrigger } from "../ui/tabs";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 import { send, subscribe } from "../wsClient";
 import { AutonomySelect, BypassWarning } from "./AutonomySelect";
+import { collapseRuns } from "./collapseRuns";
 import { ModelNote, ModelSelect } from "./ModelSelect";
 import { EdgePanel, PanelSection } from "./Panel";
 
@@ -55,12 +59,9 @@ function PackageSender() {
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      <span
-        className="text-2xs text-fg-faint"
-        title="No message behind it — real bus traffic animates on its own."
-      >
-        Belt demo
-      </span>
+      <Hint text="No message behind it — real bus traffic animates on its own.">
+        <span className="text-2xs text-fg-faint">Belt demo</span>
+      </Hint>
       <Select value={source} onValueChange={setFrom}>
         <SelectTrigger aria-label="Package from" className="w-28">
           <SelectValue />
@@ -113,15 +114,17 @@ function StagedRow() {
         >
           <PaperclipIcon />
           <span className="truncate">{a.name}</span>
-          <button
-            type="button"
-            aria-label={`Remove ${a.name}`}
-            title="Take it out of the message — the file stays on disk"
-            onClick={() => unstage(a.path)}
-            className="shrink-0 rounded-full p-0.5 hover:bg-accent/25"
-          >
-            <XIcon className="size-2.5" />
-          </button>
+          {/* `aria-label` stays: a tooltip is not an accessible name, and this button is an icon. */}
+          <Hint text="Take it out of the message — the file stays on disk">
+            <button
+              type="button"
+              aria-label={`Remove ${a.name}`}
+              onClick={() => unstage(a.path)}
+              className="shrink-0 rounded-full p-0.5 hover:bg-accent/25"
+            >
+              <XIcon className="size-2.5" />
+            </button>
+          </Hint>
         </Badge>
       ))}
       {uploading && <span className="text-2xs text-fg-faint">saving…</span>}
@@ -231,12 +234,12 @@ export function ConsoleDrawer() {
       summary={sessions.length}
       summaryTitle={`Open the console — ${sessions.length} session${sessions.length === 1 ? "" : "s"}`}
       headerExtra={
+        <Hint text={connected ? "Connected to the server" : "The socket dropped — retrying"}>
         <span
           className={cn(
             "ml-auto inline-flex items-center gap-1 text-2xs",
             connected ? "text-status-working" : "text-status-error",
           )}
-          title={connected ? "Connected to the server" : "The socket dropped — retrying"}
         >
           <span
             className={cn(
@@ -246,6 +249,7 @@ export function ConsoleDrawer() {
           />
           {connected ? "connected" : "reconnecting…"}
         </span>
+        </Hint>
       }
       className="w-[min(520px,44vw)]"
       contentClassName="overflow-hidden"
@@ -254,8 +258,11 @@ export function ConsoleDrawer() {
           `overflow-y: auto` is on the Collapsible content, so this asks for `h-full` to fill it. */}
       <div className="flex h-full min-h-0 flex-col">
         {/* Session tabs. A strip that scrolls sideways rather than wrapping: the number of sessions
-            is unbounded and a wrapping strip would push the transcript off the bottom. */}
-        <div className="hud-scroll flex shrink-0 items-center gap-1 overflow-x-auto border-b border-line px-3 pb-2">
+            is unbounded and a wrapping strip would push the transcript off the bottom. The scrolling
+            is a `ScrollArea` rather than `overflow-x-auto` so the bar is the HUD's own thin thumb,
+            which appears while scrolling and takes no height when it is not — the platform's, at
+            this width, was a permanent grey band across the top of the drawer. */}
+        <div className="flex shrink-0 items-center gap-1 border-b border-line px-3 pb-2">
           <Button
             size="xs"
             variant="accent"
@@ -275,20 +282,23 @@ export function ConsoleDrawer() {
             <PlusIcon />
             session
           </Button>
-          {sessions.map((s) => (
-            <Button
-              key={s.id}
-              size="xs"
-              variant="chip"
-              className="shrink-0 font-mono"
-              data-active={s.id === active}
-              onClick={() => select(s.id)}
-              title={`${s.id} · ${s.state}`}
-            >
-              {s.id.slice(0, 8)}
-              <span className="opacity-60">{s.state}</span>
-            </Button>
-          ))}
+          <Tabs
+            value={active ?? ""}
+            onValueChange={select}
+            className="min-w-0 flex-1"
+            activationMode="manual"
+          >
+            <ScrollArea orientation="horizontal" viewportClassName="pb-1">
+              <TabsList>
+                {sessions.map((s) => (
+                  <TabsTrigger key={s.id} value={s.id} className="font-mono" title={`${s.id} · ${s.state}`}>
+                    {s.id.slice(0, 8)}
+                    <span className="opacity-60">{s.state}</span>
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </ScrollArea>
+          </Tabs>
         </div>
 
         {/* This agent, one line: what it is allowed to do, what it runs on, and how to stop it. */}
@@ -340,8 +350,14 @@ export function ConsoleDrawer() {
               {active === null ? "No session selected — create one." : "No events yet."}
             </div>
           )}
-          {rows.map(({ seq, event }) => (
-            <Entry key={seq} event={event} resolutions={resolutions} onAnswer={answer} />
+          {collapseRuns(rows, entryKey).map(({ first, count }) => (
+            <Entry
+              key={first.seq}
+              event={first.event}
+              count={count}
+              resolutions={resolutions}
+              onAnswer={answer}
+            />
           ))}
         </div>
 
@@ -412,12 +428,37 @@ export function ConsoleDrawer() {
   );
 }
 
+/**
+ * What makes two transcript rows *look* the same, and therefore fold into one.
+ *
+ * Only two kinds may fold, and both are lossless: a status the agent repeated (the forty
+ * consecutive `· starting` lines that made this panel a texture rather than a transcript) and
+ * "thinking…". Everything else keys on its own `seq`, so it can never collapse — a prompt, a reply,
+ * a tool call, an approval and an error are each a distinct event even when two of them read
+ * identically, and folding a pair of them would tell the operator something untrue about what
+ * happened.
+ */
+function entryKey(row: EventRow): string {
+  const { event } = row;
+  if (event.type === "session_status") return `status:${event.status}:${event.detail ?? ""}`;
+  if (event.type === "agent_thinking") return "thinking";
+  return `seq:${row.seq}`;
+}
+
+/** `×17` on a folded row. Nothing at all on a row that stands for itself. */
+function RunCount({ count }: { count: number }) {
+  if (count < 2) return null;
+  return <span className="ml-1 rounded-full bg-fg/10 px-1 text-fg-muted tabular-nums">×{count}</span>;
+}
+
 function Entry({
   event,
+  count,
   resolutions,
   onAnswer,
 }: {
   event: SessionEvent;
+  count: number;
   resolutions: Map<string, "allow" | "deny">;
   onAnswer: (approvalId: string, behavior: "allow" | "deny") => void;
 }) {
@@ -437,7 +478,12 @@ function Entry({
         </p>
       );
     case "agent_thinking":
-      return <p className="my-0.5 text-2xs italic text-fg-faint">thinking…</p>;
+      return (
+        <p className="my-0.5 text-2xs italic text-fg-faint">
+          thinking…
+          <RunCount count={count} />
+        </p>
+      );
     case "tool_use":
       return (
         <p className="my-0.5 font-mono text-2xs text-fg-muted">
@@ -462,6 +508,7 @@ function Entry({
         <p className="my-0.5 text-2xs text-fg-faint">
           · {event.status}
           {event.detail !== undefined ? ` — ${event.detail}` : ""}
+          <RunCount count={count} />
         </p>
       );
     case "turn_complete":

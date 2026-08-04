@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 import { installHudTokens } from "./hud/tokens";
+import { TooltipProvider } from "./ui/tooltip";
 import "./index.css";
 
 const root = document.getElementById("root");
@@ -13,6 +14,11 @@ installHudTokens();
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    {/* One provider for the whole HUD: Radix requires an ancestor, and sharing it is what makes the
+        delay group work — moving between two adjacent controls shows the second tooltip at once
+        instead of waiting out the delay again. */}
+    <TooltipProvider>
+      <App />
+    </TooltipProvider>
   </StrictMode>,
 );

@@ -1,6 +1,7 @@
 import { TerminalIcon } from "lucide-react";
 import { useFabric } from "../store";
 import { FieldNote } from "../ui/input";
+import { Hint } from "../ui/tooltip";
 import { cn } from "../ui/utils";
 
 /**
@@ -58,9 +59,9 @@ export function Toolchain() {
               />
               <span className="min-w-0">
                 <span className="text-2xs text-fg">{t.name}</span>{" "}
-                <code className="font-mono text-2xs text-fg-muted" title={t.path ?? undefined}>
-                  {t.command}
-                </code>{" "}
+                <Hint text={t.path}>
+                  <code className="font-mono text-2xs text-fg-muted">{t.command}</code>
+                </Hint>{" "}
                 <span className="text-2xs text-fg-faint">
                   · {signInLine(t.signedIn)}
                 </span>

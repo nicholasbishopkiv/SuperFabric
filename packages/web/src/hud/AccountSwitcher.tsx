@@ -1,4 +1,4 @@
-import type { AccountInfo, AccountUsage } from "@superfabric/shared";
+import type { AccountInfo, AccountMetrics } from "@superfabric/shared";
 import { AGENT_PROVIDERS, DEFAULT_AGENT_PROVIDER } from "@superfabric/shared";
 import {
   CheckIcon,
@@ -18,10 +18,13 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
+import { Progress } from "../ui/progress";
 import { Toolchain } from "./Toolchain";
 import { cn } from "../ui/utils";
-import { LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT } from "@superfabric/shared";
-import { BurnRate, formatUsd } from "./BurnRate";
+import { LIMIT_PAUSE_PERCENT } from "@superfabric/shared";
+import { STATUS_COLOR } from "../scene/palette";
+import { BurnRate, formatRemaining, formatUsd } from "./BurnRate";
+import { type LimitHeadline, limitHeadline, type LimitSeverity, SILENCE_TEXT } from "./limitHeadline";
 import { UsageMeters } from "./UsageMeters";
 import { send } from "../wsClient";
 
@@ -44,22 +47,76 @@ import { send } from "../wsClient";
  * answered without opening anything.
  */
 
-/** The fullest meter anywhere, which is what the trigger has room to say. */
-function worstReading(usage: readonly AccountUsage[]): { percent: number; approximate: boolean } | null {
-  let worst: { percent: number; approximate: boolean } | null = null;
-  for (const account of usage) {
-    for (const window of account.windows) {
-      if (worst === null || window.utilization > worst.percent) {
-        worst = { percent: window.utilization, approximate: account.approximate };
-      }
-    }
-  }
-  return worst;
-}
-
 /** Whether the trigger should be warning-coloured: an account exists but cannot run anything yet. */
 function anyNeedsLogin(accounts: readonly AccountInfo[]): boolean {
   return accounts.some((a) => !a.credentialsPresent);
+}
+
+/** A stable empty array, so the metrics selector does not hand `useShallow` a new one each render. */
+const EMPTY_METRICS: readonly AccountMetrics[] = [];
+
+const SEVERITY_COLOR: Record<Exclude<LimitSeverity, "none">, string> = {
+  ok: STATUS_COLOR.working,
+  warn: STATUS_COLOR.blocked,
+  critical: STATUS_COLOR.error,
+};
+
+/**
+ * How much subscription is left, on the one control that is always on screen.
+ *
+ * The trigger has carried the worst percentage for a while. What it could not do was speak when
+ * there was **no** percentage: with no accounts configured — the state a fresh machine is in — it
+ * rendered nothing, and nothing reads as "fine" while `scheduler.ts` is standing by to pause every
+ * agent on the floor at `LIMIT_PAUSE_PERCENT`. Each of the three silences is now a different
+ * sentence, decided in `limitHeadline.ts` where it can be tested.
+ *
+ * The second addition is the **duration**. "At this rate you have about two hours" is what an
+ * operator plans an afternoon around; a percentage is what they then have to convert. It is absent
+ * far more often than it is present, so it degrades in two steps — the server's own reason when it
+ * was asked and could not answer, and a bare dash when nothing has been measured yet. Those are
+ * different facts and `BurnRate` already distinguishes them; flattening them here would undo that.
+ */
+function LimitReadout({ head }: { head: LimitHeadline }) {
+  if (head.silence !== null) {
+    return <span className="text-2xs font-normal text-fg-faint">{SILENCE_TEXT[head.silence]}</span>;
+  }
+
+  const color = SEVERITY_COLOR[head.severity === "none" ? "ok" : head.severity];
+  const percent = Math.round(head.utilization ?? 0);
+
+  return (
+    <>
+      <Progress
+        value={percent}
+        aria-hidden
+        className="h-1 w-10 shrink-0"
+        // Solid for a reading, hatched for a guess — the same texture `UsageMeters` uses, because it
+        // is the one mark that survives a screenshot and a colour-blind reader.
+        fill={{
+          background: head.approximate
+            ? `repeating-linear-gradient(115deg, ${color} 0 3px, transparent 3px 6px)`
+            : color,
+        }}
+      />
+      <span className="shrink-0 font-mono text-2xs tabular-nums" style={{ color }}>
+        {head.approximate ? "≈" : ""}{percent}%
+      </span>
+      {/* The duration, and the one place a blank is the honest rendering.
+          "Nothing has been measured yet" gets nothing: the percentage beside it is already on
+          screen, so an absence here cannot read as "you are fine" — which is the failure this whole
+          surface exists to prevent — whereas a bare em-dash butted against `100%` reads as a minus
+          sign. Asked-and-unanswerable is different and still says so in words: that is a refusal the
+          server made, and `BurnRate` keeps the two apart for the same reason. */}
+      {(head.secondsToLimit !== null || head.burnUnknown !== null) && (
+        <span className="shrink-0 font-mono text-2xs font-normal tabular-nums text-fg-faint">
+          ·{" "}
+          {head.secondsToLimit !== null
+            ? formatRemaining(head.secondsToLimit).replace(/^about /, "≈")
+            : "unknown"}
+        </span>
+      )}
+    </>
+  );
 }
 
 /**
@@ -305,6 +362,7 @@ export function AccountSwitcher() {
   const [configDir, setConfigDir] = useState("");
   const accounts = useAccounts();
   const usage = useUsage();
+  const accountMetrics = useFabric(useShallow((s) => s.metrics?.accounts ?? EMPTY_METRICS));
   const connected = useFabric((s) => s.connected);
   const clearError = useFabric((s) => s.clearError);
 
@@ -320,8 +378,11 @@ export function AccountSwitcher() {
   }
 
   const needsLogin = anyNeedsLogin(accounts);
-  const worst = worstReading(usage);
   const anyLimited = usage.some((u) => u.limited);
+  // One decision, made in one place and tested there: which account is worst, how loud that is, and
+  // — the part the trigger could not say before — what to put where the number goes when there is no
+  // number at all. See `limitHeadline.ts`.
+  const head = limitHeadline(accounts, usage, accountMetrics);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -329,11 +390,28 @@ export function AccountSwitcher() {
         <Button
           variant="outline"
           size="md"
-          className="bg-panel/80 backdrop-blur-xl"
+          className={cn(
+            "bg-panel/80 backdrop-blur-xl",
+            // The control itself takes the colour once the scheduler is about to act. Below the warn
+            // threshold it stays ordinary chrome: a limit meter that is loud all the time is a limit
+            // meter nobody reads.
+            head.severity === "warn" && "border-status-blocked/60 bg-status-blocked/10",
+            head.severity === "critical" && "border-status-error/60 bg-status-error/10",
+          )}
           title={
-            accounts.length === 0
-              ? "No accounts yet — agents run on your own ~/.claude"
-              : `${accounts.length} account${accounts.length === 1 ? "" : "s"}`
+            head.silence === "no-accounts"
+              ? "No accounts yet — agents run on this machine's ambient CLI configuration, whose limits SuperFabric cannot read"
+              : head.silence === "not-logged-in"
+                ? "An account is configured but has no credentials yet, so nothing can be read from it"
+                : head.silence === "no-reading"
+                  ? "The monitor polls every three minutes. The meters appear after the first reading."
+                  : `${head.windowLabel} on ${head.accountLabel} is ${head.approximate ? "about " : ""}`
+                    + `${Math.round(head.utilization ?? 0)}% full. Agents on this account are paused at `
+                    + `${LIMIT_PAUSE_PERCENT}%.`
+                    + (head.approximate
+                      ? " This reading is counted from this machine's transcripts rather than read from the provider — it cannot see your other devices."
+                      : "")
+                    + (head.burnUnknown !== null ? ` No projection: ${head.burnUnknown}.` : "")
           }
         >
           <CircleUserIcon
@@ -344,28 +422,7 @@ export function AccountSwitcher() {
           <span className="font-semibold tabular-nums">
             {accounts.length === 0 ? "Accounts" : accounts.length}
           </span>
-          {/* The fullest window across every subscription, so "am I about to run out" is answerable
-              without opening anything. `≈` when the number behind it is an estimate — the mark
-              travels with the figure wherever the figure goes. */}
-          {worst !== null && (
-            <span
-              className="font-mono text-2xs tabular-nums"
-              style={{
-                color: worst.percent >= LIMIT_PAUSE_PERCENT
-                  ? "var(--color-status-error)"
-                  : worst.percent >= LIMIT_WARN_PERCENT
-                    ? "var(--color-status-blocked)"
-                    : undefined,
-              }}
-              title={
-                worst.approximate
-                  ? "The fullest limit window across your accounts — estimated, not read from Anthropic"
-                  : "The fullest limit window across your accounts"
-              }
-            >
-              {worst.approximate ? "≈" : ""}{Math.round(worst.percent)}%
-            </span>
-          )}
+          <LimitReadout head={head} />
           <ChevronsUpDownIcon className="text-fg-faint" />
         </Button>
       </PopoverTrigger>
