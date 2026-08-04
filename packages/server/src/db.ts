@@ -268,7 +268,50 @@ const MIGRATIONS: readonly Migration[] = [
   `
     ALTER TABLE rooms ADD COLUMN runtime TEXT NOT NULL DEFAULT 'host';
   `,
+  // 15 — repair: add `usage_snapshots.limited_by` to databases that were stamped past step 11
+  // before that column was in it.
+  //
+  // This step exists because the rule at the top of this file was broken. `limited_by` was appended
+  // to step 11 *after* step 11 had shipped, so a database created from the final code has the column
+  // and one that had already applied the earlier step 11 does not — and, being stamped at 11 or
+  // above, never runs it again. Every test starts from a fresh database, which is exactly why the
+  // suite could not see it; the first operator to run a long-lived `.fabrica/fabrica.db` hit
+  // `SQLiteError: table usage_snapshots has no column named limited_by` on boot instead.
+  //
+  // A function rather than SQL because it has to be a no-op on the databases that already have the
+  // column: `ADD COLUMN` is an error, not a shrug, when the name is taken, and this step must be
+  // safe on both histories. `migrationFingerprints()` now enforces the rule this repairs, so the
+  // next person cannot make the same edit quietly.
+  (db) => {
+    const has = db
+      .query("SELECT 1 FROM pragma_table_info('usage_snapshots') WHERE name = 'limited_by'")
+      .get();
+    if (has == null) db.exec("ALTER TABLE usage_snapshots ADD COLUMN limited_by TEXT;");
+  },
 ];
+
+/**
+ * A stable fingerprint per shipped migration step, so editing one fails the suite.
+ *
+ * The rule "never edit a shipped step" was a comment, and a comment did not stop step 11 being
+ * edited after it shipped (see step 15). This makes the rule checkable: `migrations.test.ts` holds
+ * the fingerprints of every step that has shipped, so changing one is a red test that says to append
+ * a step instead, and adding one is a deliberate line in that table.
+ *
+ * SQL comments are stripped and whitespace collapsed before hashing, so reindenting a step or
+ * rewriting the prose above a statement stays free — what is frozen is the statements themselves.
+ * Function steps hash their source under the same normalisation.
+ */
+export function migrationFingerprints(): string[] {
+  return MIGRATIONS.map((step) => {
+    const source = typeof step === "string" ? step : step.toString();
+    const normalised = source
+      .replace(/--[^\n]*/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return Bun.hash(normalised).toString(16);
+  });
+}
 
 /**
  * The event types worth indexing, and the JSON path each keeps its text at.
