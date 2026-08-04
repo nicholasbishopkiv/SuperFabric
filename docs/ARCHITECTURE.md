@@ -139,8 +139,24 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   executors (Codex / ChatGPT agents, Antigravity / Gemini, etc.) plug in without
   reworking the core — different providers for different tasks. (Pattern proven by
   Vibe Kanban's executor profiles.)
-- **Onboarder** — special short-lived session that interviews the user (via UI chat) and
-  writes CLAUDE.md / README / room docs for a fresh project.
+- **Onboarding** (`src/onboarding.ts`, migration 13, built in M1c) — first contact with a project
+  nobody has written down. Deliberately **not** a special kind of session: `start_onboarding` creates
+  an *ordinary* session in the project room wearing the `onboarding` role, exactly as
+  `ensureOrchestrator` does — same runtime, same event log, same console — and sends it one turn.
+  The charter (`roles/onboarding.yaml`) is what makes it an interviewer, and it says **one question
+  per turn** in as many words. It writes `CLAUDE.md` and `README.md` with its own file tools, into
+  its own cwd; there is no special write path for them.
+  - **Detection is a file**: a project is un-onboarded iff there is no `CLAUDE.md` at its root
+    (`PROJECT_CHARTER_FILE`), re-stated on every ask because the thing that changes it is an agent
+    writing a file. No heuristic over folder contents — a guess would offer to interview someone
+    about a repository they documented last year, and they could not correct it.
+  - **The rooms it proposes are proposals.** `factory_suggest_rooms` (offered only to a session whose
+    row carries the onboarding role) records rows in `room_suggestions` and creates nothing — no
+    folder, no room, no charter. The operator sees an accept/edit list and approves; approving calls
+    the ordinary `RoomManager.createRoom`, so name safety, root containment and
+    never-overwriting-a-charter all still apply *because it is the same code path*. A factory that
+    reorganised itself on an interview's say-so is not what an operator wants on first contact.
+    A suggestion `createRoom` refuses stays `proposed` with the reason on it; the rest are created.
 - **Chronicle** — the project's decision memory: a persistent, queryable record of
   *why* things were done one way and not another. Two layers:
   1. **Decision records as files** — `docs/decisions/NNNN-<slug>.md` (ADR-style: title,
@@ -161,13 +177,19 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   by construction — including an `EventStore.append` that has never heard of the Chronicle.
   The operator searches the same index over the wire (`search_chronicle` → `chronicle`), shown in a
   popover off the top strip; an empty query answers with the newest decisions.
-- **RoleLibrary** — catalog of role presets shipping with Fabrica (architect, designer,
-  backend dev, QA, DevOps, tech writer, …). A preset bundles: role system-prompt append,
-  recommended skills (e.g. superpowers, impeccable for UI roles), plugins/MCP servers,
-  allowed-tools profile, and a recommended model. Assigning a role to an agent offers
-  one-click attachment of the bundle; presets are plain files (`roles/*.yaml` in the
-  Fabrica repo + user overrides in `.fabrica/roles/`), customizable and shareable.
-  Skills/plugins install into the room's `.claude/` so the repo stays self-contained.
+- **RoleLibrary** (`src/roleLibrary.ts`, built in M1c) — the role presets Fabrica ships: ten job
+  roles (architect, backend, data, designer, devops, frontend, generalist, qa, security,
+  tech-writer) plus `onboarding`, the one the factory puts on an agent itself. A preset bundles a
+  system-prompt append, skills, MCP servers, an `allowedTools` profile and a recommended model.
+  **Presets are plain files** — `roles/*.yaml` in the Fabrica repo, user overrides by `id` in
+  `<data dir>/roles/` — re-read when they change, so tuning one needs no restart, and a malformed
+  file is *reported* alongside the list rather than dropped from it (`RoleSpec` is `.strict()`).
+  Applying one composes into the session's `query()`: the charter is appended (an orchestrator keeps
+  its own too), the model applies only where the operator pinned none, the role's MCP servers are
+  merged with the factory bus **which can never be removed**, and skills are copied into the room's
+  `.claude/skills/` so the repo stays self-contained — never overwriting a directory that is
+  already there. `sessions.role_id` holds the *id*, so an edited preset is not frozen onto agents
+  created before it.
 - **Per-agent autonomy** — alongside the role bundle, every session carries an `autonomy` field
   (`attended` | `auto` | `bypass`, persisted in `sessions.autonomy` and re-applied on resume) that
   maps to the Agent SDK's `permissionMode` inside the executor. `auto` is the default: the CLI's
@@ -304,7 +326,8 @@ Protocol types: WS envelopes, event payloads, bus message schema, task schema. Z
 
 ```
 <project-root>/
-  CLAUDE.md                  # project-wide context (Onboarder creates if missing)
+  CLAUDE.md                  # project-wide context; its ABSENCE is what "un-onboarded" means,
+                             # and the onboarding agent writes it (§2.1)
   .fabrica/                  # factory state: fabrica.db (SQLite), layout.json, accounts.json (no secrets)
   attachments/               # files the operator pasted, dropped or uploaded at the project
   backend/                   # a room
@@ -336,6 +359,17 @@ as an injected turn, calls `mcp__factory__factory_assign_task(task_id, room)` �
 the board and an `info` message is delivered as a turn in the receiving room → a package leaves the
 main building for that workshop. The card stays visibly unassigned until the orchestrator actually
 answers; routing is a model decision, so nothing pretends it has been made.
+
+**Onboarding a project nobody has written down** (built and run live in M1c): the operator points a
+factory at a folder with no `CLAUDE.md` → the floor says so and offers one button → `start_onboarding`
+creates an ordinary session in the project room with the `onboarding` role and sends it one turn →
+the agent asks **one question per turn** in the console, waiting for each answer → when it has enough
+it writes `CLAUDE.md` and `README.md` at the project root with its own file tools → it calls
+`factory_suggest_rooms`, which **records** a handful of departments and creates nothing → the
+operator edits the names, drops what they disagree with and approves → each approved suggestion goes
+through the ordinary `createRoom`, so the folders, the charters and the buildings appear the same way
+they would if the operator had typed the names in the room panel. The surface disappears the moment
+`CLAUDE.md` exists and nothing is waiting on a decision.
 
 **Limit warn/pause/resume**: LimitMonitor reads account B at 84 % → the scheduler injects one
 short turn into every agent on B ("bring what you are doing to a safe stopping point"), once for

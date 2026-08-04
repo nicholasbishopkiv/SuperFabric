@@ -4,7 +4,8 @@ A **role** is what an agent arrives as: a charter appended to its system prompt,
 into its room, and — where the operator has not said otherwise — a model and an autonomy mode.
 
 A role is a **file**, not a database row, because it is content: something to read, diff, fork and
-keep in your own repository. This directory holds the ten SuperFabric ships. Yours go in
+keep in your own repository. This directory holds the eleven SuperFabric ships — ten you pick from
+the role picker, plus `onboarding`, the one the factory puts on an agent itself. Yours go in
 `<data dir>/roles/*.yaml` (by default `.fabrica/roles/`) and **override these by `id`** — same id,
 your file wins; new id, a new entry in the picker. An edited file is picked up without restarting the
 server.
@@ -39,7 +40,9 @@ file that is not valid YAML, and so are two files in one directory claiming the 
 ## Writing one
 
 - **A charter, not a manual.** Say what the role owns, what it must not do, and how it hands off.
-  Every turn that agent ever takes pays for this text. The ten here are 500–750 characters; the
+  Every turn that agent ever takes pays for this text. The ten job roles here are 500–750 characters
+  (`onboarding` is ~1,500: it describes a procedure, not a standing brief, and is worn for one
+  short-lived session); the
   orchestrator's own prompt (`packages/server/src/orchestrator.ts`) is the worked example.
 - **Say the boundary out loud.** "Not yours: …" is the half that stops two rooms doing one job twice.
 - **Do not invent skill names.** `skills` entries are directory names resolved against the skill
@@ -47,8 +50,16 @@ file that is not valid YAML, and so are two files in one directory claiming the 
   `~/.claude/plugins/cache/…/skills/` (override the search path with `SUPERFABRIC_SKILL_PATH`). A name
   nothing resolves is reported in the agent's own log, but a role that promises a skill it cannot
   deliver is still worse than one that promises none. If no real skill fits, ship without.
-- **Reserve the capable model for judgement.** Two of the ten pin Opus (architect, security); one
+- **Reserve the capable model for judgement.** Two of them pin Opus (architect, security); one
   pins nothing at all and runs on whatever your CLI is set to.
+
+## The one role the factory uses itself
+
+`onboarding.yaml` is what `start_onboarding` puts on an agent when you point the factory at a project
+with no `CLAUDE.md`. Its `id` is load-bearing — the server looks the role up by it — so override it
+rather than renaming it if you want the interview to go differently. It is also the only role that
+brings an extra tool: `factory_suggest_rooms`, which **records** a set of proposed rooms and creates
+nothing. The operator approves them, and approving runs the ordinary room-creation path.
 
 ## What applying one does
 

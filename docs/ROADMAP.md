@@ -48,8 +48,10 @@ Still open for M1:
 
 - [x] Task panel with manual task entry — delivered with M3a (auto-routing still needs the
       orchestrator, so a task with no room stays unassigned and the board says so).
-- [ ] Roles library v1: ~10 presets (role = prompt + skills/superpowers + plugins/MCP + model).
-- [ ] Onboarding agent for an empty project (interview → CLAUDE.md / README).
+- [x] Roles library v1: ~10 presets (role = prompt + skills/superpowers + plugins/MCP + model) —
+      delivered with M1c below.
+- [x] Onboarding agent for an empty project (interview → CLAUDE.md / README) — delivered with M1c
+      below.
 
 ## M1b — Projects, folders, files and a real UI
 
@@ -120,6 +122,96 @@ times in 3 s with every agent idle — the demand frameloop is intact. Bundle: 1
 JS plus 33 kB of CSS (gzip 355 → 409 kB). 637 tests green (shared 46, server 360 + 1 skipped
 live-quota test, web 231) — unchanged and untouched, since the web suite is store and pure-logic
 tests.
+
+## M1c — The roles library and the onboarding agent ✅ **complete** (2026-08-04)
+
+The two things that make the factory usable by someone who does not know Claude Code's configuration
+surface: pick "architect" and the agent arrives already configured, or point the factory at an
+undocumented folder and an agent interviews you about it.
+
+- [x] **A role is a file, not a row** (`roleLibrary.ts`, `RoleSpec` in the protocol): `roles/*.yaml`
+      at the repo root, `<data dir>/roles/*.yaml` overriding by `id`, an edited file picked up
+      without a restart, and a malformed one **reported next to the list** rather than dropped from
+      it. `RoleSpec` is `.strict()`, so `skill:` for `skills:` fails the file by name instead of
+      silently shipping a preset whose whole point never arrives.
+- [x] **Ten presets worth shipping** — architect, backend, data, designer, devops, frontend,
+      generalist, qa, security, tech-writer. Each 550–750 characters, each stating a boundary
+      ("You do not implement", "Do not fix the code you are testing"), Opus reserved for the two
+      roles whose mistakes are expensive to reverse, and **no invented skill names**:
+      `shippedRoles.test.ts` holds a verified list and adding a reference means adding an entry.
+- [x] **Applying a role** (`sessionManager.ts`, migration 12): `sessions.role_id` is the fourth
+      member of the `autonomy`/`model`/`account_id` family — persisted, re-applied on resume,
+      changed by restarting the executor. An explicit operator model always beats the preset's; the
+      factory bus can never be unplugged by a role's `mcpServers`; skills are copied into
+      `<room>/.claude/skills/` and a directory already there is never touched.
+- [x] **Detection is a file**: a project is un-onboarded when there is no `CLAUDE.md` at its root
+      (`PROJECT_CHARTER_FILE`). No folder-contents heuristic — a guess would offer to interview
+      someone about a repository they documented last year.
+- [x] **The onboarder is an ordinary session with a role and a one-shot job** (`onboarding.ts`),
+      exactly as the orchestrator is: `roles/onboarding.yaml` carries the charter (which says
+      **one question per turn** in as many words), `start_onboarding` creates the session in the
+      project room and sends it one turn. It writes `CLAUDE.md` and `README.md` with its own file
+      tools — there is no special write path.
+- [x] **The rooms are a proposal** (migration 13, `factory_suggest_rooms`): the tool records a list
+      and creates nothing; the UI shows an accept/edit list; approving calls the ordinary
+      `RoomManager.createRoom`, so name safety, containment and never-overwriting-a-charter hold
+      because it is the same code path. One refused name does not sink the rest.
+- [x] **UI**: the role picker (`RoleSelect.tsx`) on the room panel's "New agents arrive as" line and
+      on every agent row; `Onboarding.tsx` over the floor, prominent only while the project is
+      un-onboarded, plus the proposal list, which outranks everything because the interview writes
+      the docs *before* it proposes rooms.
+
+**Acceptance run (live, one interview, 8 agent turns, $0.44 total)**: a throwaway server on port
+4733 pointed at an empty folder called `expense-tracker`. The floor showed one card — "This project
+has no `CLAUDE.md`" — and "Start onboarding" produced an agent in the project room that asked, one
+per turn and waiting each time:
+
+1. "Empty folder, so we're starting from scratch. What is expense-tracker for — who's going to use
+   it, and what's the core problem it solves for them?"
+2. "What's it built with, or are you deciding that with me now — any language/framework/database
+   preference, or a blank slate?"
+3. "How do you want to run and test it day to day — e.g. `uvicorn` + `pytest` locally, a
+   docker-compose file, any CI, and does the SQLite data live in a mounted volume?"
+4. "Since it's shared between two people, is there any login/auth, or is it just open on the local
+   network with no accounts at all?"
+5. "What does the core workflow look like — are you two manually entering each expense, or
+   importing CSV exports from the bank, and do you need to split/categorize by person?"
+6. "Good. Any conventions or constraints you want enforced — style/linting tools (ruff, black,
+   mypy), commit message style, or anything you explicitly don't want (no ORM, no migrations
+   framework, etc.)?"
+7. "Last one — what's the near-term roadmap? E.g. is CSV import for both banks working yet, or is
+   this all still to be built from nothing?"
+
+Answered honestly about a small imaginary household expense tracker (two people, home server, Python
++ FastAPI + SQLite + htmx, no login, ruff, no ORM, no JS build step). It then wrote both files
+without being asked again. `CLAUDE.md` opened with a **Status** section nobody requested and which is
+the most valuable thing in it — "The folder is empty as of 2026-08-04. Nothing has been built yet.
+This file describes the plan agreed with the operator, not existing code." — followed by what it
+does, the roadmap as a numbered list, the stack, "Running it" (`uvicorn app.main:app --reload`,
+`pytest`, the compose file, `/data/expenses.db`, "No CI. No accounts/login — runs open on the home
+LAN only"), and "Conventions and constraints" ("No ORM — plain SQL via `sqlite3`. Schema changes are
+numbered `.sql` files applied on startup (no migration framework).", "No JavaScript build step,
+ever."). `README.md` was the same project for a person, opening "Built because bank statements are
+unreadable and it's hard to tell where the money went each month." **Nothing in either file was
+invented**: every line traces to an answer.
+
+Then five rooms, proposed and not created: `import` ("CSV import parsers for each bank's column
+layout, plus manual cash entry"), `categorization` ("Keyword-based auto-categorization rules and
+manual override handling"), `reporting` ("Monthly summary views, per-person split, recurring-payment
+detection, and category budgets"), `storage` ("SQLite schema as numbered .sql files, plain SQL data
+access, no ORM"), `app-shell` ("FastAPI app wiring, htmx server-rendered pages, Docker/compose
+packaging for the home server"). They match what was described — named after the work rather than
+the technology, and the split is one a person would defend. Approving all five created five folders,
+each with the proposed line as the first thing in its charter, and the surface disappeared.
+
+**Two honest findings from that run.** The agent's first `factory_suggest_rooms` call used
+capitalised names (`Import`, `Categorization`); the MCP layer refused it against `RoomName` and it
+retried correctly with lowercase in the same turn — self-corrected, but a tool description that said
+"lowercase" in the schema's `describe` only, not in the tool's own text, cost a round trip. And the
+"onboarding is under way" strip stayed on the floor after the interview finished, because an
+onboarding session stays `active` forever; the surface now keys off the file instead, so it vanishes
+the moment `CLAUDE.md` exists. 1,062 tests green (shared 79, server 701 + 1 skipped live-quota test,
+web 282) — 1,030 before this milestone.
 
 ## M2 — Multi-account and the limit monitor ✅ **complete** (2026-08-04)
 
@@ -274,7 +366,7 @@ test, web 244).
   activity), living-factory details (smoke, lights, movement).
 - Direct chat with any agent from the UI (partially in M0 already), notifications
   (phone push desirable), event history/search.
-- Roles library expansion (50+ presets, user-defined presets).
+- Roles library expansion (50+ presets; the format and user-defined overrides shipped in M1c).
 - Metrics: per-account burn rate, cost-equivalent analytics (ccusage math).
 - Factory export/import (multi-project moved up to M1b).
 
