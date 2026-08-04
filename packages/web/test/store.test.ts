@@ -1396,6 +1396,35 @@ describe("accounts", () => {
     expect(useFabric.getState().sessions[0]!.accountId).toBe("a1");
   });
 
+  describe("runtimes", () => {
+    it("a room's runtime repaints the room, so switching to a sandbox is not invisible", () => {
+      apply({ kind: "rooms", rooms: [room({ id: "r1" })] });
+      const before = useFabric.getState().rooms[0];
+      apply({ kind: "rooms", rooms: [room({ id: "r1", runtime: "container" })] });
+      // The building's label says "sandboxed"; a comparison that left `runtime` out would keep the
+      // row's identity and the floor would go on claiming the old answer.
+      expect(useFabric.getState().rooms[0]).not.toBe(before);
+      expect(useFabric.getState().rooms[0]!.runtime).toBe("container");
+    });
+
+    it("an agent's runtime repaints the agent, which is the badge that must never lag", () => {
+      apply({ kind: "sessions", sessions: [session({ id: "s1", runtime: "host" })] });
+      const before = useFabric.getState().sessions[0];
+      apply({ kind: "sessions", sessions: [session({ id: "s1", runtime: "container" })] });
+      expect(useFabric.getState().sessions[0]).not.toBe(before);
+      expect(useFabric.getState().sessions[0]!.runtime).toBe("container");
+    });
+
+    it("a room set to container may still hold agents running on the host", () => {
+      // The lag that the panel has to say out loud: a live session cannot be moved into a
+      // container, so the room and its agents genuinely disagree until each restarts.
+      apply({ kind: "rooms", rooms: [room({ id: "r1", runtime: "container" })] });
+      apply({ kind: "sessions", sessions: [session({ id: "s1", roomId: "r1", runtime: "host" })] });
+      expect(useFabric.getState().rooms[0]!.runtime).toBe("container");
+      expect(useFabric.getState().sessions[0]!.runtime).toBe("host");
+    });
+  });
+
   describe("accountLabel", () => {
     it("names the bound account", () => {
       expect(accountLabel([account()], "a1")).toBe("Work");

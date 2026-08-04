@@ -22,7 +22,7 @@ import {
   PROJECT_ROOF_HEIGHT,
   ROOM_ROOF_THICKNESS,
 } from "./layout";
-import { DETAIL, PROJECT, ROOM, roomAccent, SELECT_COLOR } from "./palette";
+import { DETAIL, PROJECT, ROOM, roomAccent, SANDBOX_COLOR, SELECT_COLOR } from "./palette";
 import { StatusBeacon } from "./StatusBeacon";
 
 const LABEL_COLOR = "#1c1c1c";
@@ -192,6 +192,13 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
           {isProject && agents === 0 ? "" : ` · ${agents} agent${agents === 1 ? "" : "s"}`}
           {hasOrchestrator && (
             <span style={{ color: ORCHESTRATOR_LABEL_COLOR, fontWeight: 700 }}> · orchestrator</span>
+          )}
+          {/* Which departments are sandboxed has to be answerable from the floor, not only from the
+              panel of whichever room happens to be selected — it is the question an operator asks
+              before turning an agent loose. A word rather than a light on the roof: see
+              `SANDBOX_COLOR` for why this one is deliberately quiet. */}
+          {room.runtime === "container" && (
+            <span style={{ color: SANDBOX_COLOR, fontWeight: 700 }}> · sandboxed</span>
           )}
         </div>
       </Html>
