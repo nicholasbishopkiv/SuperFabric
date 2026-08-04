@@ -36,6 +36,8 @@ const SHIPPED_FINGERPRINTS = [
   "a96d9d35e39452ed", // 13 — M1c room suggestions
   "8df3b7b9eec6257c", // 14 — M4 room runtime
   "4de2ed6418495088", // 15 — repair: limited_by for databases stamped past the old step 11
+  "960d41d1ba747dd2", // 16 — chronicle FTS delete triggers (deleting an agent must not leave hits)
+  "7e77d55222029bae", // 17 — server_state: things done once (adopting the ambient ~/.claude)
 ];
 
 describe("migrations are append-only", () => {
@@ -61,11 +63,17 @@ describe("migrations are append-only", () => {
 });
 
 describe("the limited_by repair", () => {
+  /** The step that repairs `limited_by`. A database stamped *below* it has never run it. */
+  const REPAIR_STEP = 15;
+
   /** A database in the state an operator's file was actually in: stamped past 11, missing the column. */
   function stampedPastOldStep11(path: string): void {
     const db = openDb(path); // brings it fully up to date, then we take the column back off
     db.exec("ALTER TABLE usage_snapshots DROP COLUMN limited_by");
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`); // as if step 15 had never existed
+    // As if step 15 had never existed. Pinned to the repair's own number rather than to
+    // `SCHEMA_VERSION - 1`: that was the same thing right up until a step was appended after it, at
+    // which point this stopped rewinding far enough and the test started asserting nothing.
+    db.exec(`PRAGMA user_version = ${REPAIR_STEP - 1}`);
     db.close();
   }
 

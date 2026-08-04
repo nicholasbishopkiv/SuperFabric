@@ -366,8 +366,13 @@ export function AccountSwitcher() {
           ))}
           {accounts.length === 0 && (
             <li className="text-2xs text-fg-faint">
+              {/* An empty list now means something specific: the server looked at this machine's own
+                  `~/.claude` on boot and found no login there. Saying so is more useful than "no
+                  accounts yet", which reads as "you have not got round to it" on a machine where the
+                  operator has in fact been using Claude Code all along. */}
               {connected
-                ? "No accounts yet. Agents run on your own ~/.claude until you add one."
+                ? "No accounts. This machine's own ~/.claude is not logged in — add an account here, "
+                  + "or run `claude auth login` in a terminal and it will appear."
                 : "Waiting for the server…"}
             </li>
           )}

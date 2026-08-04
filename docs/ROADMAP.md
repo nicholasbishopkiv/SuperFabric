@@ -557,6 +557,105 @@ real CLI):
 1159 → **1355 tests green** (shared 88, server 813 + 1 skipped live-quota test, web 424,
 agent-runner 30).
 
+## Removing things ✅ **complete** (2026-08-04)
+
+Not a milestone — a gap the roadmap listed under "what is not built" until an operator asked the
+obvious question: *how do I delete this?* Until now the answer was "edit `fabrica.db` by hand",
+which is not an answer.
+
+Four messages, and the shape of each is decided by what it destroys:
+
+- **`stop_session`** ends an agent and keeps every word of it. `state = 'done'`, so `resumeAll`
+  never brings it back. Applied **at a turn boundary**, exactly as a limit pause is and for the same
+  reason — a turn in flight has already spent its tokens. `interrupt` is still what cuts a long turn
+  short.
+- **`delete_session`** removes the agent *and* its event log. The one operation in the product that
+  destroys history, so it is the only one nothing else does implicitly (a room delete is explicit
+  about taking its agents' transcripts with it). Stopped hard rather than at a boundary: waiting
+  would preserve a transcript that is being deleted anyway.
+- **`delete_room`** takes the building off the floor, stops and deletes the agents standing in it,
+  and **does not touch the folder**. The project room is refused — its folder is the project root.
+- **`delete_project`** removes a factory from the switcher: rooms, agents, board, bus traffic,
+  proposals, decision *index*. The boot project (`SUPERFABRIC_PROJECT ?? cwd`) is refused because it
+  is re-created on the next start, and the last remaining project is refused for the mirror reason.
+
+What survives is the interesting half, and it is what the tests are mostly about: **every folder,
+`CLAUDE.md`, skill directory and ADR file on disk**; a room's **tasks** (unassigned, not deleted —
+the work outlives the department); a room's **bus traffic** (`messages` has never had a foreign key,
+precisely so the record outlives the room); and a deleted agent's **room suggestions** (an offer the
+operator has not answered yet is not ours to withdraw).
+
+Two structural pieces rather than three methods bolted onto three managers:
+
+- **`demolition.ts`** owns the order and the policy in one readable file — refuse before you destroy,
+  live processes before rows, and the list of what deliberately survives.
+- **Migration 16** adds `AFTER DELETE` triggers to the Chronicle's FTS index. Migration 8 stated that
+  both indexed tables were append-only and that "AFTER INSERT is the entire contract"; that stopped
+  being true the moment an agent could be deleted, and a search that quoted a transcript nobody
+  holds any more would be worse than not finding it. Kept in SQL beside the insert triggers so every
+  future delete path is covered by construction.
+
+In the UI, every removal is a two-step `ConfirmDelete` whose armed state shows **the consequence in
+words** rather than "Are you sure?" — computed from state the client already holds, so the counts are
+this factory's, now. The sentences are pure functions in `hud/removal.ts` and tested as such: a
+plural that lies or a reassurance that is no longer true is not visible in a screenshot.
+
+**Evidence.** `test/demolition.test.ts` (19 cases) drives the whole thing against real managers and a
+scripted executor: a deleted agent's words are gone from the log *and* from a chronicle search that
+found them a line earlier; a deleted room's folder still holds the operator's own file and its
+charter byte-for-byte; the project room refuses **before** the agent standing in it is touched; a
+stop lands strictly after `turn_complete`; a deleted factory's ADR file is still on disk and still
+readable; and deleting one factory leaves another's rooms, agents and tasks untouched.
+
+1355 → **1381 tests green** (shared 88, server 832 + 1 skipped live-quota test, web 431,
+agent-runner 30).
+
+## First run ✅ **complete** (2026-08-04)
+
+The other half of the same operator report, and the reason the delete above kept refusing something:
+SuperFabric opened by **inventing a factory from the directory the server was started in**. Run
+`pnpm dev` from the repo and you got a floor called "server" over `packages/server` — a project
+nobody chose, that nothing could remove, because the next boot put it straight back.
+
+- **Nothing is seeded from cwd.** `SUPERFABRIC_PROJECT` is somebody saying it and is honoured; a
+  working directory is not. A fresh server therefore has **no projects at all**, which is now a
+  first-class state: `activeProjectId` is `null` on the wire, `attach` lands a socket on no floor
+  (and creates nothing — a browser tab opening is not a decision about which folder someone works
+  in), rooms/sessions/tasks/messages answer **empty** rather than erroring, and everything that
+  would build something is refused with a sentence naming both ways forward.
+- **The UI asks.** `FirstRun.tsx` covers the empty floor with one folder field and a six-step
+  `QuickGuide` — a factory is a folder, an interview writes it down, a room is a subfolder, rooms
+  talk on the belt, the board is the work, accounts have limits. The same guide is behind the `?`
+  in the top-left bar, because one you can only read before you have a factory is one nobody can
+  re-read.
+- **`ProjectManager.remove` stopped protecting the boot project** except where the protection is
+  true: only a server that will re-seed that root (`reseedsDefaultRoot`, i.e. the variable is set)
+  refuses it. Removing the *last* factory is allowed, because "no factory yet" is a state that draws.
+- **The account that was already there is adopted.** A machine with a logged-in `~/.claude` has a
+  subscription, and every unbound agent already spends it — so "No accounts yet" was false to the
+  people most likely to read it. `AccountManager.adoptAmbient` turns it into an ordinary account row
+  (labelled `personal`) the first time a server starts, which also gives it a limit meter it never
+  had. Once, recorded in `server_state` (migration 17), so an operator who removes it is not handed
+  it back on the next boot — the same "delete that undoes itself" this whole section is about.
+
+**Evidence.** `test/wsHubEmpty.test.ts`: attaching a socket to an empty server creates no project;
+the connect handshake answers four empty lists and **no** error frame; `create_room` is refused with
+a message naming `SUPERFABRIC_PROJECT` and still creates nothing; `create_project` brings the floor
+to life with its central building; and deleting the last factory puts the tab back on the empty floor
+with `activeProjectId: null`. `test/ambientAccount.test.ts`: a logged-in directory is adopted with
+its real path, an empty one is not, a hand-added duplicate is not, a missing home is survived, and —
+the one that matters — after the operator removes it, a second `AccountManager` over the same
+database does not bring it back.
+
+Plus `scripts/setup.sh`, which is not a feature so much as the answer to "what do I install to run
+this": system packages, Node 22+, pnpm, Bun 1.3+, the `claude` CLI, the plugin marketplaces and
+plugins its agents draw skills from, and `pnpm install`. Detect-first, re-runnable, `--dry-run`, and
+a summary in which every component is present / installed-now / missing-with-the-fix. It never logs
+anyone in.
+
+1381 → **1391 tests green** (shared 88, server 842 + 1 skipped live-quota test, web 431,
+agent-runner 30).
+
 ## What is not built
 
 Stated here rather than left as an absence a reader has to discover. Everything in this list
@@ -601,10 +700,15 @@ so that nothing implies otherwise.
 - **An eight-hour unattended run across three accounts.** The first of the v1 success criteria
   in `VISION.md`, and the only one nothing has demonstrated. Every part is built and tested;
   the run has never happened.
-- **Editing a role from the UI, deleting a project, and removing a room.** Roles are edited by
-  editing the file (which is the design). Projects and rooms are never deleted by the product
-  — a delete that left sessions, tasks and history pointing at a missing row would be a worse
-  state than any it fixed, and nothing yet does the cleanup properly.
+- **Editing a role from the UI.** Roles are edited by editing the file, which is the design.
+- **Undoing a delete.** Removing an agent, a room or a factory is final. What protects the operator
+  is that nothing on disk is ever touched and that the confirm says what goes (see "Removing
+  things" below), not a bin to fish it back out of — an undo would mean keeping the rows that were
+  deleted, which is the state the delete existed to leave.
+- **Moving an agent between rooms, or restarting a stopped one.** A session's `cwd` is fixed for the
+  lifetime of its `query()`, so "move" would mean stop-and-recreate under a name that implies
+  otherwise. Stopping is therefore one-way today: the transcript stays and is readable, but the
+  agent does not come back.
 
 ## After v1
 

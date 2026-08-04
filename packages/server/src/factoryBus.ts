@@ -114,6 +114,11 @@ export class FactoryBus {
       ),
       // `AND delivered_at IS NULL` is what makes delivery idempotent at the storage level: a
       // second flush of the same row changes nothing and reports 0 changes.
+      // Only ever run while the factory itself is being removed. A *room* going does not delete its
+      // traffic — `messages` has never had a foreign key, precisely so the record of what a factory
+      // asked for outlives the department that asked (both ends already tolerate a room id that no
+      // longer resolves; see `injectedTurn`). A whole floor going leaves nothing to read it.
+      deleteForProject: this.db.prepare("DELETE FROM messages WHERE project_id = ?"),
       markDelivered: this.db.prepare("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL"),
       unmarkDelivered: this.db.prepare("UPDATE messages SET delivered_at = NULL WHERE id = ?"),
     };
@@ -217,6 +222,13 @@ export class FactoryBus {
    */
   list(projectId: string = this.projects.defaultProject().id, limit = 200): MessageInfo[] {
     return (this.stmts.list.all(projectId, limit) as MessageRow[]).map(toMessageInfo);
+  }
+
+  /** Drop a whole factory's traffic. Only ever called while the factory itself is being removed. */
+  deleteForProject(projectId: string): number {
+    const changed = this.stmts.deleteForProject.run(projectId).changes;
+    if (changed > 0) this.emitChange();
+    return changed;
   }
 
   /** `undefined` for an unknown id — the absent-row shape the rest of the package speaks. */

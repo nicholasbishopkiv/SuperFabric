@@ -102,6 +102,20 @@ export function openProject(projectId: string): void {
   send({ kind: "open_project", projectId });
 }
 
+/**
+ * Remove a factory. The same bookkeeping as `openProject` and for a stronger version of its reason:
+ * the sessions we were following may be the ones being deleted, and a reconnect that resubscribed to
+ * them would ask the server to replay a log that no longer exists.
+ *
+ * Deleting the factory this tab is *not* looking at is allowed and clears the same maps — a socket
+ * only ever follows one floor at a time, so there is nothing here that could belong to another.
+ */
+export function deleteProject(projectId: string): void {
+  subscribed.clear();
+  resyncAsked.clear();
+  send({ kind: "delete_project", projectId });
+}
+
 /** Add a factory by path. The server refuses anything that is not an existing absolute directory. */
 export function createProject(root: string, name?: string): void {
   send({ kind: "create_project", root, ...(name !== undefined && name !== "" ? { name } : {}) });

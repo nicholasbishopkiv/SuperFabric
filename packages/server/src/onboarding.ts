@@ -116,6 +116,11 @@ export class OnboardingManager {
       ),
       updateProposal: db.prepare("UPDATE room_suggestions SET charter = ?, session_id = ?, note = NULL WHERE id = ?"),
       settle: db.prepare("UPDATE room_suggestions SET status = ?, name = ?, charter = ?, note = ? WHERE id = ?"),
+      // The agent that made a proposal has been deleted. The proposal is not: migration 13 says a
+      // suggestion "outlives the agent that made it" and `session_id` is nullable for exactly this
+      // moment — the operator may still want the docs room the interview suggested last week.
+      forgetSession: db.prepare("UPDATE room_suggestions SET session_id = NULL WHERE session_id = ?"),
+      deleteForProject: db.prepare("DELETE FROM room_suggestions WHERE project_id = ?"),
     };
   }
 
@@ -127,6 +132,22 @@ export class OnboardingManager {
       sessionId: this.deps.sessions.onboarderFor(projectId) ?? null,
       suggestions: (this.stmts.byProject.all(projectId) as SuggestionRow[]).map(toSuggestion),
     };
+  }
+
+  /**
+   * The agent that made some proposals has been deleted; the proposals stay, with nobody attached.
+   *
+   * Deliberately not a delete. A room suggestion is an offer made to the operator, and the operator
+   * has not answered it yet — throwing it away because the interviewer was removed would decide the
+   * question on their behalf, and they would never know it had been asked.
+   */
+  forgetSession(sessionId: string): void {
+    this.stmts.forgetSession.run(sessionId);
+  }
+
+  /** Drop a factory's proposals. Only ever called while the factory itself is being removed. */
+  deleteForProject(projectId: string): number {
+    return this.stmts.deleteForProject.run(projectId).changes;
   }
 
   /**

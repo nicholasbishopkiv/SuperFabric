@@ -28,6 +28,10 @@ function makeHub(opts: { withOnboarding?: boolean } = {}) {
   const db = openDb(":memory:");
   const store = new EventStore(db);
   const projects = new ProjectManager(db, root);
+  // The floor this socket lands on. Explicit since the server stopped inventing a factory from its
+  // own working directory: `attach` now lands a socket on the last-opened project, and a server with
+  // none leaves it on no floor at all (which `wsHubEmpty.test.ts` is about).
+  projects.defaultProject();
   const rooms = new RoomManager(db, projects);
   const roles = new RoleLibrary();
   const withOnboarding = opts.withOnboarding !== false;

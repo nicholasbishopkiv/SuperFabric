@@ -219,6 +219,14 @@ export class SessionManager {
    */
   private pausePending = new Map<string, { until: number | null; reason: string }>();
   /**
+   * sessionId -> a stop armed while that agent had a turn in flight, and why.
+   *
+   * The pause's twin, for the same reason and at the same boundary: an operator ending an agent has
+   * no more interest in throwing away a turn's spent tokens than the scheduler does. It outranks an
+   * armed pause at the boundary — holding an agent that is being ended would be arranging its return.
+   */
+  private stopPending = new Map<string, string>();
+  /**
    * sessionId -> which executor incarnation is the current one.
    *
    * An executor keeps emitting for a moment after we have let go of it — the SDK's `result` message
@@ -290,6 +298,28 @@ export class SessionManager {
       // it is about to warn or hold.
       activeOnAccount: db.prepare(
         "SELECT id FROM sessions WHERE account_id = ? AND state = 'active' ORDER BY created_at, rowid",
+      ),
+      // Ending an agent for good. `state IN ('active','paused')` rather than `= 'active'`: a held
+      // agent is exactly the one an operator is most likely to want rid of, and a session already
+      // 'done' or 'error' is not stopped twice.
+      markDone: db.prepare(
+        "UPDATE sessions SET state = 'done', paused_at = NULL, paused_until = NULL"
+        + " WHERE id = ? AND state IN ('active', 'paused')",
+      ),
+      // Deleting one. The log goes first and by its own statement rather than by a foreign key:
+      // `events` deliberately has none (it must outlive the session row it describes), so the one
+      // path that genuinely means "forget this agent" has to say so.
+      deleteEvents: db.prepare("DELETE FROM events WHERE session_id = ?"),
+      deleteSession: db.prepare("DELETE FROM sessions WHERE id = ?"),
+      // Where an agent stands, for the caller that has to announce its removal. Not on
+      // `SESSION_COLUMNS` because nothing about *running* an agent needs its project.
+      scope: db.prepare("SELECT project_id, room_id FROM sessions WHERE id = ?"),
+      // Every agent in one room / on one floor, whatever state it is in — what a cascade is measured
+      // against. Deliberately not filtered to 'active': a stopped agent's transcript is still a row,
+      // and a room deletion that left it behind would leave it pointing at nothing.
+      idsInRoom: db.prepare("SELECT id FROM sessions WHERE room_id = ? ORDER BY created_at, rowid"),
+      idsInProject: db.prepare(
+        "SELECT id FROM sessions WHERE project_id = ? ORDER BY created_at, rowid",
       ),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
       // `status` and `blocked` are derived from the log by correlated subqueries rather than a
@@ -786,6 +816,11 @@ export class SessionManager {
   }
 
   private startExecutor(id: string, spec: RunSpec) {
+    // A session that is no longer there gets no executor. The window is real and narrow: a restart
+    // (`setModel`, `setRole`) awaits the old executor's teardown, and `deleteSession` can land in
+    // exactly that gap — starting the replacement would leave a CLI subprocess running for an agent
+    // whose row, log and floor position are gone, with nothing left to stop it.
+    if (this.stmts.session.get(id) == null) return;
     const { cwd, resume, autonomy, roomId, model, accountId, isOrchestrator } = spec;
     const role = this.roleOf(id, spec.roleId);
     const generation = (this.generation.get(id) ?? 0) + 1;
@@ -862,6 +897,15 @@ export class SessionManager {
           }
           if (event.type === "turn_complete") {
             this.turnInFlight.delete(id);
+            // An armed stop lands before an armed pause and before the flush, and it wins over both:
+            // an agent the operator has ended is not held for a limit and is not handed a message it
+            // will never answer.
+            const stopping = this.stopPending.get(id);
+            if (stopping !== undefined) {
+              this.stopPending.delete(id);
+              void this.applyStop(id, stopping);
+              return;
+            }
             // The turn boundary is also where an armed pause lands. Before the bus flush, so a
             // message is never delivered to an agent that is about to stop and would not answer it.
             const pending = this.pausePending.get(id);
@@ -1052,6 +1096,125 @@ export class SessionManager {
   }
 
   /**
+   * End an agent for good — **at the next turn boundary**, exactly as a pause is.
+   *
+   * The same argument as `pauseSession`, and it does not get weaker for being the operator's own
+   * decision: a turn already in flight has spent its tokens, and killing it mid-sentence throws them
+   * away and leaves a transcript that stops in the middle of a thought. An idle agent stops at once,
+   * which is the ordinary case; `interrupt` is what ends a turn that is taking too long, and it can
+   * be sent first.
+   *
+   * The difference from a pause is what it means afterwards: `state = 'done'` rather than `'paused'`,
+   * so `resumeAll` never brings it back and no countdown is waiting for it. The transcript is
+   * untouched — this is the operation that stops an agent *without* destroying what it said.
+   *
+   * Idempotent: an agent already stopped, errored, or already armed to stop, is not stopped twice.
+   */
+  async stopSession(id: string, reason: string): Promise<"stopped" | "at-turn-boundary" | "already-stopped"> {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    if (row.state === "done" || row.state === "error") return "already-stopped";
+    if (this.stopPending.has(id)) return "already-stopped";
+
+    if (this.turnInFlight.has(id)) {
+      this.stopPending.set(id, reason);
+      // Said now rather than at the boundary, for the same reason a pause is: an operator watching an
+      // agent work has to see that it is about to stop, and why.
+      this.store.append(id, {
+        type: "session_status", status: "working", detail: `${reason} — stopping at the end of this turn`,
+      });
+      return "at-turn-boundary";
+    }
+
+    await this.applyStop(id, reason);
+    return "stopped";
+  }
+
+  /**
+   * Actually end an agent and record that it is over.
+   *
+   * Ordered like `applyPause` and for the same reason: the row and the log say `done` *before* the
+   * executor is torn down, so a client watching the floor never sees an agent vanish and come back as
+   * stopped a moment later. An armed pause is dropped — a stopped agent has nothing left to hold.
+   */
+  private async applyStop(id: string, reason: string): Promise<void> {
+    const changed = this.stmts.markDone.run(id).changes;
+    const handle = this.handles.get(id);
+    this.supersede(id);
+    this.handles.delete(id);
+    this.turnInFlight.delete(id);
+    this.pausePending.delete(id);
+    this.stopPending.delete(id);
+    this.denyPendingApprovals(id);
+    // Only when the row actually moved: a session that had already stopped must not collect a second
+    // "stopped" line in its transcript every time something asks again.
+    if (changed > 0) this.store.append(id, { type: "session_status", status: "done", detail: reason });
+    if (handle !== undefined) await this.stopWithTimeout(handle, 5000).catch(() => {});
+  }
+
+  /**
+   * Remove an agent: its row, and every event it ever produced.
+   *
+   * **Stopped hard rather than at a turn boundary**, unlike `stopSession`. The boundary exists to
+   * protect a turn's spent tokens and the transcript that records them, and here the transcript is
+   * the thing being destroyed — waiting would preserve nothing while leaving the operator watching a
+   * "deleted" agent keep working. So the executor goes first, then the rows.
+   *
+   * The log is deleted with the session (the chronicle's index follows by trigger — see migration
+   * 16). What this deliberately does *not* touch is anything that merely *names* the agent: a task it
+   * owned, a room suggestion it made, a decision it recorded. Those belong to their own owners, which
+   * unassign or forget it in their own tables — see `Demolition`.
+   *
+   * Returns where the agent stood, so the caller can announce the change to the right floor.
+   */
+  async deleteSession(id: string): Promise<{ projectId: string | null; roomId: string | null }> {
+    const scope = this.stmts.scope.get(id) as { project_id: string | null; room_id: string | null } | null;
+    if (scope == null) throw new Error(`unknown session ${id}`);
+
+    const handle = this.handles.get(id);
+    this.supersede(id);
+    this.handles.delete(id);
+    this.turnInFlight.delete(id);
+    this.pausePending.delete(id);
+    this.stopPending.delete(id);
+    // Anything held for a restart in flight is dropped rather than reported as undelivered: a
+    // `session_error` explaining that a prompt did not land would be appended to a log that is about
+    // to be deleted, and the session it was for is going away by the operator's own instruction.
+    this.heldPrompts.delete(id);
+    this.denyPendingApprovals(id);
+    if (handle !== undefined) await this.stopWithTimeout(handle, 5000).catch(() => {});
+
+    // One transaction: a half-deleted agent — rows in `events` with no session, or the other way
+    // round — is a state nothing else in the server knows how to read.
+    this.db.transaction(() => {
+      this.stmts.deleteEvents.run(id);
+      this.stmts.deleteSession.run(id);
+    })();
+    this.generation.delete(id);
+    return { projectId: scope.project_id, roomId: scope.room_id };
+  }
+
+  /**
+   * Which factory an agent belongs to, or `undefined` for an unknown session. The twin of
+   * `RoomManager.projectOf`, and there for the same caller: something holding a session id that has
+   * to refuse it if it is on another socket's floor.
+   */
+  projectOf(sessionId: string): string | undefined {
+    const row = this.stmts.scope.get(sessionId) as { project_id: string | null } | null;
+    return row == null || row.project_id === null ? undefined : row.project_id;
+  }
+
+  /** Every agent standing in one room, in creation order, whatever state it is in. */
+  sessionIdsInRoom(roomId: string): string[] {
+    return (this.stmts.idsInRoom.all(roomId) as { id: string }[]).map((r) => r.id);
+  }
+
+  /** Every agent on one floor, in creation order, whatever state it is in. */
+  sessionIdsInProject(projectId: string): string[] {
+    return (this.stmts.idsInProject.all(projectId) as { id: string }[]).map((r) => r.id);
+  }
+
+  /**
    * Every session marked active — the set an out-of-process executor's cleanup is measured against.
    *
    * `resumeAll` answers a narrower question ("what did *this* call start?"), which is the wrong one
@@ -1102,6 +1265,17 @@ export class SessionManager {
     // 'active' and comes back on the next boot, where the scheduler will decide again from a fresh
     // reading — writing 'paused' here would hold an agent for a limit that may have rolled overnight.
     this.pausePending.clear();
+    // An armed *stop* is the opposite case and is applied rather than dropped. It is an instruction
+    // the operator gave, not a guess from a reading, and the boundary it was waiting for only ever
+    // existed to save a turn that this shutdown is ending anyway. Dropping it would resurrect an
+    // agent the operator ended, on the next boot, with nothing to explain it.
+    for (const [id, reason] of this.stopPending) {
+      if (this.stmts.markDone.run(id).changes === 0) continue;
+      this.store.append(id, {
+        type: "session_status", status: "done", detail: `${reason} — applied as the server shut down`,
+      });
+    }
+    this.stopPending.clear();
     // `detach` where the executor has one, `stop` otherwise. The difference matters for exactly one
     // kind of agent: a contained one, which is a container with a buffered outbox that is already
     // reconnecting. Shutting the server down is not a reason to end it — the next boot re-attaches

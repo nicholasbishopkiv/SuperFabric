@@ -475,7 +475,12 @@ export interface FabricState {
    * it cannot be cleaned up later because nothing in the new project's snapshots mentions it. The
    * camera is asked to re-frame for the same reason: the new floor is somewhere else.
    */
-  applyProjects(projects: ProjectInfo[], activeProjectId: string): void;
+  /**
+   * The switcher's contents plus the floor this tab is on. `activeProjectId` is **null on a server
+   * with no factory at all** — a fresh install, and what is left after the last one is deleted — and
+   * the first-run screen is what draws that state.
+   */
+  applyProjects(projects: ProjectInfo[], activeProjectId: string | null): void;
   /**
    * Drop packages that have arrived — and leave a crate at the bay for every one of them **no agent
    * was sent to meet**. Called from the render loop and by a per-package timer.
@@ -922,9 +927,41 @@ function applySessions(s: FabricState, incoming: SessionInfo[]): Partial<FabricS
   return {
     sessions,
     roomStatus,
+    // A deleted agent takes its transcript with it here too. The list is this project's whole set of
+    // agents, so a key that is not in it belongs to a session the server no longer has — and keeping
+    // its rows would mean the console could still be scrolled through the words of an agent the
+    // operator removed, and the replay watermarks would outlive the log they index.
+    ...forgetSessions(s, sessions),
     // The one place a room is noticed *stopping*: the chimney needs a deadline to fade towards, and
     // nothing else in the store looks at the transition rather than the state.
     smokeUntil: nextSmokeUntil(s.smokeUntil, s.roomStatus, roomStatus, Date.now()),
+  };
+}
+
+/**
+ * The per-session maps, with everything belonging to sessions that are no longer in the list dropped.
+ *
+ * Returns `{}` — a real no-op for the spread at the call site — when nothing has to go, which is
+ * every broadcast except the one after a delete. The four maps are kept together because they are one
+ * fact in four shapes: the rows, how far the tail has got, how far it is contiguous, and whether a
+ * resync is owed. Pruning three of them and forgetting the fourth would leave a session id that can
+ * never be cleared, because nothing will ever mention it again.
+ */
+function forgetSessions(
+  s: FabricState,
+  sessions: readonly SessionInfo[],
+): Partial<FabricState> {
+  const live = new Set(sessions.map((x) => x.id));
+  const gone = Object.keys(s.events).filter((id) => !live.has(id));
+  const orphanSeq = Object.keys(s.lastSeq).filter((id) => !live.has(id));
+  if (gone.length === 0 && orphanSeq.length === 0) return {};
+  const drop = <T,>(map: Record<string, T>): Record<string, T> =>
+    Object.fromEntries(Object.entries(map).filter(([id]) => live.has(id)));
+  return {
+    events: drop(s.events),
+    lastSeq: drop(s.lastSeq),
+    contiguousSeq: drop(s.contiguousSeq),
+    needsResync: drop(s.needsResync),
   };
 }
 
@@ -1308,6 +1345,11 @@ export const useFabric = create<FabricState>((set, get) => ({
       // that legitimately arrived in the same round trip.
       if (s.activeProjectId === null || s.activeProjectId === activeProjectId) {
         return { projects: list, activeProjectId };
+      }
+      // Off a floor and onto none — the last factory was just deleted. The same clean-out as a
+      // switch, minus the camera move: there is nothing to frame.
+      if (activeProjectId === null) {
+        return { ...EMPTY_PROJECT_STATE, projects: list, activeProjectId };
       }
       return {
         ...EMPTY_PROJECT_STATE,
@@ -1782,6 +1824,16 @@ export function openTaskCount(tasks: readonly TaskInfo[], roomId: string): numbe
 
 export const useRoomTaskCount = (roomId: string): number =>
   useFabric((s) => openTaskCount(s.tasks, roomId));
+
+/**
+ * How many cards this agent is holding — what a delete would hand back to the board.
+ *
+ * `done` is counted here, unlike `openTaskCount`: this is not a workload badge but the answer to
+ * "what happens to the work if I remove them", and a finished card losing its assignee is still a
+ * change to the record. Said before the click rather than discovered in the notice after it.
+ */
+export const useAgentTaskCount = (agentId: string): number =>
+  useFabric((s) => s.tasks.filter((t) => t.agentId === agentId).length);
 
 // ---- fetching crates -----------------------------------------------------------------------------
 //

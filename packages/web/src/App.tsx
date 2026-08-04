@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { AttachmentDrop } from "./hud/AttachmentDrop";
 import { ChroniclePanel } from "./hud/ChroniclePanel";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
+import { FirstRun } from "./hud/FirstRun";
 import { FitButton } from "./hud/FitButton";
 import { NoticeBar } from "./hud/NoticeBar";
 import { Onboarding } from "./hud/Onboarding";
@@ -43,6 +44,9 @@ export default function App() {
           the floor rather than in a panel because on an un-onboarded factory the floor is empty and
           the interview is the only thing there is to do. */}
       <Onboarding />
+      {/* Before any of that: a server with no factory at all asks for a folder and explains itself.
+          It and `Onboarding` can never both be showing — onboarding needs a project to be about. */}
+      <FirstRun />
       {/* Last, so it paints over the panel's own corner. */}
       <FitButton />
       {/* Not a panel: a window-wide paste/drop surface that only draws anything while a file is

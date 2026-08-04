@@ -41,6 +41,7 @@ function makeHub(opts: { withRoles?: boolean } = {}) {
   const db = openDb(":memory:");
   const store = new EventStore(db);
   const projects = new ProjectManager(db, root);
+  projects.defaultProject(); // the floor this socket lands on — nothing is seeded from cwd any more
   const rooms = new RoomManager(db, projects);
   const roles = new RoleLibrary({ shippedDir: rolesDir });
   const skills = new SkillLibrary({ roots: [] });

@@ -151,6 +151,8 @@ export class RoomManager {
       ),
       countRooms: db.prepare("SELECT COUNT(*) c FROM rooms WHERE project_id = ? AND kind != 'project'"),
       move: db.prepare("UPDATE rooms SET pos_x = ?, pos_z = ? WHERE id = ?"),
+      remove: db.prepare("DELETE FROM rooms WHERE id = ?"),
+      removeForProject: db.prepare("DELETE FROM rooms WHERE project_id = ?"),
       setPath: db.prepare("UPDATE rooms SET path = ? WHERE id = ?"),
       setAccount: db.prepare("UPDATE rooms SET account_id = ? WHERE id = ?"),
       setRuntime: db.prepare("UPDATE rooms SET runtime = ? WHERE id = ?"),
@@ -273,6 +275,56 @@ export class RoomManager {
     const changed = this.stmts.setRuntime.run(parsed.data, roomId).changes;
     if (changed === 0) throw new Error(`unknown room ${roomId}`);
     return this.getRoom(roomId)!;
+  }
+
+  /**
+   * The room, or a throw saying why it may not be removed.
+   *
+   * Separate from `deleteRoom` so a cascade can refuse **before** it starts stopping agents: the
+   * project room is the one refusal here, and finding it out after four sessions had been deleted
+   * would be the worst possible order to discover it in.
+   */
+  requireDeletable(roomId: string): RoomInfo {
+    const room = this.getRoom(roomId);
+    if (room === undefined) throw new Error(`unknown room ${roomId}`);
+    if (room.kind === "project") {
+      throw new Error(
+        "the project room stands for the project root and cannot be removed on its own — delete the "
+        + "project instead",
+      );
+    }
+    return room;
+  }
+
+  /**
+   * Every room of one factory, gone. Only ever called while the factory itself is being removed, which
+   * is the one case where the project room goes too — on its own it is refused (`requireDeletable`),
+   * because a floor with no central building is not a floor.
+   */
+  deleteRoomsForProject(projectId: string): number {
+    return this.stmts.removeForProject.run(projectId).changes;
+  }
+
+  /**
+   * Take a room off the floor: the row, and **only** the row.
+   *
+   * The folder is left exactly as it is — its files, its `CLAUDE.md`, its `.claude/skills`. That is
+   * not caution, it is what "room = folder" means from the other direction: the row is the thing
+   * SuperFabric added, so removing it hands the directory back in the state it would have been in if
+   * the room had never been made. A product that deleted a directory because a building was dragged
+   * off a 3D floor would be a product nobody could trust with a repository.
+   *
+   * Refuses the project room: its folder *is* the project root, `ensureProjectRoom` would put it
+   * straight back, and a factory whose central building is missing has nothing for a belt to join.
+   * Deleting the project is the operation that means that.
+   *
+   * Knows nothing about the agents standing in it — that cascade is `Demolition`'s, which owns the
+   * order (agents first, then the room they point at) and reports what it did.
+   */
+  deleteRoom(roomId: string): RoomInfo {
+    const room = this.requireDeletable(roomId);
+    this.stmts.remove.run(roomId);
+    return room;
   }
 
   /** One project's floor: its project room first, then its rooms in creation order. */

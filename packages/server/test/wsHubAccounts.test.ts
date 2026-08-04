@@ -39,6 +39,7 @@ function makeHub(opts: { withAccounts?: boolean } = {}) {
   const db = openDb(":memory:");
   const store = new EventStore(db);
   const projects = new ProjectManager(db, root);
+  projects.defaultProject(); // the floor this socket lands on — nothing is seeded from cwd any more
   const rooms = new RoomManager(db, projects);
   const accounts = new AccountManager(db);
   const login = fakeLoginSpawner();

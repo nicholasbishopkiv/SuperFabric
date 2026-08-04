@@ -22,6 +22,16 @@ export interface CreateAccountOptions {
 /** The login state of an account that has none: nothing is running, nothing has been said. */
 const NO_LOGIN: AccountLogin = { status: "idle", url: null, message: null };
 
+/** `server_state` key: this server has already looked at the operator's own `~/.claude` once. */
+const AMBIENT_ADOPTED = "ambient_account_adopted";
+
+/**
+ * What the adopted `~/.claude` is called. Plain and true rather than clever: it is the operator's own
+ * login, the one every unbound agent already runs on, and a label like "default" would read as a
+ * setting rather than as a subscription.
+ */
+const AMBIENT_LABEL = "personal";
+
 /**
  * Accounts: one Claude subscription per `CLAUDE_CONFIG_DIR`, and the row that names it.
  *
@@ -73,6 +83,12 @@ export class AccountManager {
       // being blocked by it — but never silently: `remove` reports how many it cleared.
       roomsOn: db.prepare("SELECT COUNT(*) c FROM rooms WHERE account_id = ?"),
       unbindRooms: db.prepare("UPDATE rooms SET account_id = NULL WHERE account_id = ?"),
+      // Things this server has done once and must not repeat — see `adoptAmbient`.
+      stateOf: db.prepare("SELECT value FROM server_state WHERE key = ?"),
+      setState: db.prepare(
+        "INSERT INTO server_state (key, value, set_at) VALUES (?, ?, ?)"
+        + " ON CONFLICT(key) DO UPDATE SET value = excluded.value, set_at = excluded.set_at",
+      ),
     };
   }
 
@@ -125,6 +141,49 @@ export class AccountManager {
     this.stmts.insert.run(id, label, dir);
     this.announce();
     return this.get(id)!;
+  }
+
+  /**
+   * Adopt the operator's own `~/.claude` as an account — **once, and only if it is already logged in**.
+   *
+   * A machine where Claude Code is set up already *has* a subscription, and SuperFabric already runs
+   * every unbound agent on it (a NULL `account_id` is exactly this directory). Showing "No accounts
+   * yet" there is false: the account is right in front of us, on disk, at the path the CLI documents.
+   * Adopting it makes it visible, gives it a meter (an account with no row cannot be polled, so the
+   * limit monitor was blind to the one subscription most operators use), and lets a room be bound to
+   * it explicitly.
+   *
+   * Three refusals, each of which matters:
+   *
+   * - **Only with credentials present.** An empty `~/.claude`, or one holding only settings, is not
+   *   an account; the login lives in `.credentials.json` (and on macOS may be in the keychain
+   *   instead, which is why this is best-effort discovery and not the only way in).
+   * - **Only once.** `server_state` remembers the adoption, so an operator who removes the row is not
+   *   handed it back on the next boot. A delete that undoes itself is the bug the boot project had.
+   * - **Never a duplicate.** If some account already points at that directory — the operator added it
+   *   by hand — nothing happens, because one directory is one account.
+   *
+   * Returns the account it adopted, or `undefined` when it did nothing. Never throws: a machine with
+   * no home directory readable is a machine that starts with no accounts, not one that fails to boot.
+   */
+  adoptAmbient(configDir: string): AccountInfo | undefined {
+    try {
+      if (this.stmts.stateOf.get(AMBIENT_ADOPTED) != null) return undefined;
+      const dir = path.resolve(configDir);
+      if (!existsSync(path.join(dir, ACCOUNT_CREDENTIALS_FILE))) return undefined;
+      const canonical = realpathSync(dir);
+      // Recorded before the insert, and recorded even when the insert is skipped: "we have looked at
+      // this once" is the fact worth remembering either way.
+      this.stmts.setState.run(AMBIENT_ADOPTED, canonical, this.now());
+      if (this.stmts.byDir.get(canonical) != null) return undefined;
+
+      const id = randomUUID();
+      this.stmts.insert.run(id, AMBIENT_LABEL, canonical);
+      this.announce();
+      return this.get(id)!;
+    } catch {
+      return undefined;
+    }
   }
 
   /**

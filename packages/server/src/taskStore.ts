@@ -78,6 +78,18 @@ export class TaskStore {
             blocked_on_message_id = ?, updated_at = ?
         WHERE id = ?
       `),
+      // What a demolition leaves behind. A card is never deleted because the room or the agent it
+      // named has gone: the work is the operator's, the department was only where it was being done.
+      // Both clear `agent_id` — an assignee only means anything next to the room it works in.
+      unassignRoom: db.prepare(
+        "UPDATE tasks SET room_id = NULL, agent_id = NULL, updated_at = ? WHERE room_id = ?",
+      ),
+      unassignAgent: db.prepare(
+        "UPDATE tasks SET agent_id = NULL, updated_at = ? WHERE agent_id = ?",
+      ),
+      // The one case where cards *are* deleted: the whole factory is going, and a board with no
+      // floor under it is not something anyone would ever look at again.
+      deleteForProject: db.prepare("DELETE FROM tasks WHERE project_id = ?"),
       room: db.prepare("SELECT project_id FROM rooms WHERE id = ?"),
       taskProject: db.prepare("SELECT project_id FROM tasks WHERE id = ?"),
       sessionRoom: db.prepare("SELECT room_id FROM sessions WHERE id = ?"),
@@ -139,6 +151,33 @@ export class TaskStore {
     );
     this.emitChange();
     return parsed;
+  }
+
+  /**
+   * Hand every card owned by a room back to the board, unassigned. Returns how many moved.
+   *
+   * The alternative — deleting them with the room — would throw away the operator's own record of
+   * what the factory owes, because a department was reorganised. An unassigned card is a state the
+   * board already draws and the orchestrator can already route.
+   */
+  unassignRoom(roomId: string): number {
+    const changed = this.stmts.unassignRoom.run(this.now(), roomId).changes;
+    if (changed > 0) this.emitChange();
+    return changed;
+  }
+
+  /** The same for one agent: the card stays where it is, with nobody on it. */
+  unassignAgent(agentId: string): number {
+    const changed = this.stmts.unassignAgent.run(this.now(), agentId).changes;
+    if (changed > 0) this.emitChange();
+    return changed;
+  }
+
+  /** Drop a whole factory's board. Only ever called while the factory itself is being removed. */
+  deleteForProject(projectId: string): number {
+    const changed = this.stmts.deleteForProject.run(projectId).changes;
+    if (changed > 0) this.emitChange();
+    return changed;
   }
 
   /**

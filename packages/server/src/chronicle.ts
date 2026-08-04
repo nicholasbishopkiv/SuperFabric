@@ -129,7 +129,24 @@ export class Chronicle {
         LIMIT ?
       `),
       pathOf: db.prepare("SELECT path FROM decisions WHERE id = ?"),
+      // Index rows only, and only when the whole factory goes. The FTS entries follow by trigger
+      // (migration 16) rather than by a second statement here, for migration 8's reason: the index is
+      // kept in step by construction, not by every delete path remembering.
+      deleteForProject: db.prepare("DELETE FROM decisions WHERE project_id = ?"),
     };
+  }
+
+  /**
+   * Forget a factory's decision *index*. Only ever called while the factory itself is being removed.
+   *
+   * **The ADR files are not touched, and that is the whole point of the design.** A decision is the
+   * markdown file in the project's own `docs/decisions/`; this table is an index over it. Someone who
+   * clones that repository must still find the reasoning, whether or not the factory that produced it
+   * was ever removed from a switcher — deleting their files because they closed a floor would be
+   * SuperFabric taking something that was never ours.
+   */
+  deleteForProject(projectId: string): number {
+    return this.stmts.deleteForProject.run(projectId).changes;
   }
 
   /**

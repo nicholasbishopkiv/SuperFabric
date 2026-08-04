@@ -977,6 +977,36 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * labelled with a job title is not a decision the operator made.
    */
   z.object({ kind: z.literal("set_role"), sessionId: z.string(), roleId: RoleId.nullable() }),
+  /**
+   * End an agent — at the next turn boundary, and for good.
+   *
+   * The counterpart of `interrupt`, which ends a *turn*: this ends the session. The executor is torn
+   * down and the row moves to `done`, so `resumeAll` does not bring it back on the next boot. **Its
+   * transcript is untouched** — the event log is append-only and the operator can still read
+   * everything the agent did. That is the whole difference from `delete_session`, and it is why both
+   * exist: "stop spending my quota" and "I never want to see this again" are different requests, and
+   * answering the first with the second is unrecoverable.
+   *
+   * Not reversible, and the UI says so: a stopped agent is history rather than a paused one. Pausing
+   * is the scheduler's, and it is what a *limit* does to an agent.
+   *
+   * The pause discipline applies: an agent with a turn in flight is stopped at the boundary it is
+   * already heading for, never mid-thought — the tokens that turn has spent would otherwise be
+   * thrown away.
+   */
+  z.object({ kind: z.literal("stop_session"), sessionId: z.string() }),
+  /**
+   * Remove an agent and everything it ever said.
+   *
+   * Stops it first if it is running (see `stop_session`), then deletes its row *and* its event log —
+   * the transcript, the tool calls, the approvals, and the chronicle's index over them. This is the
+   * one operation in SuperFabric that destroys history, so nothing else does it implicitly: deleting
+   * a *room* deletes the agents standing in it, and that is stated where it is asked for.
+   *
+   * A task the agent owned is not deleted with it: the card is unassigned and stays on the board. The
+   * work outlives whoever was doing it.
+   */
+  z.object({ kind: z.literal("delete_session"), sessionId: z.string() }),
   z.object({ kind: z.literal("list_sessions") }),
   /**
    * The role library: the presets this server shipped, plus the operator's own overrides, plus any
@@ -1025,6 +1055,26 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * started in, because there is no way to move a running `query()` into a container.
    */
   z.object({ kind: z.literal("set_room_runtime"), roomId: z.string(), runtime: RoomRuntime }),
+  /**
+   * Take a building off the floor.
+   *
+   * **The folder is never touched.** Room = folder: the row is what SuperFabric adds to a directory,
+   * so removing it hands the directory back exactly as it was — its files, its `CLAUDE.md`, its
+   * `.claude/skills` — and a repository cloned without SuperFabric is unchanged either way. This is
+   * the reason a delete here is a safe thing to offer at all.
+   *
+   * What it does destroy is the agents: every session standing in the room is stopped and deleted
+   * with it, transcripts included, because a session's `cwd` *is* the room and an agent left behind
+   * would be an agent in a department that no longer exists. The client says how many before asking.
+   *
+   * Two things deliberately survive: the room's **tasks**, which are unassigned rather than deleted
+   * (the work outlives the department), and the bus **messages** it sent and received, which are the
+   * record of what the factory did — `messages` has never had a foreign key for exactly this reason.
+   *
+   * The project room is refused: its folder is the project root, and a factory with no central
+   * building is not a factory. Delete the project instead.
+   */
+  z.object({ kind: z.literal("delete_room"), roomId: z.string() }),
   z.object({ kind: z.literal("list_rooms") }),
   // Accounts. Machine-wide rather than project-scoped (see `AccountInfo`), so unlike every other
   // listing here these four take no project and their answer is the same on every floor.
@@ -1089,6 +1139,23 @@ export const ClientMessage = z.discriminatedUnion("kind", [
     name: z.string().min(1).max(120).optional(),
   }),
   z.object({ kind: z.literal("open_project"), projectId: z.string() }),
+  /**
+   * Remove a factory from the switcher: its rooms, its agents and their transcripts, its board, its
+   * bus traffic and its chronicle *index*.
+   *
+   * **Nothing on disk is touched** — not the project root, not a room's folder, and not the ADR files
+   * in `docs/decisions/`, which are the decisions themselves and belong to the repository rather than
+   * to us. What goes is everything SuperFabric wrote *about* the folder.
+   *
+   * Two refusals, both because the alternative would be a lie. The project whose root this server was
+   * started in is re-created on the next boot, so deleting it would undo itself — point the server at
+   * another folder (`SUPERFABRIC_PROJECT`) if it should not be there. And the last remaining project
+   * is refused, because a server with no factory has no floor to show and would simply seed one back.
+   *
+   * Tabs looking at the deleted floor are moved to another one and told; they cannot be left holding
+   * a project id that no longer resolves.
+   */
+  z.object({ kind: z.literal("delete_project"), projectId: z.string() }),
   // Onboarding. Four messages for one conversation with the factory itself: what is the state, start
   // the interview, approve what it proposed, drop what it got wrong. All scoped to the asking
   // socket's own project, like every other per-factory message here.
@@ -1334,7 +1401,18 @@ export const ServerMessage = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("projects"),
     projects: z.array(ProjectInfo),
-    activeProjectId: z.string(),
+    /**
+     * `null` when this server has no factory at all — a fresh install, and now the *normal* first
+     * state rather than an impossible one.
+     *
+     * SuperFabric used to invent a project from the folder it happened to be started in, which meant
+     * a first run always produced a factory over its own source tree that nothing could remove. A
+     * project root is the operator's own repository and choosing one is the first real decision they
+     * make, so the server no longer guesses: with nothing configured, the floor is empty, every
+     * listing is empty, and the UI asks for a folder. `SUPERFABRIC_PROJECT` still seeds one, because
+     * that is somebody saying it rather than the server assuming it.
+     */
+    activeProjectId: z.string().nullable(),
   }),
   z.object({ kind: z.literal("error"), message: z.string() }),
   /**

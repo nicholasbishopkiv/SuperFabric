@@ -288,6 +288,48 @@ const MIGRATIONS: readonly Migration[] = [
       .get();
     if (has == null) db.exec("ALTER TABLE usage_snapshots ADD COLUMN limited_by TEXT;");
   },
+  // 16 — the other half of the Chronicle's trigger contract: AFTER DELETE.
+  //
+  // Migration 8 says in as many words that both indexed tables are append-only and that "AFTER INSERT
+  // is the entire contract", which was true right up until an operator could delete an agent. A
+  // transcript removed from `events` while its rows stayed in `chronicle_fts` would leave the index
+  // answering with text nothing holds any more — search would quote a deleted agent, and the row it
+  // pointed at (`ref`/`seq`) would resolve to nothing. That is worse than not finding it: the whole
+  // value of the index is that a hit is evidence.
+  //
+  // In SQL beside the insert triggers rather than as a DELETE statement in `SessionManager`, and for
+  // migration 8's own reason: the index is kept in step *by construction*, so every delete path —
+  // this milestone's, and whatever deletes next — is covered without having to remember. The
+  // predicate is `kind` plus `ref` plus `seq`, which is exactly the identity the insert triggers
+  // write; a row the insert trigger skipped (a `tool_result`, an empty status) simply matches
+  // nothing.
+  `
+    CREATE TRIGGER IF NOT EXISTS events_ad AFTER DELETE ON events BEGIN
+      DELETE FROM chronicle_fts
+      WHERE kind = 'event' AND ref = old.session_id AND seq = old.seq;
+    END;
+    CREATE TRIGGER IF NOT EXISTS decisions_ad AFTER DELETE ON decisions BEGIN
+      DELETE FROM chronicle_fts WHERE kind = 'decision' AND ref = old.id;
+    END;
+  `,
+  // 17 — one row per thing this server has done **once**, and must not do again.
+  //
+  // The first is adopting the operator's own `~/.claude` as an account: a machine that already has
+  // Claude Code logged in should show that subscription and its meters on first run rather than an
+  // empty list, but it must be *adoptable once*. Without a marker, an operator who removed that row
+  // would find it back after the next restart — the same "delete that undoes itself" the boot project
+  // used to have, and the reason that one is gone.
+  //
+  // Key/value rather than a column per fact: these are decisions the *server* has made about itself,
+  // they arrive one at a time, and a table that grows a column per boot-time behaviour would need a
+  // migration for each. Nothing an operator ever reads, so no listing and no wire type.
+  `
+    CREATE TABLE IF NOT EXISTS server_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      set_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+  `,
 ];
 
 /**

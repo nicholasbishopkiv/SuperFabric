@@ -21,6 +21,7 @@ function build() {
   const db = openDb(":memory:");
   const store = new EventStore(db);
   const projects = new ProjectManager(db, dir);
+  projects.defaultProject(); // the floor this socket lands on — nothing is seeded from cwd any more
   const rooms = new RoomManager(db, projects);
   const mgr = new SessionManager(db, store, new FakeExecutor(), rooms, projects);
   const hub = new WsHub(store, mgr, rooms, projects, { sessionsDebounceMs: 1 });

@@ -208,6 +208,39 @@ and a subscription limit monitor with auto-pause/resume.
   someone opens one is not a thing they asked for), and `Chronicle.indexImported` writes an index row
   **only when the ADR file is actually present** — the decision is the file, still.
 
+- **A delete never touches a file, and it says what it takes before it takes it.** Removing a room,
+  an agent or a whole factory removes *rows* — never a folder, never a `CLAUDE.md`, never a skill
+  directory, and never an ADR in `docs/decisions/`. That is not caution, it is "room = folder" read
+  from the other end: the row is what SuperFabric added, so removing it hands the directory back as
+  it was, and this is the only reason a delete is safe to offer at all. The order is fixed in
+  `demolition.ts` — **refuse before you destroy** (the project room, the boot project, the last
+  project, all checked before an executor is stopped), then live processes, then rows — and so is
+  what *survives*: a room's **tasks** (unassigned, never deleted — the work outlives the department),
+  its **bus messages** (`messages` has no foreign key precisely for this), and a deleted agent's
+  **room suggestions** (an offer the operator has not answered is not ours to withdraw). Exactly two
+  things are destroyed on purpose: an agent's transcript when that agent is deleted, and a factory's
+  records when that factory is. `stop_session` is the other half of the pair and destroys nothing —
+  it ends an agent at a turn boundary (the pause discipline, for the pause's reason) and leaves every
+  word readable. The UI never asks "Are you sure?": `ConfirmDelete` shows the consequence in words
+  and the counts come from this floor, now (`hud/removal.ts`, tested as pure functions).
+- **Nothing invents a factory, and nothing invents an account.** The server creates a project only
+  from an explicit `SUPERFABRIC_PROJECT`; the directory it happens to be started in is not an
+  instruction, and treating it as one is how a first run used to produce a floor over SuperFabric's
+  own checkout — one nobody chose and, once rooms could be deleted, one that came back every boot.
+  With nothing configured there are **no projects**, `activeProjectId` is `null` on the wire, every
+  listing answers empty, everything that would build something is refused in words that say what to
+  do, and the UI's first-run screen asks for a folder (`hud/FirstRun.tsx`, `hud/QuickGuide.tsx`).
+  The one thing that *is* adopted is the opposite case: an existing, logged-in `~/.claude` is a
+  subscription that already exists on the machine and that every unbound agent already spends, so
+  `AccountManager.adoptAmbient` turns it into a visible account with a meter — **once**, recorded in
+  `server_state`, so removing it sticks.
+- **The chronicle index is kept in step by triggers, in both directions.** Migration 8 indexes
+  `events` and `decisions` on insert; **migration 16 removes them on delete**. A search that quoted a
+  transcript nobody holds any more is worse than a search that finds nothing — the whole value of a
+  hit is that it is evidence. Anything that learns to delete rows from those two tables is covered by
+  construction, which is why this lives in SQL beside the insert triggers rather than in whichever
+  manager happens to be deleting.
+
 ## Autonomy (per-agent permission mode)
 
 Three modes, in our own vocabulary (`AutonomyMode` in `packages/shared/src/protocol.ts`):
@@ -382,7 +415,13 @@ originally sketched; that was consciously changed and the reason is recorded in 
 See `docs/ROADMAP.md` for the acceptance evidence of each, including the live onboarding
 transcript and M4's isolation proofs from inside a running container.
 
-**1355 tests green** (shared 88, server 813 + 1 skipped live-quota test, web 424, agent-runner 30).
+Since then: **removing things** — an agent (stopped, or deleted with its transcript), a room, or a
+whole factory, none of which touches a file — and **a first run that asks rather than guesses**: no
+project is invented from the server's working directory, the UI opens on a folder field plus a quick
+guide, and a logged-in `~/.claude` found on disk is adopted as a visible account. See the "Removing
+things" and "First run" sections of `docs/ROADMAP.md`.
+
+**1391 tests green** (shared 88, server 842 + 1 skipped live-quota test, web 431, agent-runner 30).
 
 **What is *not* built is listed at the end of `docs/ROADMAP.md`** and is worth reading before you
 add a doc sentence that implies otherwise — there are no notifications off the browser tab, eleven
@@ -390,6 +429,14 @@ role presets rather than fifty, one provider behind the `Executor` seam, no fold
 per-turn token counts, and no serialised OAuth refresh within a single account.
 
 ## Running it
+
+`./scripts/setup.sh` bootstraps a bare machine — system packages, Node 22+, pnpm, Bun, the `claude`
+CLI, the plugin toolkit agents draw skills from, and `pnpm install`. It detects before it installs,
+re-runs safely, and ends with a summary in which every component is present, installed-now or
+missing-with-the-fix. `--dry-run` changes nothing. It never logs anyone in.
+
+**The first run has no factory.** Point the UI at a project folder (or set `SUPERFABRIC_PROJECT`);
+nothing is created from the server's own working directory.
 
 ```bash
 pnpm install                      # pnpm, not bun install
@@ -535,6 +582,9 @@ README names).
   burn rate and cost-equivalent under them plus this factory's spend by room (`BurnRate.tsx` —
   a duration at a resolution the readings support, and "Time left: unknown" with the server's
   reason in the place the figure would have been),
+  removing things (`ConfirmDelete.tsx` — two steps, and the armed state shows the consequence in
+  words rather than "Are you sure?"; `removal.ts` — those sentences as pure functions, because a
+  plural that lies is not visible in a screenshot),
   export/import in the project switcher (`FactoryTransfer.tsx` — the import's *problems* list is
   the point of the surface and stays up until dismissed; the download happens in an effect,
   because writing a file is a DOM side effect and the store is a reducer),
@@ -542,6 +592,10 @@ README names).
   — the shared collapsible edge-panel chrome all three edges are built from) ·
   the role picker (`RoleSelect.tsx` — name plus its one-line summary, on the room panel's
   "New agents arrive as" line and on every agent row),
+  `FirstRun.tsx` (the screen a server with no factory opens on: one folder field, and the guide that
+  makes it answerable) and `QuickGuide.tsx` (the six lines about how this works — shown there and in
+  the help popover, because a guide you can only read before you have a factory is one nobody can
+  re-read),
   `Onboarding.tsx` (first contact, over the floor: the offer on an un-onboarded project, the
   "under way" strip, and the accept/edit room list — `onboardingSurface` is the one pure function
   that decides which of the four, so "prominent only when un-onboarded" is testable),

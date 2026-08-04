@@ -38,6 +38,10 @@ function makeHub(opts: {
   const store = new EventStore(db);
   const exec = new FakeExecutor(opts.script ? { script: opts.script } : {});
   const projects = new ProjectManager(db, opts.root ?? tmpdir());
+  // The floor these sockets land on. Explicit since the server stopped inventing a factory from the
+  // directory it runs in: `attach` lands a socket on the last-opened project, and a server with none
+  // leaves it on no floor (see `wsHubEmpty.test.ts`).
+  projects.defaultProject();
   const rooms = new RoomManager(db, projects);
   const tasks = new TaskStore(db, projects);
   const chronicle = new Chronicle(db, projects, opts.now ?? (() => 1_800_000_000));
@@ -85,6 +89,7 @@ describe("WsHub", () => {
     const store = new EventStore(db);
     const exec = new FakeExecutor();
     const projects = new ProjectManager(db, tmpdir());
+    projects.defaultProject();
     const rooms = new RoomManager(db, projects);
     const mgr = new SessionManager(db, store, exec, rooms, projects);
     const hub = new WsHub(store, mgr, rooms, projects);
@@ -113,6 +118,7 @@ describe("WsHub", () => {
     const store = new EventStore(db);
     const exec = new FakeExecutor({ script: [{ tool: "Bash", input: {} }] });
     const projects = new ProjectManager(db, tmpdir());
+    projects.defaultProject();
     const rooms = new RoomManager(db, projects);
     const mgr = new SessionManager(db, store, exec, rooms, projects);
     const hub = new WsHub(store, mgr, rooms, projects);
@@ -143,6 +149,7 @@ describe("WsHub", () => {
     const store = new EventStore(db);
     const exec = new FakeExecutor();
     const projects = new ProjectManager(db, tmpdir());
+    projects.defaultProject();
     const rooms = new RoomManager(db, projects);
     const mgr = new SessionManager(db, store, exec, rooms, projects);
     const hub = new WsHub(store, mgr, rooms, projects);

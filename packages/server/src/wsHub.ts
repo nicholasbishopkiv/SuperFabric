@@ -1,6 +1,7 @@
 import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@superfabric/shared";
 import type { AccountLoginManager } from "./accountLogin.js";
 import type { AccountManager } from "./accountManager.js";
+import type { Demolition } from "./demolition.js";
 import type { FactoryPortability } from "./factoryPortability.js";
 import type { LimitMonitor } from "./limitMonitor.js";
 import type { MetricsStore } from "./metricsStore.js";
@@ -86,6 +87,12 @@ export interface WsHubOptions {
    * the shape of every other optional collaborator here.
    */
   portability?: FactoryPortability;
+  /**
+   * Removing an agent, a room or a factory. Absent => the three deletes are refused with an error
+   * rather than half-done — the shape of every other optional collaborator here, and the one where
+   * "silently do part of it" would be least forgivable.
+   */
+  demolition?: Demolition;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -119,6 +126,7 @@ export class WsHub {
   private readonly onboarding: OnboardingManager | undefined;
   private readonly metrics: MetricsStore | undefined;
   private readonly transfer: FactoryPortability | undefined;
+  private readonly demolition: Demolition | undefined;
 
   constructor(
     private store: EventStore,
@@ -139,6 +147,7 @@ export class WsHub {
     this.onboarding = opts.onboarding;
     this.metrics = opts.metrics;
     this.transfer = opts.portability;
+    this.demolition = opts.demolition;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -194,7 +203,11 @@ export class WsHub {
    */
   attach(sock: SocketLike): void {
     this.subs.set(sock, new Map());
-    this.active.set(sock, this.projects.lastOpened().id);
+    // `undefined` on a server with no factory yet — a fresh install, which is a state rather than a
+    // failure. Nothing is seeded here: a socket attaching is someone opening a browser tab, and a
+    // browser tab is not a decision about which folder this operator works in.
+    const landing = this.projects.lastOpened();
+    if (landing !== undefined) this.active.set(sock, landing.id);
   }
 
   detach(sock: SocketLike): void {
@@ -202,9 +215,31 @@ export class WsHub {
     this.active.delete(sock);
   }
 
-  /** Which factory a socket is looking at. Falls back to the default project for a socket we lost. */
-  private activeProject(sock: SocketLike): string {
-    return this.active.get(sock) ?? this.projects.defaultProject().id;
+  /**
+   * Which factory a socket is looking at, or `null` when this server has none.
+   *
+   * It used to fall back to "the project for the directory the server runs in", creating it if it was
+   * not there — which is how a first run produced a factory over SuperFabric's own source tree. There
+   * is no fallback now: an empty server answers empty listings and the UI asks for a folder.
+   */
+  private activeProject(sock: SocketLike): string | null {
+    return this.active.get(sock) ?? null;
+  }
+
+  /**
+   * The same, for everything that cannot mean anything without a floor — creating a room, an agent, a
+   * task, starting an interview. Refused in words the operator can act on rather than by inventing a
+   * project for them.
+   */
+  private requireProject(sock: SocketLike): string {
+    const projectId = this.activeProject(sock);
+    if (projectId === null) {
+      throw new Error(
+        "this server has no factory yet — point it at a project folder first (the switcher at the "
+        + "top left, or set SUPERFABRIC_PROJECT before starting the server)",
+      );
+    }
+    return projectId;
   }
 
   /**
@@ -279,7 +314,7 @@ export class WsHub {
             // Omitted => a plain agent. An unknown id throws into the catch below rather than
             // quietly starting a session that is not what was asked for.
             roleId: msg.roleId,
-            projectId: this.activeProject(sock),
+            projectId: this.requireProject(sock),
           });
           this.broadcastSessions();
           // The room's agentCount just changed; refresh it in the same round trip so the building's
@@ -324,9 +359,61 @@ export class WsHub {
             (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
           );
           break;
-        case "list_sessions":
-          this.safeSend(sock, { kind: "sessions", sessions: this.mgr.listSessions(this.activeProject(sock)) });
+        // Ending an agent. The counterpart of `interrupt` (which ends a turn), and reported as a
+        // notice rather than silently, because the interesting case is the one where nothing appears
+        // to happen: an agent mid-turn stops at the boundary it is already heading for.
+        case "stop_session": {
+          this.requireSessionOnFloor(sock, msg.sessionId);
+          void this.mgr.stopSession(msg.sessionId, "stopped by the operator").then(
+            (outcome) => {
+              this.broadcastSessions();
+              this.safeSend(sock, {
+                kind: "notice",
+                message: outcome === "at-turn-boundary"
+                  ? "this agent is finishing its turn and then stops — its transcript stays; "
+                    + "interrupt it first if you want the turn cut short"
+                  : outcome === "already-stopped"
+                    ? "this agent had already stopped"
+                    : "agent stopped — its transcript stays, and it will not come back on a restart",
+              });
+            },
+            (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
+          );
           break;
+        }
+        // The one message that destroys history, so it says exactly what it destroyed. The room's
+        // agent count changes with it, hence the second broadcast — the same pair `create_session`
+        // sends, in reverse.
+        case "delete_session": {
+          this.requireSessionOnFloor(sock, msg.sessionId);
+          void this.demolisher().deleteSession(msg.sessionId).then(
+            (removed) => {
+              this.broadcastSessions();
+              if (removed.roomId !== null) this.broadcastRooms();
+              this.safeSend(sock, {
+                kind: "notice",
+                message: "agent removed, with everything it said"
+                  + (removed.tasksUnassigned === 0
+                    ? ""
+                    : ` — ${removed.tasksUnassigned} task${removed.tasksUnassigned === 1 ? " it owned is" : "s it owned are"} `
+                      + "back on the board, unassigned"),
+              });
+            },
+            (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
+          );
+          break;
+        }
+        // The listings below answer **empty** rather than refusing when this server has no factory:
+        // a client asks for all of them on connect, and a first run would otherwise open on a wall of
+        // errors instead of on the one question it needs answered.
+        case "list_sessions": {
+          const projectId = this.activeProject(sock);
+          this.safeSend(sock, {
+            kind: "sessions",
+            sessions: projectId === null ? [] : this.mgr.listSessions(projectId),
+          });
+          break;
+        }
         // The role library, with its own failures attached. Machine-wide like the accounts — a role
         // is a file on this machine, not a property of a factory — so the answer is the same on every
         // floor and, like every other listing, it goes to the socket that asked.
@@ -340,7 +427,7 @@ export class WsHub {
         // socket is subscribed to it so the operator can watch it work. It stands in the project room,
         // so the central building's agent count changes too.
         case "ensure_orchestrator": {
-          const projectId = this.activeProject(sock);
+          const projectId = this.requireProject(sock);
           const { sessionId, created } = ensureOrchestrator(
             { sessions: this.mgr, rooms: this.rooms }, projectId,
           );
@@ -365,7 +452,7 @@ export class WsHub {
           // `path` given => the room's folder is exactly that, anywhere on disk; omitted => the
           // default `<project root>/<name>`, which still has to stay inside the root.
           this.rooms.createRoom(msg.name, {
-            projectId: this.activeProject(sock),
+            projectId: this.requireProject(sock),
             ...(msg.path !== undefined ? { path: msg.path } : {}),
           });
           this.broadcastRooms();
@@ -420,7 +507,7 @@ export class WsHub {
           this.broadcastRooms();
           this.broadcastSessions();
           const live = this.mgr
-            .listSessions(this.activeProject(sock))
+            .listSessions(this.requireProject(sock))
             .filter((s) => s.roomId === room.id && s.runtime !== null && s.runtime !== msg.runtime);
           const where = msg.runtime === "container"
             ? "in a container — only this room's folder and its account's credentials, capped CPU, "
@@ -437,9 +524,40 @@ export class WsHub {
           });
           break;
         }
-        case "list_rooms":
-          this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms(this.activeProject(sock)) });
+        // Taking a building off the floor. The notice names the two things an operator cannot see
+        // from the floor going quiet: the folder is still there, and the agents that stood in it are
+        // not — the client warned about the second before asking, and this confirms what happened.
+        case "delete_room": {
+          this.requireRoomOnFloor(sock, msg.roomId);
+          void this.demolisher().deleteRoom(msg.roomId).then(
+            (removed) => {
+              this.broadcastRooms();
+              this.broadcastSessions();
+              const agents = removed.agents === 0
+                ? ""
+                : `, and ${removed.agents} agent${removed.agents === 1 ? "" : "s"} with it`;
+              const tasks = removed.tasksUnassigned === 0
+                ? ""
+                : ` — ${removed.tasksUnassigned} task${removed.tasksUnassigned === 1 ? " is" : "s are"} `
+                  + "back on the board, unassigned";
+              this.safeSend(sock, {
+                kind: "notice",
+                message: `room ${removed.room.name} removed${agents}. Its folder is untouched: `
+                  + `${removed.room.path} is exactly as it was${tasks}`,
+              });
+            },
+            (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
+          );
           break;
+        }
+        case "list_rooms": {
+          const projectId = this.activeProject(sock);
+          this.safeSend(sock, {
+            kind: "rooms",
+            rooms: projectId === null ? [] : this.rooms.listRooms(projectId),
+          });
+          break;
+        }
         // Accounts. The one group of messages here that is *not* scoped to a project: a subscription is
         // the operator's and serves every factory, so the answer goes to every socket rather than only
         // to those on one floor. See `AccountInfo`.
@@ -455,12 +573,15 @@ export class WsHub {
         // Burn rate and cost, from readings and log rows this server already holds. Like `list_usage`
         // it reads nothing over the network — and unlike it, it is scoped, because the room half of
         // the answer belongs to one floor.
-        case "list_metrics":
-          this.safeSend(sock, {
-            kind: "metrics",
-            metrics: this.metricStore().snapshot(this.activeProject(sock)),
-          });
+        // Metrics and onboarding are the two listings with nothing to say about a floor that does not
+        // exist — a `FactoryMetrics` or an `OnboardingState` for no project would have to invent an
+        // id. Nothing is sent, and the client keeps the null it started with.
+        case "list_metrics": {
+          const projectId = this.activeProject(sock);
+          if (projectId === null) break;
+          this.safeSend(sock, { kind: "metrics", metrics: this.metricStore().snapshot(projectId) });
           break;
+        }
         case "create_account": {
           // The store announces its own change (see the constructor), so the fresh list reaches every
           // tab without this branch having to push it — the same arrangement the board has.
@@ -515,20 +636,54 @@ export class WsHub {
           break;
         }
         case "open_project": this.openProject(sock, msg.projectId); break;
+        // Removing a whole factory. Unlike `export_project` this is *not* restricted to the floor this
+        // tab is on: deleting reads nothing, and the switcher lists every project — being made to
+        // switch to a factory in order to remove it would be a strange dance. Every tab that *was*
+        // looking at it has to be moved, though, because its project id no longer resolves.
+        case "delete_project": {
+          const wasLookingAt = [...this.subs.keys()]
+            .filter((s) => this.activeProject(s) === msg.projectId);
+          void this.demolisher().deleteProject(msg.projectId).then(
+            (removed) => {
+              // `undefined` when that was the last factory: those tabs are moved to no floor at all
+              // and the UI shows its first-run screen again, which is the truth.
+              const fallback = this.projects.lastOpened();
+              for (const other of wasLookingAt) {
+                // Only sockets still attached: a failed send during the move detaches them.
+                if (!this.subs.has(other)) continue;
+                if (fallback === undefined) this.leaveProject(other);
+                else this.openProject(other, fallback.id);
+              }
+              for (const other of [...this.subs.keys()]) this.sendProjects(other);
+              this.safeSend(sock, {
+                kind: "notice",
+                message: `factory ${removed.project.name} removed — ${removed.rooms} room(s), `
+                  + `${removed.agents} agent(s) and ${removed.tasks} task(s). Nothing on disk was `
+                  + `touched: ${removed.project.root} still holds every folder, charter and ADR `
+                  + "the factory wrote",
+              });
+            },
+            (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
+          );
+          break;
+        }
         // Onboarding. A query, then three changes — and every one of them answers with the whole
         // state rather than a delta, like the room list does, so a client can rebuild the surface
         // from one frame and never has to merge.
-        case "list_onboarding":
+        case "list_onboarding": {
+          const projectId = this.activeProject(sock);
+          if (projectId === null) break;
           this.safeSend(sock, {
             kind: "onboarding",
-            onboarding: this.onboardingStore().state(this.activeProject(sock)),
+            onboarding: this.onboardingStore().state(projectId),
           });
           break;
+        }
         // Idempotent like `ensure_orchestrator`, and answered the same way: the notice is what tells
         // the operator where the interview is happening, because the agent stands in the project room
         // and its first question arrives in the console like any other turn.
         case "start_onboarding": {
-          const projectId = this.activeProject(sock);
+          const projectId = this.requireProject(sock);
           const { sessionId, created } = this.onboardingStore().start(projectId);
           this.broadcastSessions();
           this.broadcastRooms();
@@ -547,7 +702,7 @@ export class WsHub {
         // room panel's own form uses, with the same invariants. Nothing an agent said reached a
         // folder until this message arrived.
         case "accept_room_suggestions": {
-          const projectId = this.activeProject(sock);
+          const projectId = this.requireProject(sock);
           const result = this.onboardingStore().accept(projectId, msg.rooms);
           if (result.created.length > 0) this.broadcastRooms();
           this.scheduleBroadcast("onboarding");
@@ -564,7 +719,7 @@ export class WsHub {
           break;
         }
         case "dismiss_room_suggestion":
-          this.onboardingStore().dismiss(this.activeProject(sock), msg.suggestionId);
+          this.onboardingStore().dismiss(this.requireProject(sock), msg.suggestionId);
           this.scheduleBroadcast("onboarding");
           break;
         // Tasks. The board is global state like rooms are, so a change is broadcast — on the
@@ -576,7 +731,7 @@ export class WsHub {
         case "create_task": {
           const task = this.taskStore().create({
             title: msg.title, detail: msg.detail, roomId: msg.roomId,
-            projectId: this.activeProject(sock),
+            projectId: this.requireProject(sock),
           });
           // A card with no room is the intended path, and this is where routing starts: the
           // orchestrator is sent a message describing it and the floor. With no orchestrator nothing
@@ -605,20 +760,30 @@ export class WsHub {
             ...(msg.agentId !== undefined ? { agentId: msg.agentId } : {}),
           });
           break;
-        case "list_tasks":
-          this.safeSend(sock, { kind: "tasks", tasks: this.taskStore().list(this.activeProject(sock)) });
+        case "list_tasks": {
+          const projectId = this.activeProject(sock);
+          this.safeSend(sock, {
+            kind: "tasks",
+            tasks: projectId === null ? [] : this.taskStore().list(projectId),
+          });
           break;
+        }
         // A query like the others: the socket that asked gets the bus's newest traffic, and nobody
         // else is spammed with a list they already hold.
-        case "list_messages":
-          this.safeSend(sock, { kind: "messages", messages: this.busStore().list(this.activeProject(sock)) });
+        case "list_messages": {
+          const projectId = this.activeProject(sock);
+          this.safeSend(sock, {
+            kind: "messages",
+            messages: projectId === null ? [] : this.busStore().list(projectId),
+          });
           break;
+        }
         // The chronicle, as the operator's own copy of `factory_search_history`: the same index, the
         // same hits, answered to the socket that asked. An empty query is "show me what has been
         // decided here", which is the question someone opening the surface actually has.
         case "search_chronicle": {
           const chronicle = this.chronicleStore();
-          const projectId = this.activeProject(sock);
+          const projectId = this.requireProject(sock);
           const limit = msg.limit ?? CHRONICLE_SEARCH_LIMIT;
           const hits = msg.query.trim() === ""
             ? chronicle.recentHits(projectId, limit)
@@ -631,10 +796,10 @@ export class WsHub {
         // Portability. An export is a read of this socket's own floor — answered to the socket that
         // asked, never broadcast, because it is a file the operator started downloading.
         case "export_project": {
-          const projectId = msg.projectId ?? this.activeProject(sock);
+          const projectId = msg.projectId ?? this.requireProject(sock);
           // A client holding another project's id must not be able to read that factory's shape
           // through this socket, for the same reason `requireRoomOnFloor` exists.
-          if (projectId !== this.activeProject(sock)) {
+          if (projectId !== this.requireProject(sock)) {
             throw new Error("a factory can only be exported from the floor this tab is looking at");
           }
           this.safeSend(sock, { kind: "factory_export", factory: this.portability().export(projectId) });
@@ -677,6 +842,9 @@ export class WsHub {
     // "cannot happen" skipped socket happens.
     for (const sock of [...this.subs.keys()]) {
       const projectId = this.activeProject(sock);
+      // A socket on no floor has nothing to be told about one. It gets its state the moment it opens
+      // a project, which is the only thing it can do from there.
+      if (projectId === null) continue;
       const group = byProject.get(projectId);
       if (group === undefined) byProject.set(projectId, [sock]);
       else group.push(sock);
@@ -826,6 +994,25 @@ export class WsHub {
   }
 
   /**
+   * Point one socket at no factory at all — what is left after the operator deletes the one it was
+   * looking at and there is no other.
+   *
+   * Deliberately the same shape as `openProject`: the scope is dropped, the session subscriptions go
+   * with it (their transcripts have just been deleted), and the socket is handed the empty floor
+   * rather than left holding the last one it saw. An empty server is a state the UI draws — its
+   * first-run screen — not an error to report.
+   */
+  private leaveProject(sock: SocketLike): void {
+    this.active.delete(sock);
+    this.subs.set(sock, new Map());
+    this.sendProjects(sock);
+    this.safeSend(sock, { kind: "rooms", rooms: [] });
+    this.safeSend(sock, { kind: "sessions", sessions: [] });
+    if (this.tasks !== undefined) this.safeSend(sock, { kind: "tasks", tasks: [] });
+    if (this.bus !== undefined) this.safeSend(sock, { kind: "messages", messages: [] });
+  }
+
+  /**
    * Point one socket at another factory. `ProjectManager.open` throws for an unknown id (reported as
    * an error, nothing changed), then this socket is re-scoped and handed a complete fresh set of
    * lists — rooms, agents, board, bus traffic — because the client throws away everything it held for
@@ -872,9 +1059,31 @@ export class WsHub {
   private requireRoomOnFloor(sock: SocketLike, roomId: string): void {
     const projectId = this.rooms.projectOf(roomId);
     if (projectId === undefined) throw new Error(`unknown room ${roomId}`);
-    if (projectId !== this.activeProject(sock)) {
+    if (projectId !== this.requireProject(sock)) {
       throw new Error(`room ${roomId} belongs to another project`);
     }
+  }
+
+  /**
+   * Refuse to touch an agent that is not on the floor this socket is looking at — the twin of
+   * `requireRoomOnFloor`, and needed for the same reason: session ids are globally unique, so without
+   * it a client holding another project's id could stop or delete an agent on a floor it cannot see,
+   * and the change would be announced to operators who never asked for it.
+   */
+  private requireSessionOnFloor(sock: SocketLike, sessionId: string): void {
+    const projectId = this.mgr.projectOf(sessionId);
+    if (projectId === undefined) throw new Error(`unknown session ${sessionId}`);
+    if (projectId !== this.requireProject(sock)) {
+      throw new Error(`session ${sessionId} belongs to another project`);
+    }
+  }
+
+  /** Likewise for demolition: "this server does not delete" is an answer; half a delete is not. */
+  private demolisher(): Demolition {
+    if (this.demolition === undefined) {
+      throw new Error("this server cannot remove agents, rooms or factories");
+    }
+    return this.demolition;
   }
 
   /** Likewise for the router: a factory with no routing says so rather than swallowing the request. */

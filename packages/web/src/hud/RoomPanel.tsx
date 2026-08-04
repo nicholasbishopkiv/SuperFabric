@@ -1,7 +1,8 @@
 import type { AutonomyMode, RoomRuntime, SessionInfo } from "@superfabric/shared";
 import { RoomName } from "@superfabric/shared";
 import {
-  BotIcon, CircleUserIcon, FlagIcon, FolderIcon, PencilIcon, PlusIcon, ShieldIcon, WarehouseIcon,
+  BotIcon, CircleStopIcon, CircleUserIcon, FlagIcon, FolderIcon, PencilIcon, PlusIcon, ShieldIcon,
+  WarehouseIcon,
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import type { FactoryStatus } from "../store";
@@ -21,6 +22,7 @@ import {
   useRoomTaskCount,
   useSelectedRoomId,
   useAccounts,
+  useAgentTaskCount,
   useRoleProblems,
 } from "../store";
 import { Badge } from "../ui/badge";
@@ -30,6 +32,8 @@ import { cn } from "../ui/utils";
 import { send } from "../wsClient";
 import { AccountSelect } from "./AccountSelect";
 import { AutonomySelect } from "./AutonomySelect";
+import { ConfirmDelete } from "./ConfirmDelete";
+import { agentRemovalWarning, roomRemovalWarning } from "./removal";
 import { ModelSelect } from "./ModelSelect";
 import { RoleSelect } from "./RoleSelect";
 import { RUNTIME_SUMMARY, RuntimeSelect } from "./RuntimeSelect";
@@ -185,6 +189,45 @@ function OrchestratorLine({ connected }: { connected: boolean }) {
   );
 }
 
+/**
+ * Ending an agent, and removing it — the two halves of "I am done with this one", kept apart because
+ * they are not the same request.
+ *
+ * `stop_session` ends the session and keeps every word of it; `delete_session` takes the transcript
+ * too. So stopping is one click (it destroys nothing that cannot be read afterwards) and deleting is
+ * armed first, with the count of what goes with it. An already-stopped agent keeps only the delete —
+ * offering to stop it again would be a button that does nothing.
+ */
+function AgentControls({ agent, connected }: { agent: SessionInfo; connected: boolean }) {
+  const owned = useAgentTaskCount(agent.id);
+  const stopped = agent.state === "done" || agent.state === "error";
+
+  return (
+    <>
+      {!stopped && (
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          className="text-fg-faint hover:text-fg"
+          onClick={() => send({ kind: "stop_session", sessionId: agent.id })}
+          disabled={!connected}
+          title="End this agent. Its transcript stays, and it does not come back on a restart — a turn in flight finishes first."
+          aria-label="Stop agent"
+        >
+          <CircleStopIcon />
+        </Button>
+      )}
+      <ConfirmDelete
+        title="Remove this agent and everything it said"
+        what={agentRemovalWarning(owned)}
+        onConfirm={() => send({ kind: "delete_session", sessionId: agent.id })}
+        disabled={!connected}
+        className="basis-full"
+      />
+    </>
+  );
+}
+
 /** One agent of the selected room: what it is doing, how much rope it has, and what it runs on. */
 function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolean }) {
   const status = agentStatus(agent);
@@ -284,6 +327,7 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
           short
           onChange={(accountId) => send({ kind: "set_session_account", sessionId: agent.id, accountId })}
         />
+        <AgentControls agent={agent} connected={connected} />
       </span>
     </div>
   );
@@ -591,7 +635,52 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
           agents.map((a) => <AgentLine key={a.id} agent={a} connected={connected} />)
         )}
       </div>
+
+      {/* The project room has no delete: its folder is the project root, so removing it would mean
+          removing the factory — which is what the project switcher's own delete is for. */}
+      {room.kind !== "project" && (
+        <DeleteRoomLine roomId={roomId} connected={connected} />
+      )}
     </PanelSection>
+  );
+}
+
+/**
+ * Taking this building off the floor.
+ *
+ * At the bottom of the room's own section, under everything it is made of, because that is the order
+ * an operator reads it in — and because a destructive control beside the "+ agent" button in the
+ * header would be one slip away from the thing they use most.
+ *
+ * The sentence is the feature. Two facts decide whether this is safe to click and neither is visible
+ * from the floor: the folder survives untouched, and the agents standing here do not.
+ */
+function DeleteRoomLine({ roomId, connected }: { roomId: string; connected: boolean }) {
+  const room = useRoom(roomId);
+  const agents = useRoomAgentCount(roomId);
+  const tasks = useRoomTaskCount(roomId);
+  const clearError = useFabric((s) => s.clearError);
+  if (room === undefined) return null;
+
+  return (
+    <div className="mt-2 border-t border-line/60 pt-2">
+      <ConfirmDelete
+        label="Delete this room"
+        title={`Take ${room.name} off the floor — the folder is not touched`}
+        confirmLabel="Delete room"
+        what={roomRemovalWarning({ agents, tasks })}
+        onConfirm={() => {
+          clearError();
+          send({ kind: "delete_room", roomId });
+        }}
+        disabled={!connected}
+        size="xs"
+      />
+      <FieldNote>
+        Nothing on disk is removed — <code className="font-mono">{room.path}</code> keeps its files
+        and its charter. What goes is the building, and whoever is standing in it.
+      </FieldNote>
+    </div>
   );
 }
 
@@ -603,6 +692,7 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
  */
 function UnassignedSessions() {
   const sessions = useRoomlessSessions();
+  const connected = useFabric((s) => s.connected);
   if (sessions.length === 0) return null;
 
   return (
@@ -610,12 +700,17 @@ function UnassignedSessions() {
       <FieldNote className="mt-0 mb-1.5">In no room, so nothing on the floor draws them.</FieldNote>
       <div className="space-y-0.5">
         {sessions.map((s) => (
-          <div key={s.id} className="flex items-center gap-1.5">
+          <div key={s.id} className="flex flex-wrap items-center gap-1.5">
             <StatusDot status={agentStatus(s)} title={`${agentStatus(s)} · ${s.state}`} />
             <code className="font-mono text-2xs text-fg" title={s.id}>
               {s.id.slice(0, 8)}
             </code>
             <span className="text-2xs text-fg-muted">{s.state}</span>
+            {/* The only place a roomless agent can be ended or removed: no building draws it, so
+                there is no room panel to do it from. */}
+            <span className="ml-auto flex items-center gap-1">
+              <AgentControls agent={s} connected={connected} />
+            </span>
           </div>
         ))}
       </div>

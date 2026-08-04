@@ -59,7 +59,9 @@ packages and work in smoking workshops; several projects in one server; a multi-
 limit monitor with warn/pause/auto-resume; the inter-room bus, the task board, the
 orchestrator and the decision chronicle; the roles library and the onboarding interview;
 an optional container per room; burn-rate metrics; and factory export/import.
-**1,355 tests green** (shared 88, server 813 + 1 live-quota test run by hand, web 424,
+Plus what came after them: removing things (an agent, a room or a whole factory — never a
+file), and a first run that asks which folder you work in instead of guessing.
+**1,391 tests green** (shared 88, server 842 + 1 live-quota test run by hand, web 431,
 agent-runner 30).
 
 **It has not been used in anger by anyone but its author, and a list of what is
@@ -68,18 +70,48 @@ executors, the 50-role expansion, and more — is at the end of
 [docs/ROADMAP.md](docs/ROADMAP.md#what-is-not-built). Read it before assuming a feature
 exists.
 
+### Getting it running
+
+On a machine that has nothing installed, one script does the lot — Node 22+, pnpm, Bun,
+the `claude` CLI, the plugin toolkit its agents draw skills from, and `pnpm install`:
+
 ```bash
-pnpm install
-pnpm -F @superfabric/server dev   # 127.0.0.1:4620
-pnpm -F @superfabric/web dev      # open the printed Vite URL
+./scripts/setup.sh
 ```
+
+It **detects before it installs**, so it is safe to re-run, and it finishes with a summary
+in which every component is either already present, installed just now, or still missing
+with the command that fixes it. `--dry-run` prints what it would do and changes nothing;
+`--skip-toolkit`, `--skip-docker` and `--with-image` are the obvious knobs. It never logs
+you in — that stays `claude auth login`, or the login flow in the app.
+
+Then:
+
+```bash
+pnpm dev
+```
+
+The server comes up on `127.0.0.1:4620` and the UI on the printed Vite URL (usually
+`http://localhost:5173`).
+
+**The first run asks you one question: which folder do you work in.** SuperFabric creates
+no factory of its own — in particular not from the directory the server happens to be
+started in — so it opens with a folder field and a six-line guide to how the thing works.
+Point it at a repository you already have; if that repository has no `CLAUDE.md`, an
+onboarding agent offers to interview you and write one. Set `SUPERFABRIC_PROJECT` if you
+would rather a factory was there on every boot.
+
+If this machine already has Claude Code logged in, that subscription shows up as an
+account (labelled `personal`) with its own limit meters the first time the server starts —
+found on disk at `~/.claude`, adopted once, and yours to remove.
 
 Requires Node 22+, [pnpm](https://pnpm.io) 9+, [Bun](https://bun.sh) 1.3+ (the server runs
 and tests on Bun; installs and the web toolchain stay on Node/pnpm), and a `claude` login.
-Agents run on your ambient `~/.claude` until you add an account, which is what every
-session did before multi-account arrived and still is the default. Container rooms
+Agents run on your ambient `~/.claude` until you bind one to an account, which is what
+every session did before multi-account arrived and still is the default. Container rooms
 additionally need the runner image, built once with
-`pnpm -F @superfabric/agent-runner image`. See [docs/ROADMAP.md](docs/ROADMAP.md) and
+`pnpm -F @superfabric/agent-runner image` (or `./scripts/setup.sh --with-image`). See
+[docs/ROADMAP.md](docs/ROADMAP.md) and
 [docs/decisions/0001-bun-runtime-keep-vite.md](docs/decisions/0001-bun-runtime-keep-vite.md).
 
 ## Security

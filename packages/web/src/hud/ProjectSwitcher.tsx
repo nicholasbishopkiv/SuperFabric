@@ -5,8 +5,10 @@ import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { cn } from "../ui/utils";
-import { createProject, openProject } from "../wsClient";
+import { createProject, deleteProject, openProject } from "../wsClient";
+import { ConfirmDelete } from "./ConfirmDelete";
 import { FactoryTransfer } from "./FactoryTransfer";
+import { projectRemovalWarning } from "./removal";
 
 /**
  * The project switcher: which factory this tab is looking at, and how to look at another.
@@ -78,25 +80,47 @@ export function ProjectSwitcher() {
           {projects.map((p) => {
             const selected = p.id === activeProjectId;
             return (
-              <li key={p.id}>
-                <button
-                  onClick={() => switchTo(p.id)}
-                  disabled={!connected}
-                  title={p.root}
+              <li key={p.id} className="group/project">
+                <div
                   className={cn(
-                    "block w-full rounded-[3px] border px-2 py-1 text-left outline-none transition-colors",
-                    "focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-40",
+                    "flex items-center gap-1 rounded-[3px] border pr-1 transition-colors",
                     // Selection is cyan everywhere in this UI: on the floor, in the room list, here.
                     selected
                       ? "border-accent/70 bg-accent/12"
                       : "border-transparent hover:border-line hover:bg-fg/5",
                   )}
                 >
-                  <div className={cn("truncate text-sm", selected ? "font-semibold text-accent" : "text-fg")}>
-                    {p.name}
-                  </div>
-                  <div className="break-all font-mono text-2xs text-fg-muted">{p.root}</div>
-                </button>
+                  <button
+                    onClick={() => switchTo(p.id)}
+                    disabled={!connected}
+                    title={p.root}
+                    className={cn(
+                      "min-w-0 flex-1 px-2 py-1 text-left outline-none",
+                      "focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-40",
+                    )}
+                  >
+                    <div className={cn("truncate text-sm", selected ? "font-semibold text-accent" : "text-fg")}>
+                      {p.name}
+                    </div>
+                    <div className="break-all font-mono text-2xs text-fg-muted">{p.root}</div>
+                  </button>
+                  {/* Removing a factory belongs next to the factory, not in a settings screen — but
+                      it must never be the control the pointer lands on while switching, so it stays
+                      out of sight until this row is hovered or something in it has focus. */}
+                  <span className="shrink-0 opacity-0 transition-opacity focus-within:opacity-100 group-hover/project:opacity-100">
+                    <ConfirmDelete
+                      title={`Remove ${p.name} from this server — nothing in ${p.root} is touched`}
+                      confirmLabel="Delete factory"
+                      what={projectRemovalWarning(p.name)}
+                      onConfirm={() => {
+                        clearError();
+                        deleteProject(p.id);
+                      }}
+                      disabled={!connected}
+                      className="max-w-[min(380px,80vw)]"
+                    />
+                  </span>
+                </div>
               </li>
             );
           })}

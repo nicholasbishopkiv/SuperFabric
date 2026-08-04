@@ -1,4 +1,5 @@
 import { mkdirSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import Docker from "dockerode";
 import Fastify from "fastify";
@@ -8,6 +9,7 @@ import { AccountLoginManager, CredentialsWatcher } from "./accountLogin.js";
 import { AccountManager } from "./accountManager.js";
 import { registerAttachmentRoutes } from "./attachmentRoutes.js";
 import { Chronicle } from "./chronicle.js";
+import { Demolition } from "./demolition.js";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
 import { FactoryPortability } from "./factoryPortability.js";
@@ -41,14 +43,22 @@ function numberFromEnv(name: string): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-// The project the server boots on: the first factory floor, and the fallback scope for anything that
-// does not name a project. It is no longer the only project there can be — the operator adds and
-// switches between them from the UI, and each is its own floor with its own rooms, agents and board.
-const projectRoot = path.resolve(process.env.SUPERFABRIC_PROJECT ?? process.cwd());
+// A factory to open with, **only if the operator named one**. `SUPERFABRIC_PROJECT` is a deliberate
+// instruction and is honoured; the directory the server happens to be started in is not one, and
+// treating it as one is how a first run used to produce a factory over SuperFabric's own checkout —
+// unasked for, and (once rooms could be deleted) impossible to be rid of, because the next boot put
+// it straight back. With nothing set, the server starts with no factory and the UI asks for a folder;
+// `defaultRoot` then only serves callers that name no project at all.
+const seededRoot = process.env.SUPERFABRIC_PROJECT?.trim() === "" ? undefined : process.env.SUPERFABRIC_PROJECT;
+const projectRoot = path.resolve(seededRoot ?? process.cwd());
 
 const db = openDb(path.join(dataDir, "fabrica.db"));
 const store = new EventStore(db);
-const projects = new ProjectManager(db, projectRoot);
+// `reseedsDefaultRoot` is what makes "this project comes back on every boot" a fact the delete path
+// can state rather than assume: true only when the operator set the variable that re-creates it.
+const projects = new ProjectManager(db, projectRoot, undefined, {
+  reseedsDefaultRoot: seededRoot !== undefined,
+});
 const rooms = new RoomManager(db, projects);
 const tasks = new TaskStore(db, projects);
 // The Chronicle writes into the operator's own repository (docs/decisions/), so it needs the project
@@ -57,6 +67,15 @@ const chronicle = new Chronicle(db, projects);
 // Accounts are machine-wide: no project, no root, just the `CLAUDE_CONFIG_DIR` of each subscription
 // the operator has added. Bindings (which room, which agent) are what carry the per-project choice.
 const accounts = new AccountManager(db);
+// A machine that already has Claude Code logged in already has a subscription, and every unbound
+// agent already runs on it. Adopting it means the operator sees their own account — with a meter —
+// on first run instead of "No accounts yet", which was never true on such a machine. Once only, and
+// only when `.credentials.json` is actually there: see `AccountManager.adoptAmbient`.
+const ambientConfigDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(homedir(), ".claude");
+const adopted = accounts.adoptAmbient(ambientConfigDir);
+if (adopted !== undefined) {
+  console.log(`found a logged-in Claude Code at ${adopted.configDir} — added it as account "${adopted.label}"`);
+}
 // Roles are files, not rows: the shipped presets in `roles/` at the product root, the operator's own
 // in `<data dir>/roles/` overriding them by id. Both are re-read when they change, so tuning a preset
 // does not mean bouncing the server. Skills come from the machine's own skill directories — nothing
@@ -174,8 +193,15 @@ const metrics = new MetricsStore(db, accounts, projects);
 // Moving a factory. Everything it needs is already here; nothing it produces contains a credential —
 // accounts travel as the labels the operator typed, and an import re-binds them by hand.
 const portability = new FactoryPortability({ db, projects, rooms, accounts, tasks, chronicle });
+// Taking things away: an agent, a room, a whole factory. Every collaborator it has is one that owns a
+// table this cascade must not reach into itself — see `demolition.ts` for the order and, more to the
+// point, for what deliberately survives.
+const demolition = new Demolition({
+  sessions: mgr, rooms, projects, tasks, bus, chronicle, onboarding,
+});
 hub = new WsHub(store, mgr, rooms, projects, {
   tasks, bus, router, chronicle, accounts, logins, limits, roles, onboarding, metrics, portability,
+  demolition,
 });
 
 // `.credentials.json` appearing is how the server learns a login finished — and it works whether the
@@ -198,14 +224,25 @@ watchAccountDirs();
 limits.start();
 scheduler.start();
 
-const bootProject = projects.defaultProject();
+// A factory is only ever created because somebody said so. `SUPERFABRIC_PROJECT` is somebody saying
+// so; the directory the server happens to be started in is not — and it used to be, which meant a
+// first run opened on a factory built over SuperFabric's own source tree that nothing could remove.
+// With nothing configured the server starts empty and the UI asks for a folder.
+if (seededRoot !== undefined) projects.defaultProject();
 // Every project needs its central building, including one that existed before this boot.
 for (const project of projects.list()) rooms.ensureProjectRoom(project.id);
-const projectRoom = rooms.ensureProjectRoom(bootProject.id);
-console.log(
-  `project root: ${projectRoot} (project room "${projectRoom.name}", `
-  + `${rooms.listRooms(bootProject.id).length - 1} room(s), ${projects.list().length} project(s))`,
-);
+const known = projects.list();
+if (known.length === 0) {
+  console.log(
+    "no factory yet — open the UI and point it at a project folder "
+    + "(or start the server with SUPERFABRIC_PROJECT=/path/to/your/project)",
+  );
+} else {
+  console.log(
+    `${known.length} project(s): `
+    + known.map((p) => `${p.name} (${rooms.listRooms(p.id).length - 1} room(s))`).join(", "),
+  );
+}
 
 const resumed = mgr.resumeAll();
 if (resumed.length > 0) console.log(`resumed sessions: ${resumed.join(", ")}`);

@@ -247,6 +247,38 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
     not something anyone asked for. And a decision is still a file — `Chronicle.indexImported`
     writes an index row only when the ADR is actually present, reading the body off disk so
     there is never a second copy of a decision's text.
+- **ProjectManager** (`projectManager.ts`) — one row per factory floor, and the scope every other
+  listing is filtered by. **A server may have none**: nothing is seeded from the directory the
+  server runs in (only from an explicit `SUPERFABRIC_PROJECT`), so a fresh install has no project,
+  `activeProjectId` is `null` on the wire, listings answer empty and anything that would build
+  something is refused in words. The UI's first-run screen is what draws that state.
+- **AccountManager.adoptAmbient** — the mirror case. A machine with a logged-in `~/.claude` already
+  has a subscription and every unbound agent already spends it, so it is adopted as an ordinary
+  account row (label `personal`) the first time a server boots — which also gives it a limit meter,
+  since an account with no row cannot be polled. Once only, recorded in `server_state` (migration
+  17), so removing it sticks.
+- **Demolition** (`demolition.ts`) — removing an agent, a room or a factory. A class of its own
+  rather than three methods on three managers, because the interesting part of a delete is the
+  *order* and what is deliberately not removed.
+  - **Nothing on disk is ever touched.** Not a room's folder, not a project root, not an ADR in
+    `docs/decisions/`. Room = folder read from the other end: the row is what SuperFabric added,
+    so removing it hands the directory back as it was. This is what makes a delete offerable.
+  - **Refuse before you destroy.** The project room (its folder is the project root), the boot
+    project (`SUPERFABRIC_PROJECT ?? cwd`, which is re-created on the next start, so deleting it
+    would undo itself) and the last remaining project are all checked *before* an executor is
+    stopped, through `requireDeletable` on the two managers.
+  - **What survives**: a room's tasks (unassigned, never deleted), its bus messages (`messages`
+    has no foreign key precisely so the record outlives the department), and a deleted agent's
+    room suggestions (`room_suggestions.session_id` is nullable for exactly this moment). Exactly
+    two things are destroyed on purpose — an agent's transcript when that agent is deleted, and a
+    factory's records when that factory is.
+  - **`stop_session` is the other half.** It ends an agent at a **turn boundary** (`state='done'`,
+    so `resumeAll` never revives it) and destroys nothing; `interrupt` still ends a turn. The
+    boundary is the pause's discipline, applied for the pause's reason — a turn in flight has
+    already spent its tokens.
+  - **The chronicle index follows by trigger.** Migration 16 adds `AFTER DELETE` on `events` and
+    `decisions`, completing migration 8's insert-only contract: a search that quoted a transcript
+    nobody holds any more would be worse than one that finds nothing.
 - **Per-agent autonomy** — alongside the role bundle, every session carries an `autonomy` field
   (`attended` | `auto` | `bypass`, persisted in `sessions.autonomy` and re-applied on resume) that
   maps to the Agent SDK's `permissionMode` inside the executor. `auto` is the default: the CLI's
@@ -540,6 +572,17 @@ and creates each room through the ordinary `createRoom`. Everything it could not
 in `problems` (a colliding room, a missing account label, an ADR the repository does not hold,
 and the agents it described but did not start), the socket is moved onto the floor it just
 built, and every other tab is told the switcher gained an entry.
+
+**Removing a room** (built after M5): the operator opens the room's own section, arms
+`ConfirmDelete` and reads what it will take — computed in the client from the floor it already
+holds, e.g. *"Removes the room from the floor. 2 agents here are stopped and removed too, with
+everything they said. 3 unfinished tasks go back to the board, unassigned. The folder stays exactly
+as it is."* → `delete_room` → `Demolition` refuses a project room first, then stops and deletes each
+agent standing there (transcripts and their chronicle entries with them), unassigns the room's
+cards, deletes the row → fresh `rooms` and `sessions` frames redraw the floor, and a notice repeats
+the folder's path unchanged. Deleting an agent and deleting a factory are the same shape, one step
+narrower and one step wider; a factory delete additionally moves every tab that was looking at it
+onto another floor, because its project id no longer resolves.
 
 **Crash recovery**: on boot, server reads `sessions` table, resumes every session marked
 active (`options.resume` + JSONL transcripts persisted in each account's config dir).
