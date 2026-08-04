@@ -410,6 +410,37 @@ describe("ClaudeCodeExecutor", () => {
     expect(o.abortController).toBeInstanceOf(AbortController);
   });
 
+  it("a session's own account beats the process-wide config dir, and the env still carries PATH", () => {
+    const fq = makeFakeQuery();
+    // One executor instance serves the whole factory, so the *session's* directory is what decides
+    // which subscription is spent — this is the entire multi-account mechanism.
+    const exec = new ClaudeCodeExecutor({ configDir: "/tmp/server-default", query: fq.fn });
+    exec.start(
+      { cwd: "/repo", configDir: "/tmp/account-alpha" },
+      { onEvent: () => {}, requestApproval: async () => "deny" },
+    );
+    const o = fq.options()!;
+    expect(o.env?.CLAUDE_CONFIG_DIR).toBe("/tmp/account-alpha");
+    expect(o.env?.PATH).toBe(process.env.PATH);
+    expect(o.env?.HOME).toBe(process.env.HOME);
+  });
+
+  it("a session with no account falls back to the process-wide config dir", () => {
+    const fq = makeFakeQuery();
+    const exec = new ClaudeCodeExecutor({ configDir: "/tmp/server-default", query: fq.fn });
+    exec.start({ cwd: "/repo" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+    expect(fq.options()!.env?.CLAUDE_CONFIG_DIR).toBe("/tmp/server-default");
+  });
+
+  it("with neither, the subprocess environment is not overridden at all", () => {
+    const fq = makeFakeQuery();
+    const exec = new ClaudeCodeExecutor({ query: fq.fn });
+    exec.start({ cwd: "/repo" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+    // Not "an env with no CLAUDE_CONFIG_DIR" — no env at all, so the CLI inherits the server's and
+    // uses the ambient ~/.claude, exactly as it did before accounts existed.
+    expect(fq.options()!.env).toBeUndefined();
+  });
+
   it("owns its own configuration instead of inheriting the operator's global setup", () => {
     const fq = makeFakeQuery();
     const exec = new ClaudeCodeExecutor({ query: fq.fn });

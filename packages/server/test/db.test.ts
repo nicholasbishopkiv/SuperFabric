@@ -687,6 +687,64 @@ describe("db", () => {
     }
   });
 
+  // ---- migration 9: accounts ----
+
+  it("creates the accounts table with a UNIQUE config_dir", () => {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO accounts (id, label, config_dir) VALUES (?, ?, ?)")
+      .run("a1", "Work", "/home/me/.claude-work");
+    expect(db.prepare("SELECT id, label, config_dir, last_used_at FROM accounts").get())
+      .toEqual({ id: "a1", label: "Work", config_dir: "/home/me/.claude-work", last_used_at: null });
+
+    // The invariant, in the schema rather than only in code: one config directory is one account,
+    // because the CLI rewrites its refresh token in place there.
+    expect(() => db.prepare("INSERT INTO accounts (id, label, config_dir) VALUES (?, ?, ?)")
+      .run("a2", "Personal", "/home/me/.claude-work")).toThrow(/UNIQUE/i);
+  });
+
+  it("adds a nullable account_id to sessions and rooms, because NULL is the ambient ~/.claude", () => {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO sessions (id, cwd) VALUES (?, ?)").run("s1", "/tmp");
+    db.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
+    db.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
+      .run("r1", "p1", "payments", "/code/shop/payments");
+    expect(db.prepare("SELECT account_id FROM sessions WHERE id = 's1'").get()).toEqual({ account_id: null });
+    expect(db.prepare("SELECT account_id FROM rooms WHERE id = 'r1'").get()).toEqual({ account_id: null });
+  });
+
+  it("upgrades a user_version = 8 database, leaving every agent on the ambient ~/.claude", () => {
+    const dir = mkdtempSync(join(tmpdir(), "fabrica-db-"));
+    try {
+      const path = join(dir, "v8.db");
+      const v8 = new Database(path);
+      // A real pre-M2 file, brought up by the shipped migrations and then pinned.
+      openDb(path).close();
+      v8.exec("PRAGMA user_version = 8");
+      v8.exec("DROP INDEX sessions_account");
+      v8.exec("ALTER TABLE sessions DROP COLUMN account_id");
+      v8.exec("ALTER TABLE rooms DROP COLUMN account_id");
+      v8.exec("DROP TABLE accounts");
+      v8.prepare("INSERT INTO projects (id, name, root) VALUES (?, ?, ?)").run("p1", "shop", "/code/shop");
+      v8.prepare("INSERT INTO rooms (id, project_id, name, path) VALUES (?, ?, ?, ?)")
+        .run("r1", "p1", "payments", "/code/shop/payments");
+      v8.prepare("INSERT INTO sessions (id, cwd, room_id, project_id, model) VALUES (?, ?, ?, ?, ?)")
+        .run("s1", "/code/shop/payments", "r1", "p1", "claude-opus-5");
+      v8.close();
+
+      const db = openDb(path);
+      expect(userVersion(db)).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(9);
+      // Nothing about the existing factory changed, and its one agent runs where it always did.
+      expect(db.prepare("SELECT room_id, model, account_id FROM sessions WHERE id = 's1'").get())
+        .toEqual({ room_id: "r1", model: "claude-opus-5", account_id: null });
+      expect(db.prepare("SELECT account_id FROM rooms WHERE id = 'r1'").get()).toEqual({ account_id: null });
+      expect((db.prepare("SELECT COUNT(*) c FROM accounts").get() as { c: number }).c).toBe(0);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("indexes the project scope of every list the operator looks at", () => {
     const db = openDb(":memory:");
     const indexes = (table: string) =>

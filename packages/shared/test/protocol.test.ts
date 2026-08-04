@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  AGENT_MODELS, ATTACHMENTS_DIRNAME, AttachmentUploadResult, AutonomyMode,
+  ACCOUNT_CREDENTIALS_FILE, AGENT_MODELS, ATTACHMENTS_DIRNAME, AccountInfo,
+  AttachmentUploadResult, AutonomyMode,
   CHRONICLE_SEARCH_LIMIT, ChronicleHit, ClientMessage,
   DEFAULT_AUTONOMY, MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
   ProjectInfo, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
@@ -459,6 +460,98 @@ describe("protocol", () => {
     it("fixes the destination folder and the size cap in one place", () => {
       expect(ATTACHMENTS_DIRNAME).toBe("attachments");
       expect(MAX_ATTACHMENT_BYTES).toBe(25 * 1024 * 1024);
+    });
+  });
+
+  describe("accounts", () => {
+    const ACCOUNT = {
+      id: "a1", label: "Work", configDir: "/home/me/.claude-work",
+      credentialsPresent: false, createdAt: 1_800_000_000, lastUsedAt: null,
+      login: { status: "idle", url: null, message: null },
+    } as const;
+
+    it("parses an account, login state and all", () => {
+      expect(AccountInfo.parse(ACCOUNT)).toEqual(ACCOUNT);
+    });
+
+    it("requires a label and a config directory", () => {
+      expect(() => AccountInfo.parse({ ...ACCOUNT, label: "" })).toThrow();
+      expect(() => AccountInfo.parse({ ...ACCOUNT, configDir: "" })).toThrow();
+    });
+
+    it("carries the four states an in-app login can be in, plus idle", () => {
+      for (const status of ["idle", "starting", "awaiting_code", "finishing", "failed"]) {
+        expect(AccountInfo.parse({ ...ACCOUNT, login: { status, url: null, message: null } })
+          .login.status).toBe(status);
+      }
+      expect(() => AccountInfo.parse({ ...ACCOUNT, login: { status: "confused", url: null, message: null } }))
+        .toThrow();
+    });
+
+    it("names the file that means a login finished, once, for both sides", () => {
+      expect(ACCOUNT_CREDENTIALS_FILE).toBe(".credentials.json");
+    });
+
+    it("carries the account list as its own server message", () => {
+      const m = ServerMessage.parse({ kind: "accounts", accounts: [ACCOUNT] });
+      expect(m.kind === "accounts" && m.accounts[0]!.label).toBe("Work");
+      expect(ServerMessage.parse({ kind: "accounts", accounts: [] })).toEqual({ kind: "accounts", accounts: [] });
+    });
+
+    it("parses the five account client messages", () => {
+      expect(ClientMessage.parse({ kind: "list_accounts" }).kind).toBe("list_accounts");
+      expect(ClientMessage.parse({ kind: "create_account", label: "Work", configDir: "/c" }).kind)
+        .toBe("create_account");
+      expect(ClientMessage.parse({ kind: "remove_account", accountId: "a1" }).kind).toBe("remove_account");
+      expect(ClientMessage.parse({ kind: "begin_account_login", accountId: "a1" }).kind)
+        .toBe("begin_account_login");
+      expect(ClientMessage.parse({ kind: "submit_account_login_code", accountId: "a1", code: "x" }).kind)
+        .toBe("submit_account_login_code");
+      expect(ClientMessage.parse({ kind: "cancel_account_login", accountId: "a1" }).kind)
+        .toBe("cancel_account_login");
+    });
+
+    it("refuses an account with no label or no directory on the wire too", () => {
+      expect(() => ClientMessage.parse({ kind: "create_account", label: "", configDir: "/c" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "create_account", label: "Work", configDir: "" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "submit_account_login_code", accountId: "a1", code: "" }))
+        .toThrow();
+    });
+
+    it("null is a real value on both bindings: it means the ambient ~/.claude", () => {
+      // Distinguishable from "leave it alone", which is what an omitted field would mean — the two
+      // are different instructions and the wire has to be able to say either.
+      expect(ClientMessage.parse({ kind: "set_room_account", roomId: "r1", accountId: null }))
+        .toEqual({ kind: "set_room_account", roomId: "r1", accountId: null });
+      expect(ClientMessage.parse({ kind: "set_session_account", sessionId: "s1", accountId: null }))
+        .toEqual({ kind: "set_session_account", sessionId: "s1", accountId: null });
+      expect(() => ClientMessage.parse({ kind: "set_room_account", roomId: "r1" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "set_session_account", sessionId: "s1" })).toThrow();
+    });
+
+    it("an agent may be created on a named account, or on none", () => {
+      expect(ClientMessage.parse({ kind: "create_session", roomId: "r1", accountId: "a1" }))
+        .toMatchObject({ accountId: "a1" });
+      // Omitted is the normal path: the room's default decides.
+      expect(ClientMessage.parse({ kind: "create_session", roomId: "r1" }))
+        .not.toHaveProperty("accountId");
+    });
+
+    it("a room and a session both report which account they are on, defaulting to none", () => {
+      const room = RoomInfo.parse({
+        id: "r1", name: "backend", path: "/p/backend", kind: "room", agentCount: 0,
+      });
+      // A client written before accounts existed sends no field, and the answer is the pre-M2
+      // behaviour rather than a parse failure.
+      expect(room.accountId).toBeNull();
+      expect(RoomInfo.parse({
+        id: "r1", name: "backend", path: "/p/backend", kind: "room", agentCount: 0, accountId: "a1",
+      }).accountId).toBe("a1");
+
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [SESSION_INFO] }))
+        .toMatchObject({ sessions: [{ accountId: null }] });
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...SESSION_INFO, accountId: "a1" }] }))
+        .toMatchObject({ sessions: [{ accountId: "a1" }] });
     });
   });
 });

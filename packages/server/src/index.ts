@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import Fastify from "fastify";
 import { WebSocketServer, type WebSocket } from "ws";
+import { AccountManager } from "./accountManager.js";
 import { registerAttachmentRoutes } from "./attachmentRoutes.js";
 import { Chronicle } from "./chronicle.js";
 import { openDb } from "./db.js";
@@ -32,6 +33,9 @@ const tasks = new TaskStore(db, projects);
 // The Chronicle writes into the operator's own repository (docs/decisions/), so it needs the project
 // roots and nothing else — the FTS index over it and over the event log is kept in step by triggers.
 const chronicle = new Chronicle(db, projects);
+// Accounts are machine-wide: no project, no root, just the `CLAUDE_CONFIG_DIR` of each subscription
+// the operator has added. Bindings (which room, which agent) are what carry the per-project choice.
+const accounts = new AccountManager(db);
 // The bus and the session runner need each other: the bus delivers *through* the runner, and the
 // runner hands every agent the bus as tools and flushes the bus at each turn boundary. The bus takes
 // callbacks rather than the runner itself, so the dependency stays one-way in the module graph — and
@@ -53,8 +57,10 @@ const router = new TaskRouter({
   orchestratorFor: (projectId) => mgr.orchestratorFor(projectId),
   roomAgents: (roomId) => mgr.roomAgents(roomId),
 });
-mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, { bus, tasks, router, chronicle });
-const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router, chronicle });
+mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
+  bus, tasks, router, chronicle, accounts,
+});
+const hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router, chronicle, accounts });
 
 const bootProject = projects.defaultProject();
 // Every project needs its central building, including one that existed before this boot.

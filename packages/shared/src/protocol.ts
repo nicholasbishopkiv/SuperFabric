@@ -106,6 +106,63 @@ export const ProjectInfo = z.object({
 });
 export type ProjectInfo = z.infer<typeof ProjectInfo>;
 
+// ---- M2: accounts ----
+
+/**
+ * The file whose existence means a `CLAUDE_CONFIG_DIR` has been logged in.
+ *
+ * Named here rather than in the server because both sides talk about it: the server tests for it and
+ * the UI explains it. On Linux the CLI writes the OAuth tokens to `<config dir>/.credentials.json`
+ * with mode 0600 (see `docs/RESEARCH.md` §1); on macOS they may go to the keychain instead, which is
+ * why `credentialsPresent` is a *hint that a login finished* and never the only signal the login flow
+ * waits on.
+ */
+export const ACCOUNT_CREDENTIALS_FILE = ".credentials.json";
+
+/**
+ * Where an account's in-app login has got to.
+ *
+ * `claude auth login` is a plain-pipe conversation (no terminal emulator involved — see
+ * `docs/decisions/0004-account-login-over-a-pipe.md`): it prints a URL, waits for the code the
+ * operator gets from it, and exits. These are the four things the operator can be looking at while
+ * that happens, plus `idle` for "nothing is running".
+ */
+export const AccountLoginStatus = z.enum(["idle", "starting", "awaiting_code", "finishing", "failed"]);
+export type AccountLoginStatus = z.infer<typeof AccountLoginStatus>;
+
+export const AccountLogin = z.object({
+  status: AccountLoginStatus,
+  /** The OAuth URL the CLI printed, once it has. This is what the operator opens. */
+  url: z.string().nullable(),
+  /** The CLI's own last word — an invalid code, a failure — shown verbatim rather than paraphrased. */
+  message: z.string().nullable(),
+});
+export type AccountLogin = z.infer<typeof AccountLogin>;
+
+/**
+ * One Claude subscription, as a `CLAUDE_CONFIG_DIR` on disk plus a label.
+ *
+ * **Machine-wide, not per project.** A subscription belongs to the operator, not to a repository: the
+ * same account runs agents on every floor, and a per-project table would make the operator re-create
+ * (and re-log-in to) the same account for each one. Worse, it would put two rows on one config
+ * directory, which is the exact thing the one-dir-one-account invariant forbids — refresh tokens
+ * rewrite in place and two accounts sharing a directory corrupt each other. So accounts are listed
+ * globally and *bound* per room and per agent, which is where the per-project choice actually lives.
+ */
+export const AccountInfo = z.object({
+  id: z.string(),
+  label: z.string().min(1).max(120),
+  /** Absolute path of this account's `CLAUDE_CONFIG_DIR`. Unique across the server. */
+  configDir: z.string().min(1),
+  /** `<configDir>/.credentials.json` exists — how the server knows a login finished. */
+  credentialsPresent: z.boolean(),
+  createdAt: z.number().int(),
+  /** When an agent last started on this account; null until one has. */
+  lastUsedAt: z.number().int().nullable(),
+  login: AccountLogin,
+});
+export type AccountInfo = z.infer<typeof AccountInfo>;
+
 // ---- rooms ----
 
 /**
@@ -135,6 +192,14 @@ export const RoomInfo = z.object({
   /** "project" is the single central building; "room" is a workshop. */
   kind: z.enum(["project", "room"]),
   agentCount: z.number().int().nonnegative(),
+  /**
+   * The account new agents in this room start on, or null for the ambient `~/.claude`.
+   *
+   * A *default*, resolved once when an agent is created and then persisted on that agent: changing
+   * it here never moves an agent that is already running, because a live session's environment is
+   * fixed for the lifetime of its `query()`. See `SessionInfo.accountId`.
+   */
+  accountId: z.string().nullable().default(null),
 });
 export type RoomInfo = z.infer<typeof RoomInfo>;
 
@@ -264,6 +329,11 @@ export const ClientMessage = z.discriminatedUnion("kind", [
     autonomy: AutonomyMode.optional(),
     /** Omitted => the CLI's own default model. */
     model: ModelId.optional(),
+    /**
+     * Run this agent on a particular account, overriding whatever its room defaults to. Omitted =>
+     * the room's account; a roomless session, or a room with none, => the ambient `~/.claude`.
+     */
+    accountId: z.string().optional(),
   }),
   z.object({ kind: z.literal("set_autonomy"), sessionId: z.string(), autonomy: AutonomyMode }),
   /**
@@ -272,6 +342,15 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * because the model is fixed for the lifetime of a `query()` — see `SessionManager.setModel`.
    */
   z.object({ kind: z.literal("set_model"), sessionId: z.string(), model: ModelId.nullable() }),
+  /**
+   * Move a live agent onto another account. `null` hands it back to the ambient `~/.claude`.
+   *
+   * The third member of the `set_autonomy`/`set_model` family and restarted for exactly the same
+   * reason: `Options.env` — and therefore `CLAUDE_CONFIG_DIR` — is baked in when `query()` is called,
+   * so the session's executor is torn down and resumed rather than mutated. The stored account and
+   * the account actually in force can then never disagree.
+   */
+  z.object({ kind: z.literal("set_session_account"), sessionId: z.string(), accountId: z.string().nullable() }),
   z.object({ kind: z.literal("list_sessions") }),
   /**
    * Give this factory its orchestrator, or hand back the one it already has.
@@ -295,7 +374,45 @@ export const ClientMessage = z.discriminatedUnion("kind", [
    * `cwd` their SDK session was started with; only new agents get the new folder.
    */
   z.object({ kind: z.literal("set_room_path"), roomId: z.string(), path: z.string().min(1) }),
+  /**
+   * The account agents created in this room start on. `null` means the ambient `~/.claude`.
+   *
+   * A default for *new* agents only. Agents already standing there keep the account their session was
+   * started with — the environment of a live `query()` cannot be changed — so this is not a way to
+   * move a running agent; `set_session_account` is.
+   */
+  z.object({ kind: z.literal("set_room_account"), roomId: z.string(), accountId: z.string().nullable() }),
   z.object({ kind: z.literal("list_rooms") }),
+  // Accounts. Machine-wide rather than project-scoped (see `AccountInfo`), so unlike every other
+  // listing here these four take no project and their answer is the same on every floor.
+  z.object({ kind: z.literal("list_accounts") }),
+  z.object({
+    kind: z.literal("create_account"),
+    label: z.string().min(1).max(120),
+    /**
+     * Absolute path of this account's `CLAUDE_CONFIG_DIR`. Created if it is not there yet, and
+     * refused if another account already claims it: one directory is one account, always.
+     */
+    configDir: z.string().min(1),
+  }),
+  /** Refused while any session still runs on it — an account is not removed out from under an agent. */
+  z.object({ kind: z.literal("remove_account"), accountId: z.string() }),
+  /**
+   * Log this account in, in the app.
+   *
+   * The server runs `claude auth login` against that account's config directory over plain pipes and
+   * reports what it prints: an OAuth URL for the operator to open, then a wait for the code that page
+   * gives them (`submit_account_login_code`). No terminal emulator is involved — the command needs no
+   * TTY, which is the measured finding this design rests on.
+   */
+  z.object({ kind: z.literal("begin_account_login"), accountId: z.string() }),
+  z.object({
+    kind: z.literal("submit_account_login_code"),
+    accountId: z.string(),
+    /** The code from the OAuth page, handed to the waiting CLI on its stdin. */
+    code: z.string().min(1).max(2000),
+  }),
+  z.object({ kind: z.literal("cancel_account_login"), accountId: z.string() }),
   // Projects. `open_project` is per-socket: it changes what *this* tab is looking at, and the
   // server answers with that project's rooms, sessions, tasks and messages. Another tab watching
   // another factory is unaffected — which is the whole point of the active project being a
@@ -387,6 +504,16 @@ export const SessionInfo = z.object({
    */
   isOrchestrator: z.boolean(),
   /**
+   * The account this agent runs on — its `CLAUDE_CONFIG_DIR` — or `null` for the ambient `~/.claude`,
+   * which is what every session before M2 ran on and still does.
+   *
+   * Resolved once when the agent is created (an explicit choice, else its room's default) and then
+   * persisted here, so the room's default changing later never silently moves a running agent. Like
+   * `autonomy` and `model` it is re-applied on resume: an agent restarted by a reboot comes back on
+   * the same subscription, which is the property the whole multi-account feature rests on.
+   */
+  accountId: z.string().nullable().default(null),
+  /**
    * Derived from the session's own event log: the latest `session_status`, or `idle` when it has
    * none. The 3D floor needs the *current* status of every agent, and subscribing to every session
    * just to replay every transcript would be absurd — so the server computes it and sends it.
@@ -404,6 +531,12 @@ export const ServerMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("event"), sessionId: z.string(), seq: z.number().int(), event: SessionEvent }),
   z.object({ kind: z.literal("sessions"), sessions: z.array(SessionInfo) }),
   z.object({ kind: z.literal("rooms"), rooms: z.array(RoomInfo) }),
+  /**
+   * Every account on this server — the one list here that is *not* scoped to a project, because a
+   * subscription is the operator's and serves every floor (see `AccountInfo`). It therefore goes to
+   * every attached socket rather than only to those looking at one factory.
+   */
+  z.object({ kind: z.literal("accounts"), accounts: z.array(AccountInfo) }),
   z.object({ kind: z.literal("tasks"), tasks: z.array(TaskInfo) }),
   /**
    * The bus's traffic. This is what drives the conveyor animation, so it carries `deliveredAt`:

@@ -478,4 +478,48 @@ describe("RoomManager", () => {
       });
     });
   });
+
+  describe("setAccount", () => {
+    it("a room starts on no account, which is the ambient ~/.claude", () => {
+      withProject(({ mgr }) => {
+        expect(mgr.createRoom("backend").accountId).toBeNull();
+        expect(mgr.ensureProjectRoom().accountId).toBeNull();
+      });
+    });
+
+    it("binds and unbinds a room, and the listing carries it", () => {
+      withProject(({ mgr }) => {
+        const room = mgr.createRoom("backend");
+        expect(mgr.setAccount(room.id, "acct-1").accountId).toBe("acct-1");
+        expect(mgr.listRooms().find((r) => r.id === room.id)!.accountId).toBe("acct-1");
+        expect(mgr.setAccount(room.id, null).accountId).toBeNull();
+      });
+    });
+
+    it("refuses an unknown room", () => {
+      withProject(({ mgr }) => {
+        expect(() => mgr.setAccount("nope", "acct-1")).toThrow(/unknown room/);
+      });
+    });
+
+    it("one room's account is not another's, and not another project's", () => {
+      withProject(({ db, mgr, projects }) => {
+        const elsewhere = mkdtempSync(join(tmpdir(), "superfabric-other-"));
+        try {
+          const a = mgr.createRoom("backend");
+          const b = mgr.createRoom("frontend");
+          const other = projects.create({ root: elsewhere });
+          const far = mgr.createRoom("backend", { projectId: other.id });
+          mgr.setAccount(a.id, "acct-1");
+
+          expect(mgr.getRoom(b.id)!.accountId).toBeNull();
+          expect(mgr.getRoom(far.id)!.accountId).toBeNull();
+          expect(mgr.listRooms(other.id).every((r) => r.accountId === null)).toBe(true);
+          void db;
+        } finally {
+          rmSync(elsewhere, { recursive: true, force: true });
+        }
+      });
+    });
+  });
 });

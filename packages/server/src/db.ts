@@ -126,6 +126,36 @@ const MIGRATIONS: readonly Migration[] = [
   `,
   // 8 — M3b, the Chronicle: decisions, and one FTS5 index over them and over what was actually said.
   migrateChronicle,
+  // 9 — M2 accounts. An account is a `CLAUDE_CONFIG_DIR` on disk plus this row.
+  //
+  // **`config_dir` is UNIQUE, and that is a correctness constraint rather than tidiness.** The CLI
+  // rewrites its refresh token in place inside that directory, so two accounts pointing at one
+  // directory would each invalidate the other's session at unpredictable moments — the failure would
+  // look like random logouts, days later, with nothing in the log to explain them. `AccountManager`
+  // refuses a duplicate with a readable message *and* the schema refuses it, because this invariant
+  // is too expensive to lose to a future write path that forgets to ask.
+  //
+  // Deliberately **not** scoped to a project: one subscription serves every factory (see
+  // `AccountInfo`). The per-project choice is the *binding*, which is why the nullable `account_id`
+  // goes on `sessions` (the account an agent actually runs on) and on `rooms` (the default new agents
+  // there inherit). Both are nullable and default NULL, so every row written before this migration
+  // keeps running on the ambient `~/.claude` exactly as it did.
+  //
+  // No foreign keys, for the same reason nothing else here has them: `AccountManager.remove` is what
+  // enforces "not while an agent is running on it", and a session's history must survive the removal
+  // of the account it happened to run on.
+  `
+    CREATE TABLE IF NOT EXISTS accounts (
+      id TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      config_dir TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      last_used_at INTEGER
+    );
+    ALTER TABLE sessions ADD COLUMN account_id TEXT;
+    ALTER TABLE rooms ADD COLUMN account_id TEXT;
+    CREATE INDEX IF NOT EXISTS sessions_account ON sessions (account_id);
+  `,
 ];
 
 /**

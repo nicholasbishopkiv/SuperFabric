@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
+import type { AccountManager } from "./accountManager.js";
 import { FACTORY_MCP_SERVER_NAME, busTools } from "./busTools.js";
 import type { Chronicle } from "./chronicle.js";
 import type { Db } from "./db.js";
@@ -41,6 +42,15 @@ export interface CreateSessionOptions {
   /** Model id to pin this agent to. Omitted => the executor's default, i.e. the CLI's own. */
   model?: string;
   /**
+   * Run this agent on a particular account, overriding whatever its room defaults to. Omitted => the
+   * room's account; a roomless session, or a room bound to none, => the ambient `~/.claude`, which is
+   * the pre-M2 behaviour and stays the behaviour of a factory that has configured no accounts.
+   *
+   * Whatever this resolves to is written onto the session's own row, so the room's default changing
+   * later cannot move an agent that is already running.
+   */
+  accountId?: string;
+  /**
    * The factory this agent belongs to. With a `roomId` it is implied by the room and only has to be
    * passed to be *checked* — the hub passes the asking socket's active project, so a client that knew
    * another project's room id cannot put an agent on someone else's floor. Without one it defaults to
@@ -68,6 +78,45 @@ export interface SessionManagerOptions {
   router?: TaskRouter;
   /** The Chronicle. Absent => no agent gets the decision tools; see `BusToolsDeps.chronicle`. */
   chronicle?: Chronicle;
+  /**
+   * The accounts this server knows about. Absent => every session runs on the ambient `~/.claude`,
+   * which is a valid (pre-M2-shaped) server rather than a broken one — the same reason `bus` and
+   * `tasks` are optional.
+   */
+  accounts?: AccountManager;
+}
+
+/**
+ * Everything `startExecutor` needs to bring one agent up — the session row, minus its identity.
+ *
+ * An object rather than the eight positional arguments this had grown into. Three of them are
+ * nullable strings, and `createSession`, `resumeAll` and `restartExecutor` all build the same list
+ * independently: one transposed pair there would silently start an agent in the wrong room on the
+ * wrong account, and nothing would fail loudly enough to notice.
+ */
+interface RunSpec {
+  cwd: string;
+  /** Provider-native session id to resume, or null for a fresh conversation. */
+  resume: string | null;
+  autonomy: AutonomyMode;
+  roomId: string | null;
+  model: string | null;
+  /** The account this agent runs on; null is the ambient `~/.claude`. */
+  accountId: string | null;
+  isOrchestrator: boolean;
+}
+
+/** The spec that brings a stored session back exactly as it was. */
+function specOf(row: SessionRow): RunSpec {
+  return {
+    cwd: row.cwd,
+    resume: row.claude_session_id,
+    autonomy: asAutonomy(row.autonomy),
+    roomId: row.room_id,
+    model: row.model,
+    accountId: row.account_id,
+    isOrchestrator: isOrchestratorRow(row),
+  };
 }
 
 export class SessionManager {
@@ -110,8 +159,8 @@ export class SessionManager {
   ) {
     this.stmts = {
       insertSession: db.prepare(
-        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator)"
-        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator, account_id)"
+        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       ),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
       activeSessions: db.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE state = 'active'`),
@@ -124,6 +173,7 @@ export class SessionManager {
       ),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       setModel: db.prepare("UPDATE sessions SET model = ? WHERE id = ?"),
+      setAccount: db.prepare("UPDATE sessions SET account_id = ? WHERE id = ?"),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
       // `status` and `blocked` are derived from the log by correlated subqueries rather than a
       // second round of queries per row, for the same reason — the 3D floor asks for this list on
@@ -146,6 +196,8 @@ export class SessionManager {
     let roomId: string | null = null;
     let cwd = opts.cwd ?? process.cwd();
     let projectId = opts.projectId ?? this.projects.defaultProject().id;
+    /** The room's default account, when the agent is being put in a room that has one. */
+    let roomAccountId: string | null = null;
 
     if (opts.roomId !== undefined) {
       const room = this.rooms.getRoom(opts.roomId);
@@ -159,6 +211,7 @@ export class SessionManager {
       projectId = roomProject;
       roomId = room.id;
       cwd = room.path;
+      roomAccountId = room.accountId;
     }
 
     // `cwd` comes straight off the wire. An unchecked value is persisted forever and makes the
@@ -176,11 +229,34 @@ export class SessionManager {
       throw new Error(`project ${projectId} already has an orchestrator`);
     }
 
+    // The agent's own choice wins over its room's default; with neither, the ambient `~/.claude`. An
+    // explicit id is checked here rather than allowed to become a dangling reference: an agent
+    // silently starting on the operator's own subscription because a typo'd account id fell back to
+    // "none" is the multi-account bug that would be hardest to see.
+    const accountId = opts.accountId ?? roomAccountId;
+    if (accountId !== null && accountId !== undefined) this.requireAccount(accountId);
+
     const id = randomUUID();
     const model = opts.model ?? null;
-    this.stmts.insertSession.run(id, projectId, cwd, autonomy, roomId, model, isOrchestrator ? 1 : 0);
-    this.startExecutor(id, cwd, null, autonomy, roomId, model, isOrchestrator);
+    const spec: RunSpec = {
+      cwd, resume: null, autonomy, roomId, model, accountId: accountId ?? null, isOrchestrator,
+    };
+    this.stmts.insertSession.run(
+      id, projectId, cwd, autonomy, roomId, model, isOrchestrator ? 1 : 0, spec.accountId,
+    );
+    this.startExecutor(id, spec);
     return id;
+  }
+
+  /**
+   * Refuse an account id this server does not have. Only for ids arriving from *outside* — a stored
+   * `account_id` is never re-validated, because a session row outlives the account row it names and a
+   * resumed agent must still come back rather than refusing to boot over a deleted account.
+   */
+  private requireAccount(accountId: string): void {
+    const accounts = this.opts.accounts;
+    if (accounts === undefined) throw new Error("this server has no accounts");
+    accounts.require(accountId);
   }
 
   /**
@@ -222,7 +298,7 @@ export class SessionManager {
       return;
     }
 
-    await this.restartExecutor(id, row, handle, autonomy, row.model, `autonomy: ${autonomy}`);
+    await this.restartExecutor(id, handle, { ...specOf(row), autonomy }, `autonomy: ${autonomy}`);
   }
 
   /**
@@ -251,15 +327,55 @@ export class SessionManager {
       return;
     }
 
-    await this.restartExecutor(
-      id, row, handle, asAutonomy(row.autonomy), model, `model: ${model ?? "default"}`,
-    );
+    await this.restartExecutor(id, handle, { ...specOf(row), model }, `model: ${model ?? "default"}`);
+  }
+
+  /**
+   * Move an agent onto another account. `null` hands it back to the ambient `~/.claude`.
+   *
+   * The third member of the `setAutonomy`/`setModel` family, with the same shape for the same reason:
+   * `Options.env` — which is where `CLAUDE_CONFIG_DIR` lives — is fixed when `query()` is called, so
+   * a live session is restarted (resuming from the stored `claude_session_id`, which keeps the
+   * conversation) rather than mutated. There is no in-place alternative here at all: the environment
+   * belongs to a subprocess that is already running.
+   *
+   * The new account is persisted first, so even a failed restart leaves the next boot starting the
+   * agent on the subscription the operator asked for.
+   *
+   * **What this does not do**: move the transcript. Sessions live under `<config dir>/projects/…`, so
+   * an agent resumed against a different account is resuming a `claude_session_id` that account has
+   * never seen. The CLI starts a fresh conversation in that case; the SuperFabric event log — which is
+   * the source of truth the operator reads — is untouched and complete either way. Said out loud in
+   * the UI rather than discovered.
+   */
+  async setAccount(id: string, accountId: string | null): Promise<void> {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    if (accountId !== null) this.requireAccount(accountId);
+    this.stmts.setAccount.run(accountId, id);
+
+    const label = accountId === null ? "the ambient ~/.claude" : this.accountLabel(accountId);
+    const handle = this.handles.get(id);
+    if (handle === undefined) {
+      this.store.append(id, {
+        type: "session_status", status: "idle",
+        detail: `account: ${label} (applies when the session next starts)`,
+      });
+      return;
+    }
+
+    await this.restartExecutor(id, handle, { ...specOf(row), accountId }, `account: ${label}`);
+  }
+
+  /** An account's label for the log, falling back to its id if the row has since gone. */
+  private accountLabel(accountId: string): string {
+    return this.opts.accounts?.get(accountId)?.label ?? accountId;
   }
 
   /**
    * Swap a live session's executor for a new one that resumes the same provider session — the one
-   * mechanism behind both `setAutonomy` and `setModel`, because both change an `Options` field that
-   * is fixed for the lifetime of a `query()`.
+   * mechanism behind `setAutonomy`, `setModel` and `setAccount`, because each changes an `Options`
+   * field that is fixed for the lifetime of a `query()`.
    *
    * The ordering is the design: the old executor must be gone before a new one resumes the same
    * provider session, whatever turn was in flight died with it, and its pending approvals are denied
@@ -268,10 +384,8 @@ export class SessionManager {
    */
   private async restartExecutor(
     id: string,
-    row: SessionRow,
     handle: ExecutorHandle,
-    autonomy: AutonomyMode,
-    model: string | null,
+    spec: RunSpec,
     detail: string,
   ): Promise<void> {
     this.store.append(id, { type: "session_status", status: "starting", detail });
@@ -291,7 +405,7 @@ export class SessionManager {
         undeliverable = "the server is shutting down";
         return;
       }
-      this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id, model, isOrchestratorRow(row));
+      this.startExecutor(id, spec);
     } catch (err) {
       undeliverable = `the restart failed: ${String(err)}`;
       throw err;
@@ -337,14 +451,13 @@ export class SessionManager {
     const started: string[] = [];
     for (const r of rows) {
       if (this.handles.has(r.id)) continue;
-      // The stored mode and the stored model are what a session comes back as: a bypass agent stays
-      // bypass across a restart, an attended one stays attended, and an agent pinned to a model
-      // comes back on that model rather than on the CLI's default. The role is stored the same way,
-      // so the factory's orchestrator comes back as the orchestrator — with its charter and its
-      // routing tools — rather than as an ordinary agent standing in the central building.
-      this.startExecutor(
-        r.id, r.cwd, r.claude_session_id, asAutonomy(r.autonomy), r.room_id, r.model, isOrchestratorRow(r),
-      );
+      // Everything stored on the row is what a session comes back as: a bypass agent stays bypass, an
+      // attended one stays attended, an agent pinned to a model comes back on that model rather than
+      // on the CLI's default, and — since M2 — an agent bound to an account comes back on that
+      // account's `CLAUDE_CONFIG_DIR` rather than on the operator's own. The role is stored the same
+      // way, so the factory's orchestrator comes back as the orchestrator, with its charter and its
+      // routing tools, rather than as an ordinary agent standing in the central building.
+      this.startExecutor(r.id, specOf(r));
       started.push(r.id);
     }
     return started;
@@ -383,18 +496,20 @@ export class SessionManager {
     };
   }
 
-  private startExecutor(
-    id: string,
-    cwd: string,
-    resume: string | null,
-    autonomy: AutonomyMode,
-    roomId: string | null,
-    model: string | null,
-    isOrchestrator = false,
-  ) {
+  private startExecutor(id: string, spec: RunSpec) {
+    const { cwd, resume, autonomy, roomId, model, accountId, isOrchestrator } = spec;
+    // The account, as the one thing the provider seam understands: a directory. `undefined` (no
+    // account, or an account row that has since been deleted) leaves the executor's own default in
+    // charge, which is the ambient `~/.claude` — the pre-M2 behaviour, unchanged.
+    const configDir = this.opts.accounts?.configDirOf(accountId);
+    // "This subscription was last used just now", which is what the account list shows and what the
+    // limit monitor will poll. Only for an account that actually resolved to a directory.
+    if (accountId !== null && configDir !== undefined) this.opts.accounts?.touch(accountId);
+
     const handle = this.executor.start(
       {
         cwd, resumeSessionId: resume, autonomy, model,
+        ...(configDir !== undefined ? { configDir } : {}),
         mcpServers: this.busToolServers(id, roomId, isOrchestrator),
         // The role, as a system-prompt append. This — plus the flag and the extra tools — is the
         // entire difference between the orchestrator and any other session: same manager, same
@@ -561,7 +676,7 @@ export class SessionManager {
     return (rows as {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
       autonomy: string; model: string | null; room_id: string | null; last_seq: number;
-      status: string | null; blocked: number; is_orchestrator: number;
+      status: string | null; blocked: number; is_orchestrator: number; account_id: string | null;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
@@ -570,6 +685,7 @@ export class SessionManager {
       autonomy: asAutonomy(r.autonomy),
       model: r.model,
       roomId: r.room_id,
+      accountId: r.account_id,
       status: asStatus(r.status),
       blocked: r.blocked === 1,
       isOrchestrator: r.is_orchestrator === 1,
@@ -582,7 +698,7 @@ export class SessionManager {
  * back exactly as it was. One list, used by every statement that reads a session row, so adding a
  * per-session property cannot be remembered in `resumeAll` and forgotten in `setModel`.
  */
-const SESSION_COLUMNS = "id, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator";
+const SESSION_COLUMNS = "id, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator, account_id";
 
 /**
  * The session listing, with a caller-chosen `WHERE`. The clause is a literal from the two call sites
@@ -592,7 +708,7 @@ function sessionListSql(where: string): string {
   return `
     SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
            s.autonomy AS autonomy, s.model AS model, s.room_id AS room_id,
-           s.is_orchestrator AS is_orchestrator,
+           s.is_orchestrator AS is_orchestrator, s.account_id AS account_id,
            COALESCE(MAX(e.seq), 0) AS last_seq,
            -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
            (SELECT json_extract(st.payload, '$.status')
@@ -625,6 +741,8 @@ interface SessionRow {
   room_id: string | null;
   /** SQLite has no boolean: 1 is the factory's orchestrator, 0 is every other agent. */
   is_orchestrator: number;
+  /** NULL is "the ambient `~/.claude`", not a missing value. */
+  account_id: string | null;
 }
 
 /**

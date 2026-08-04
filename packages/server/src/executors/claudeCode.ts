@@ -58,7 +58,11 @@ export interface ClaudeCodeExecutorOptions {
    * sessions that pinned nothing.
    */
   model?: string;
-  /** Per-account CLAUDE_CONFIG_DIR (auth/settings/transcript isolation). */
+  /**
+   * Process-wide fallback `CLAUDE_CONFIG_DIR` (auth/settings/transcript isolation). A session's own
+   * `ExecutorStartOptions.configDir` wins over this; this is only the default for sessions bound to
+   * no account.
+   */
   configDir?: string;
   /** Appended to the claude_code system-prompt preset. */
   appendSystemPrompt?: string;
@@ -227,10 +231,14 @@ export class ClaudeCodeExecutor implements Executor {
       // There is no `appendSystemPrompt` option; appending lives inside the preset object form.
       options.systemPrompt = { type: "preset", preset: "claude_code", append: appendSystemPrompt };
     }
-    if (this.defaults.configDir) {
+    // Per-session account wins over the process-wide default, exactly as `model`, `autonomy` and the
+    // role do. This is the whole multi-account mechanism: two sessions of the *same* executor
+    // instance get two different `CLAUDE_CONFIG_DIR`s and therefore two different subscriptions.
+    const configDir = opts.configDir ?? this.defaults.configDir;
+    if (configDir) {
       // Options.env REPLACES the subprocess environment (it does not merge), so process.env
       // must be spread first or the CLI loses PATH/HOME/credentials.
-      options.env = { ...process.env, CLAUDE_CONFIG_DIR: this.defaults.configDir };
+      options.env = { ...process.env, CLAUDE_CONFIG_DIR: configDir };
     }
 
     const q: Query = this.queryFn({ prompt: queue, options });
