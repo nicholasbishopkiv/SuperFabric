@@ -45,6 +45,11 @@
   --text-xs--line-height: 1.0625rem;
   --text-sm: 0.8125rem; /* 13px — the HUD's body size */
   --text-sm--line-height: 1.15rem;
+  /* 15px — an entity's own name: a room, an account, a session. The one step *up*, and deliberately
+     the only one: three sizes within two points of each other gave the eye no entry point, and a
+     fourth would start competing with the floor. Controls never use it — see `ui/button.tsx`. */
+  --text-md: 0.9375rem;
+  --text-md--line-height: 1.3rem;
 
   --animate-pop: pop 110ms ease-out;
 }
