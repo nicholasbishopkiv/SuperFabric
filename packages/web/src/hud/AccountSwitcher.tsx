@@ -1,4 +1,5 @@
 import type { AccountInfo, AccountUsage } from "@superfabric/shared";
+import { AGENT_PROVIDERS, DEFAULT_AGENT_PROVIDER } from "@superfabric/shared";
 import {
   CheckIcon,
   ChevronsUpDownIcon,
@@ -207,6 +208,15 @@ function AccountRow({ account, connected }: { account: AccountInfo; connected: b
           )}
         />
         <span className="truncate text-sm font-semibold text-fg">{account.label}</span>
+        {/* Which CLI this subscription belongs to. Only when it is not the default: on a machine
+            where every account is a Claude one the badge would be noise on every row, and its
+            absence is unambiguous. It matters because the two are read differently — a Codex meter
+            is the number its own CLI recorded on the last turn, not something we polled. */}
+        {account.provider !== DEFAULT_AGENT_PROVIDER && (
+          <Badge title={AGENT_PROVIDERS.find((p) => p.id === account.provider)?.summary ?? account.provider}>
+            {AGENT_PROVIDERS.find((p) => p.id === account.provider)?.name ?? account.provider}
+          </Badge>
+        )}
         {!account.credentialsPresent && (
           <Badge variant="warn" title="No credentials in this directory yet — agents on it would fail">
             not logged in

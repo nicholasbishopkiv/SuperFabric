@@ -315,6 +315,9 @@ export class WsHub {
             // Omitted => a plain agent. An unknown id throws into the catch below rather than
             // quietly starting a session that is not what was asked for.
             roleId: msg.roleId,
+            // Omitted => Claude Code. A provider this server has no executor for throws into the
+            // catch below rather than quietly starting the agent on a different CLI.
+            provider: msg.provider,
             projectId: this.requireProject(sock),
           });
           this.broadcastSessions();
@@ -592,7 +595,12 @@ export class WsHub {
         case "create_account": {
           // The store announces its own change (see the constructor), so the fresh list reaches every
           // tab without this branch having to push it — the same arrangement the board has.
-          const account = this.accountStore().create({ label: msg.label, configDir: msg.configDir });
+          const account = this.accountStore().create({
+            label: msg.label, configDir: msg.configDir,
+            // Omitted => Claude Code. It decides which file means "logged in" and where the limits
+            // are read from, so it has to travel with the row rather than be guessed from the path.
+            ...(msg.provider !== undefined ? { provider: msg.provider } : {}),
+          });
           this.safeSend(sock, {
             kind: "notice",
             message: `account ${account.label} uses ${account.configDir} — log it in to give it a `

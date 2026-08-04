@@ -1,5 +1,7 @@
 import {
   type AccountUsage,
+  type AgentProvider,
+  DEFAULT_AGENT_PROVIDER,
   LIMIT_PAUSE_PERCENT,
   USAGE_POLL_INTERVAL_MS,
   USAGE_RATE_LIMIT_BACKOFF_MS,
@@ -71,6 +73,17 @@ export interface LimitMonitorOptions {
   primary?: UsageAdapter;
   /** Used when the primary throws. Defaults to counting local transcripts. */
   fallback?: UsageAdapter;
+  /**
+   * A reading adapter per provider, for accounts that are not Claude Code ones — `{ codex: … }`.
+   *
+   * A separate map rather than another `primary`, because the *shape* of the answer differs: the
+   * Claude pair is an authoritative endpoint with an estimate behind it, while Codex needs no
+   * fallback at all (its CLI records the provider's own numbers on disk, so there is nothing to
+   * degrade *to* — either a record exists or the account has never run a turn, and both are honest
+   * answers). An account whose provider has no adapter is simply never polled: no meters, rather
+   * than invented ones.
+   */
+  byProvider?: Partial<Record<AgentProvider, UsageAdapter>>;
   /** Milliseconds. Injected so a fake clock can drive the poll-interval rule. */
   now?: () => number;
   /**
@@ -86,6 +99,7 @@ export class LimitMonitor {
   private readonly stmts;
   private readonly primary: UsageAdapter;
   private readonly fallback: UsageAdapter;
+  private readonly byProvider: Partial<Record<AgentProvider, UsageAdapter>>;
   private readonly now: () => number;
   private readonly minIntervalMs: number;
   /** accountId -> the newest reading. Hydrated from the database at construction. */
@@ -112,6 +126,7 @@ export class LimitMonitor {
   ) {
     this.primary = opts.primary ?? new OAuthUsageAdapter();
     this.fallback = opts.fallback ?? new TranscriptEstimateAdapter();
+    this.byProvider = opts.byProvider ?? {};
     this.now = opts.now ?? (() => Date.now());
     this.minIntervalMs = opts.minIntervalMs ?? USAGE_POLL_INTERVAL_MS;
     if (opts.onChange !== undefined) this.listeners.push(opts.onChange);
@@ -205,7 +220,7 @@ export class LimitMonitor {
       for (const account of this.accounts.list()) {
         if (!this.isDue(account.id)) continue;
         if (!this.accounts.credentialsPresent(account.id)) continue;
-        if (await this.poll(account.id, account.configDir)) changed = true;
+        if (await this.poll(account.id, account.configDir, account.provider)) changed = true;
       }
       if (changed) this.announce();
     } finally {
@@ -251,13 +266,26 @@ export class LimitMonitor {
    * tight loop, and a throw from the fallback too leaves the previous reading standing with a note
    * rather than blanking the meters.
    */
-  private async poll(accountId: string, configDir: string): Promise<boolean> {
+  private async poll(
+    accountId: string,
+    configDir: string,
+    provider: AgentProvider = DEFAULT_AGENT_PROVIDER,
+  ): Promise<boolean> {
     this.lastAttemptMs.set(accountId, this.now());
     const account = { id: accountId, configDir };
 
+    // Which door this account's numbers come through. A provider we have no adapter for is not
+    // polled at all — an account with no meters is the truth about it, and a Claude reading taken
+    // from another CLI's directory would be a number about nothing.
+    const primary = provider === DEFAULT_AGENT_PROVIDER ? this.primary : this.byProvider[provider];
+    if (primary === undefined) return false;
+    // Only the Claude pair has an estimate behind it: counting `~/.claude` transcripts says nothing
+    // about a Codex account, and a guess about the wrong CLI is worse than an empty meter.
+    const fallback = provider === DEFAULT_AGENT_PROVIDER ? this.fallback : undefined;
+
     let reading: UsageReading;
     try {
-      reading = await this.primary.read(account);
+      reading = await primary.read(account);
       // A reading that worked clears any back-off: the endpoint is talking to us again.
       this.backoffUntilMs.delete(accountId);
     } catch (primaryError) {
@@ -284,8 +312,15 @@ export class LimitMonitor {
         // Nothing to keep: an estimate is thin, but a blank meter reads as "you have used nothing",
         // which is the wrong direction to be wrong in.
       }
+      if (fallback === undefined) {
+        const previous = this.readings.get(accountId) ?? emptyUsage(accountId);
+        const next: AccountUsage = { ...previous, note: String(primaryError) };
+        if (next.note === previous.note) return false;
+        this.readings.set(accountId, next);
+        return true;
+      }
       try {
-        const estimate = await this.fallback.read(account);
+        const estimate = await fallback.read(account);
         reading = {
           ...estimate,
           approximate: true,
@@ -319,9 +354,15 @@ export class LimitMonitor {
    * before the 429, not after it.
    */
   private record(accountId: string, reading: UsageReading): void {
-    const readAt = Math.floor(this.now() / 1000);
+    // The provider's own timestamp when it gave us one (a reading taken from a record the CLI wrote
+    // is as old as that record), else now. A meter that showed yesterday's figure as freshly read
+    // would be lying about its own age.
+    const readAt = reading.readAt ?? Math.floor(this.now() / 1000);
     const worst = worstWindow(reading.windows);
-    const limited = worst !== null && worst.utilization >= LIMIT_PAUSE_PERCENT;
+    // The provider's own answer wins where it has one — see `UsageReading.blocked`. A Codex account
+    // at 100 % of its plan window with credits behind it is *not* stopped, and holding its agents on
+    // the percentage alone would be the meter deciding something it cannot see.
+    const limited = reading.blocked ?? (worst !== null && worst.utilization >= LIMIT_PAUSE_PERCENT);
     const usage: AccountUsage = {
       accountId,
       source: reading.source,

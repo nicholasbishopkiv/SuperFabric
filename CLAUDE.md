@@ -175,6 +175,18 @@ and a subscription limit monitor with auto-pause/resume.
   restart, shutdown) bumps it; events from a superseded incarnation are dropped. Without this the
   `idle` the SDK emits one line after `result` would overwrite the `paused` a boundary pause had just
   appended, and the row and the transcript would disagree about the same agent.
+- **An account belongs to a provider, and that decides how it is read.** `accounts.provider` says
+  whose directory `config_dir` is — `CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex — and
+  everything read out of it follows from that: which file means "logged in"
+  (`PROVIDER_CREDENTIALS_FILE`) and where the limits are. **Codex's meters are the provider's own
+  numbers**, recorded by its CLI on every turn in `sessions/**/rollout-*.jsonl`, so reading them costs
+  no request and is not an estimate — but it is only as fresh as the last turn, and `readAt` is the
+  record's timestamp rather than ours so a day-old figure looks a day old. Two rules there are
+  load-bearing: a window whose `resets_at` has passed is **dropped** rather than shown (it cannot
+  correct itself until another turn runs), and **100 % is not "stopped"** — a free plan reports it
+  while working on credits, so `UsageReading.blocked` comes from what the provider says about
+  spending and only then decides `limited`. The ambient `~/.codex` is adopted exactly as `~/.claude`
+  is: once, when it holds a login.
 - **Accounts are machine-wide, not per project.** A subscription belongs to the operator, not to a
   repository: `accounts` is the one listing on the wire with no `project_id`, and its broadcast goes
   to every socket rather than only to those on one floor. The per-project choice is the *binding* —
@@ -246,6 +258,24 @@ and a subscription limit monitor with auto-pause/resume.
   hit is that it is evidence. Anything that learns to delete rows from those two tables is covered by
   construction, which is why this lives in SQL beside the insert triggers rather than in whichever
   manager happens to be deleting.
+
+- **A provider is chosen once, and everything below the executor seam is unchanged by it.** `claude`
+  and `codex` are both agents in rooms: same row, same event log, same floor, same board, same stop
+  and delete paths. `sessions.provider` decides which `Executor` implementation `startExecutor` picks
+  and **nothing else branches on it**. It is the one per-session property with no setter — unlike
+  `autonomy`/`model`/`account_id`/`role_id`, which are settings of a conversation, this decides
+  *whose* conversation it is, and `claude_session_id` is a provider-native handle (a Codex thread
+  cannot be resumed by Claude Code). A provider whose executor this server does not have is
+  **refused** at creation and, for a stored row, leaves the agent stopped with the reason in its own
+  log — never silently started on a different CLI.
+- **Where a provider is weaker, it says so where the operator is looking.** `codex exec` is
+  non-interactive, so there are no approval cards: autonomy becomes its *sandbox* setting
+  (`attended` → `read-only`, because an agent that cannot ask permission must not be able to take
+  it), and the mapping is written into the agent's own log at the start of the session. It has no
+  factory bus — `busTools` is an in-process MCP server object the Agent SDK takes directly — and no
+  container runtime, because the `agent-runner` image is built around the SDK. All three absences are
+  stated in the picker and in the log, never discovered. See `notes/codex-cli.md` for what was
+  measured, including the JSONL the mapping is built from.
 
 ## Autonomy (per-agent permission mode)
 
@@ -427,7 +457,7 @@ project is invented from the server's working directory, the UI opens on a folde
 guide, and a logged-in `~/.claude` found on disk is adopted as a visible account. See the "Removing
 things" and "First run" sections of `docs/ROADMAP.md`.
 
-**1402 tests green** (shared 88, server 853 + 1 skipped live-quota test, web 431, agent-runner 30).
+**1435 tests green** (shared 89, server 885 + 1 skipped live-quota test, web 431, agent-runner 30).
 
 **What is *not* built is listed at the end of `docs/ROADMAP.md`** and is worth reading before you
 add a doc sentence that implies otherwise — there are no notifications off the browser tab, eleven
@@ -522,13 +552,17 @@ README names).
   one-file change) · `origin.ts` (WebSocket
   origin allow-list) · `eventStore.ts` (append-only log + subscriptions)
   · `executor.ts` (provider seam) · `executors/claudeCode.ts` (Agent SDK, streaming input)
+  · `executors/codex.ts` (the second provider: `codex exec --json`, one process per turn, resumed by
+  thread id; `codexEvents` is the JSONL→`SessionEvent` mapping and `sandboxFor` is autonomy in the
+  vocabulary that CLI actually has) · `toolchain.ts` (which agent CLIs are on this machine)
   · `executors/fake.ts` (scripted, for tests) · `projectManager.ts` (projects: the scope every
   listing is filtered by) · `roomManager.ts` (rooms as folders, charters, settable folders)
   · `accountManager.ts` (accounts: one `CLAUDE_CONFIG_DIR` each, machine-wide, duplicate directories
   refused) · `accountLogin.ts` (`claude auth login` over plain pipes — no PTY, no native module —
   plus the `.credentials.json` watcher)
-  · `usageAdapters.ts` (the limit-reading seam: the OAuth usage endpoint, and the
-  honestly-approximate JSONL estimate behind it) · `limitMonitor.ts` (per-account polling at the
+  · `usageAdapters.ts` (the limit-reading seam: the OAuth usage endpoint, the honestly-approximate
+  JSONL estimate behind it, and `CodexUsageAdapter` — the provider's own figures out of the records
+  its CLI writes) · `limitMonitor.ts` (per-account polling at the
   300 s floor measured from the last reading's own timestamp, so a restart cannot shorten it; a long
   back-off when the endpoint itself answers 429; persisted snapshots; and the immediate mark from a
   429 seen by a *session*) · `toolchain.ts` (which agent CLIs are on this machine — a `PATH` walk and

@@ -330,6 +330,40 @@ const MIGRATIONS: readonly Migration[] = [
       set_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
   `,
+  // 18 — which CLI an agent runs on. `'claude'` for every existing row, which is what they all are.
+  //
+  // The fifth per-session property, and the one that is **not** a member of the
+  // `autonomy`/`model`/`account_id`/`role_id` family: those are settings of a conversation and can be
+  // changed by restarting the executor onto the same `claude_session_id`. This decides *whose*
+  // conversation it is. That id is provider-native — a Codex thread cannot be resumed by Claude Code
+  // — so a `set_provider` would produce an agent that silently forgot everything it knew. Fixed at
+  // creation; changing providers means creating another agent.
+  //
+  // Plain TEXT with no CHECK, like `rooms.runtime` and for the same two reasons: an unrecognised
+  // value folds to the default in TypeScript (which is the *conservative* direction here — the
+  // provider this product was built around), and SQLite cannot drop a column named in a CHECK.
+  //
+  // A function rather than bare SQL, for step 15's reason: `ADD COLUMN` is an error rather than a
+  // shrug when the name is taken, and a database whose `user_version` has been rewound — which is
+  // exactly what `db.test.ts` and the repair tests do to prove an upgrade path — would re-run this
+  // and fail on a column it already has. Every step from here on should be written this way.
+  (db) => {
+    const has = db.query("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'provider'").get();
+    if (has == null) db.exec("ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude';");
+  },
+  // 19 — which CLI an *account* belongs to.
+  //
+  // An account has always been "a config directory plus a row", and that generalises exactly:
+  // `CLAUDE_CONFIG_DIR` is to Claude Code what `CODEX_HOME` is to Codex. What does *not* generalise
+  // is everything read out of that directory — the credentials file has a different name, and the
+  // limits are in a different place and shape — so the row has to say which vocabulary applies.
+  //
+  // `'claude'` for every existing row, which is what they all are. The UNIQUE on `config_dir` still
+  // holds and still means what it meant: one directory is one account, whoever wrote it.
+  (db) => {
+    const has = db.query("SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'provider'").get();
+    if (has == null) db.exec("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude';");
+  },
 ];
 
 /**

@@ -38,6 +38,8 @@ const SHIPPED_FINGERPRINTS = [
   "4de2ed6418495088", // 15 — repair: limited_by for databases stamped past the old step 11
   "960d41d1ba747dd2", // 16 — chronicle FTS delete triggers (deleting an agent must not leave hits)
   "7e77d55222029bae", // 17 — server_state: things done once (adopting the ambient ~/.claude)
+  "95ff6373f0e58fb1", // 18 — sessions.provider: which agent CLI a session runs on
+  "25657d3a29ed374",  // 19 — accounts.provider: whose config directory an account row is
 ];
 
 describe("migrations are append-only", () => {

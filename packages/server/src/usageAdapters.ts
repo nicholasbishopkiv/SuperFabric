@@ -20,11 +20,34 @@ export interface UsageReading {
   windows: UsageWindow[];
   /** Why this reading is degraded, in words for the operator, or null when it is not. */
   note: string | null;
+  /**
+   * When the *provider* produced these numbers, in unix seconds — not when we looked.
+   *
+   * Omitted by an adapter that asks over the network, where the two are the same moment. Set by one
+   * that reads a **record** the CLI wrote (see `CodexUsageAdapter`): a figure from yesterday's turn
+   * shown as if it had just been read would be the meter lying about its own age, which is the one
+   * thing every reading in this product is careful not to do.
+   */
+  readAt?: number;
+  /**
+   * The provider itself says whether this account can work — set only by an adapter that *knows*,
+   * and then it decides `limited` instead of the percentage does.
+   *
+   * It exists because a percentage is not always the whole story. A Codex account can sit at 100 % of
+   * its plan window and keep working on credits: pausing its agents on the number alone would hold
+   * them for a limit that is not in force. The reverse matters too — `spend_control_reached` blocks
+   * an account whose windows look fine. Omitted, and the fullest window decides, exactly as before.
+   */
+  blocked?: boolean;
 }
 
 export interface UsageAccount {
   id: string;
-  /** This account's `CLAUDE_CONFIG_DIR`. Everything an adapter needs is inside it. */
+  /**
+   * This account's configuration directory — `CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for
+   * Codex. Everything an adapter needs is inside it, which is what lets one seam serve providers
+   * that authenticate and record entirely differently.
+   */
   configDir: string;
 }
 
@@ -477,4 +500,170 @@ export class TranscriptEstimateAdapter implements UsageAdapter {
           + "publishes no limit to measure against. Treat it as a direction, not a number.",
     };
   }
+}
+
+// ---- the second provider: what the codex CLI already recorded --------------------------------------
+
+/**
+ * Codex's limits, read out of the records its own CLI writes.
+ *
+ * **These are the provider's numbers, not ours.** Codex stores a `token_count` event on every turn
+ * carrying a `rate_limits` object straight from the API — percentage used, window length, and when it
+ * resets — in `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl`. So this adapter does not ask anyone
+ * anything: it reads the newest record and reports what the API last said. No network, no request to
+ * be rate-limited for, and nothing estimated.
+ *
+ * What it costs instead is **freshness**, and that is reported rather than hidden: `readAt` is the
+ * record's own timestamp, so a meter from yesterday's turn shows as a day old. Two consequences are
+ * deliberate:
+ *
+ * - **A window whose `resets_at` has passed is dropped**, not shown. The recorded number was true
+ *   before the window rolled; showing 96 % from a window that ended overnight would hold agents for
+ *   a limit that no longer exists — and this reading, unlike a Claude one, cannot correct itself
+ *   until the operator runs a turn.
+ * - **An account that has never run a turn has no meters**, which is the truth: nothing has ever told
+ *   us anything about it. It is not zero usage.
+ *
+ * Verified against `codex-cli 0.146.0` on 2026-08-05 — see `notes/codex-cli.md` for the captured
+ * record this parser was written from.
+ */
+export class CodexUsageAdapter implements UsageAdapter {
+  readonly name = "codex-session-records";
+
+  constructor(private now: () => number = () => Date.now()) {}
+
+  async read(account: UsageAccount): Promise<UsageReading> {
+    const record = newestRateLimits(path.join(account.configDir, "sessions"));
+    if (record === null) {
+      throw new Error(
+        "codex has recorded no limits for this account yet — its CLI writes them on every turn, so "
+        + "one turn is all it takes",
+      );
+    }
+
+    const nowSeconds = Math.floor(this.now() / 1000);
+    const windows: UsageWindow[] = [];
+    for (const [slot, raw] of [["primary", record.limits.primary], ["secondary", record.limits.secondary]] as const) {
+      if (raw === null || raw === undefined || typeof raw.used_percent !== "number") continue;
+      const resetsAt = typeof raw.resets_at === "number" ? raw.resets_at : null;
+      // Rolled since it was recorded: the number is no longer about anything. Dropped rather than
+      // shown, because a stale 96 % is what would hold an agent for a limit that has already lifted.
+      if (resetsAt !== null && resetsAt <= nowSeconds) continue;
+      windows.push({
+        key: `codex_${slot}`,
+        label: windowLabel(raw.window_minutes),
+        utilization: raw.used_percent,
+        resetsAt: resetsAt === null ? null : new Date(resetsAt * 1000).toISOString(),
+        detail: null,
+      });
+    }
+
+    const plan = typeof record.limits.plan_type === "string" ? record.limits.plan_type : null;
+    const credits = record.limits.credits;
+    const balance = credits?.balance;
+    const worst = windows.reduce((most, w) => Math.max(most, w.utilization), 0);
+    // A full window with credits behind it is not a stopped account — which is not a hypothetical:
+    // a free plan reports 100 % and keeps working. So the percentage is *shown* and the decision is
+    // taken from what the provider says about spending instead.
+    const onCredits = credits?.has_credits === true;
+    const blocked = record.limits.spend_control_reached === true
+      || typeof record.limits.rate_limit_reached_type === "string"
+      || (worst >= 100 && !onCredits);
+    const notes = [
+      `as recorded by codex at ${new Date(record.at * 1000).toISOString()}`,
+      plan === null ? null : `plan: ${plan}`,
+      balance === undefined ? null : `credits: ${balance}`,
+      windows.length === 0 ? "every recorded window has since reset" : null,
+      // The one line that explains a meter reading 100 % next to an agent that is still working.
+      credits?.has_credits === true && windows.some((w) => w.utilization >= 100)
+        ? "the plan window is full but credits are available, so this account is not held"
+        : null,
+    ].filter((n): n is string => n !== null);
+
+    return {
+      // The provider's own figure, not a guess of ours — the same standing as a reading from
+      // Anthropic's endpoint, and marked as such so nothing downstream treats it as an estimate.
+      source: "endpoint",
+      approximate: false,
+      windows,
+      note: notes.join(" · "),
+      readAt: record.at,
+      blocked,
+    };
+  }
+}
+
+/** `window_minutes` in words. The three the CLI has been seen to use, then a general fallback. */
+function windowLabel(minutes: unknown): string {
+  if (minutes === 300) return "5-hour";
+  if (minutes === 10080) return "weekly";
+  if (minutes === 43200) return "monthly";
+  if (typeof minutes !== "number" || !Number.isFinite(minutes)) return "window";
+  if (minutes % 1440 === 0) return `${minutes / 1440}-day`;
+  if (minutes % 60 === 0) return `${minutes / 60}-hour`;
+  return `${minutes}-minute`;
+}
+
+interface CodexRateLimits {
+  primary?: { used_percent?: number; window_minutes?: unknown; resets_at?: number } | null;
+  secondary?: { used_percent?: number; window_minutes?: unknown; resets_at?: number } | null;
+  plan_type?: unknown;
+  credits?: { balance?: string; has_credits?: boolean; unlimited?: boolean } | null;
+  /** The provider refusing to spend more, whatever the windows say. */
+  spend_control_reached?: boolean | null;
+  /** Non-null when a limit has actually been hit, in the CLI's own words. */
+  rate_limit_reached_type?: unknown;
+}
+
+/**
+ * The newest `rate_limits` any recent session file holds, with the moment it was written.
+ *
+ * Newest-first by mtime and **only the few newest files**: a busy machine has hundreds of session
+ * records, and reading all of them to answer a meter would make opening a popover an I/O event.
+ * Every failure — no directory, an unreadable file, a line that will not parse — is a `null` or a
+ * skip rather than a throw, because a broken record is not a broken account.
+ */
+function newestRateLimits(sessionsDir: string): { at: number; limits: CodexRateLimits } | null {
+  let files: string[];
+  try { files = jsonlFilesByNewest(sessionsDir).slice(0, 5); }
+  catch { return null; }
+
+  for (const file of files) {
+    let lines: string[];
+    try { lines = readFileSync(file, "utf8").split("\n"); }
+    catch { continue; }
+    // From the end: the last record in a file is the newest thing that file knows.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]!;
+      if (!line.includes('"rate_limits"')) continue;
+      try {
+        const parsed = JSON.parse(line) as {
+          timestamp?: string;
+          payload?: { rate_limits?: CodexRateLimits };
+        };
+        const limits = parsed.payload?.rate_limits;
+        if (limits === undefined || limits === null) continue;
+        const at = parsed.timestamp === undefined ? NaN : Math.floor(Date.parse(parsed.timestamp) / 1000);
+        return { at: Number.isFinite(at) ? at : Math.floor(statSync(file).mtimeMs / 1000), limits };
+      } catch { /* a half-written line at the end of a live file is normal */ }
+    }
+  }
+  return null;
+}
+
+/** Every `*.jsonl` under a directory tree, newest first. */
+function jsonlFilesByNewest(dir: string): string[] {
+  const found: { file: string; mtime: number }[] = [];
+  const walk = (at: string, depth: number): void => {
+    if (depth > 4) return;
+    for (const entry of readdirSync(at, { withFileTypes: true })) {
+      const full = path.join(at, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.name.endsWith(".jsonl")) {
+        try { found.push({ file: full, mtime: statSync(full).mtimeMs }); } catch { /* gone */ }
+      }
+    }
+  };
+  walk(dir, 0);
+  return found.sort((a, b) => b.mtime - a.mtime).map((f) => f.file);
 }

@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
-import { ACCOUNT_CREDENTIALS_FILE, AccountInfo, type AccountLogin } from "@superfabric/shared";
+import {
+  AgentProvider, DEFAULT_AGENT_PROVIDER, PROVIDER_CREDENTIALS_FILE, AccountInfo,
+  type AccountLogin,
+} from "@superfabric/shared";
 import type { Db } from "./db.js";
 
 /** Row shape of `accounts`. */
@@ -11,19 +14,27 @@ interface AccountRow {
   config_dir: string;
   created_at: number;
   last_used_at: number | null;
+  /** Which CLI's directory this is. Anything unrecognised folds to the default. */
+  provider: string;
 }
 
 export interface CreateAccountOptions {
   label: string;
-  /** Absolute path of this account's `CLAUDE_CONFIG_DIR`. Created if absent. */
+  /** Absolute path of this account's config directory (`CLAUDE_CONFIG_DIR`/`CODEX_HOME`). Created if absent. */
   configDir: string;
+  /** Which CLI it belongs to. Omitted => Claude Code, which is what every account before this was. */
+  provider?: AgentProvider;
 }
 
 /** The login state of an account that has none: nothing is running, nothing has been said. */
 const NO_LOGIN: AccountLogin = { status: "idle", url: null, message: null };
 
-/** `server_state` key: this server has already looked at the operator's own `~/.claude` once. */
-const AMBIENT_ADOPTED = "ambient_account_adopted";
+/**
+ * `server_state` key: this server has already looked at the operator's own config directory for one
+ * provider. Per provider, so adding Codex support does not re-adopt (or un-remember) the Claude one.
+ */
+const ambientAdoptedKey = (provider: AgentProvider): string =>
+  provider === DEFAULT_AGENT_PROVIDER ? "ambient_account_adopted" : `ambient_account_adopted:${provider}`;
 
 /**
  * What the adopted `~/.claude` is called. Plain and true rather than clever: it is the operator's own
@@ -70,12 +81,12 @@ export class AccountManager {
   constructor(private db: Db, now: () => number = () => Math.floor(Date.now() / 1000)) {
     this.now = now;
     this.stmts = {
-      insert: db.prepare("INSERT INTO accounts (id, label, config_dir) VALUES (?, ?, ?)"),
-      one: db.prepare("SELECT id, label, config_dir, created_at, last_used_at FROM accounts WHERE id = ?"),
-      byDir: db.prepare("SELECT id, label, config_dir, created_at, last_used_at FROM accounts WHERE config_dir = ?"),
+      insert: db.prepare("INSERT INTO accounts (id, label, config_dir, provider) VALUES (?, ?, ?, ?)"),
+      one: db.prepare("SELECT id, label, config_dir, created_at, last_used_at, provider FROM accounts WHERE id = ?"),
+      byDir: db.prepare("SELECT id, label, config_dir, created_at, last_used_at, provider FROM accounts WHERE config_dir = ?"),
       // Creation order, like the project switcher's, and for the same reason: a list that reshuffles
       // as you use it is a list you have to re-read every time.
-      list: db.prepare("SELECT id, label, config_dir, created_at, last_used_at FROM accounts ORDER BY created_at, rowid"),
+      list: db.prepare("SELECT id, label, config_dir, created_at, last_used_at, provider FROM accounts ORDER BY created_at, rowid"),
       remove: db.prepare("DELETE FROM accounts WHERE id = ?"),
       touch: db.prepare("UPDATE accounts SET last_used_at = ? WHERE id = ?"),
       sessionsOn: db.prepare("SELECT COUNT(*) c FROM sessions WHERE account_id = ?"),
@@ -138,7 +149,7 @@ export class AccountManager {
     }
 
     const id = randomUUID();
-    this.stmts.insert.run(id, label, dir);
+    this.stmts.insert.run(id, label, dir, opts.provider ?? DEFAULT_AGENT_PROVIDER);
     this.announce();
     return this.get(id)!;
   }
@@ -166,19 +177,23 @@ export class AccountManager {
    * Returns the account it adopted, or `undefined` when it did nothing. Never throws: a machine with
    * no home directory readable is a machine that starts with no accounts, not one that fails to boot.
    */
-  adoptAmbient(configDir: string): AccountInfo | undefined {
+  adoptAmbient(configDir: string, provider: AgentProvider = DEFAULT_AGENT_PROVIDER): AccountInfo | undefined {
     try {
-      if (this.stmts.stateOf.get(AMBIENT_ADOPTED) != null) return undefined;
+      const key = ambientAdoptedKey(provider);
+      if (this.stmts.stateOf.get(key) != null) return undefined;
       const dir = path.resolve(configDir);
-      if (!existsSync(path.join(dir, ACCOUNT_CREDENTIALS_FILE))) return undefined;
+      if (!existsSync(path.join(dir, PROVIDER_CREDENTIALS_FILE[provider]))) return undefined;
       const canonical = realpathSync(dir);
       // Recorded before the insert, and recorded even when the insert is skipped: "we have looked at
       // this once" is the fact worth remembering either way.
-      this.stmts.setState.run(AMBIENT_ADOPTED, canonical, this.now());
+      this.stmts.setState.run(key, canonical, this.now());
       if (this.stmts.byDir.get(canonical) != null) return undefined;
 
       const id = randomUUID();
-      this.stmts.insert.run(id, AMBIENT_LABEL, canonical);
+      // The label says which CLI when it is not the default one: two rows both called "personal"
+      // would be two accounts an operator cannot tell apart in a picker.
+      const label = provider === DEFAULT_AGENT_PROVIDER ? AMBIENT_LABEL : `${AMBIENT_LABEL} (${provider})`;
+      this.stmts.insert.run(id, label, canonical, provider);
       this.announce();
       return this.get(id)!;
     } catch {
@@ -233,7 +248,8 @@ export class AccountManager {
   }
 
   /**
-   * Has this account been logged in? True exactly when `<configDir>/.credentials.json` is there.
+   * Has this account been logged in? True exactly when the **provider's own** credentials file is in
+   * its directory — `.credentials.json` for Claude Code, `auth.json` for Codex.
    *
    * That file appearing is how the server learns a login finished, whether it was driven from the UI
    * or by the operator in their own terminal. It is a *hint*, not a proof of a working session: the
@@ -242,9 +258,9 @@ export class AccountManager {
    * alone.
    */
   credentialsPresent(id: string): boolean {
-    const dir = this.configDirOf(id);
-    if (dir === undefined) return false;
-    return existsSync(path.join(dir, ACCOUNT_CREDENTIALS_FILE));
+    const row = this.stmts.one.get(id) as AccountRow | null;
+    if (row == null) return false;
+    return existsSync(path.join(row.config_dir, PROVIDER_CREDENTIALS_FILE[asProvider(row.provider)]));
   }
 
   /**
@@ -285,10 +301,24 @@ export class AccountManager {
       id: row.id,
       label: row.label,
       configDir: row.config_dir,
-      credentialsPresent: existsSync(path.join(row.config_dir, ACCOUNT_CREDENTIALS_FILE)),
+      provider: asProvider(row.provider),
+      credentialsPresent: existsSync(
+        path.join(row.config_dir, PROVIDER_CREDENTIALS_FILE[asProvider(row.provider)]),
+      ),
       createdAt: row.created_at,
       lastUsedAt: row.last_used_at,
       login: this.loginState(row.id),
     });
   }
+}
+
+/**
+ * `accounts.provider` is a TEXT column, so a hand-edited or downgraded database could hold anything.
+ * An unrecognised value folds to the product default — the same conservative direction
+ * `sessions.provider` folds in, and for the same reason: a row that says nothing must not be read
+ * with another CLI's vocabulary.
+ */
+function asProvider(value: string | null | undefined): AgentProvider {
+  const parsed = AgentProvider.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_AGENT_PROVIDER;
 }

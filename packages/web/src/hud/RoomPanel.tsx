@@ -1,5 +1,5 @@
-import type { AutonomyMode, RoomRuntime, SessionInfo } from "@superfabric/shared";
-import { RoomName } from "@superfabric/shared";
+import type { AgentProvider, AutonomyMode, RoomRuntime, SessionInfo } from "@superfabric/shared";
+import { AGENT_PROVIDERS, DEFAULT_AGENT_PROVIDER, RoomName } from "@superfabric/shared";
 import {
   BotIcon, CircleStopIcon, CircleUserIcon, FlagIcon, FolderIcon, PencilIcon, PlusIcon, ShieldIcon,
   WarehouseIcon,
@@ -35,6 +35,7 @@ import { AutonomySelect } from "./AutonomySelect";
 import { ConfirmDelete } from "./ConfirmDelete";
 import { agentRemovalWarning, roomRemovalWarning } from "./removal";
 import { ModelSelect } from "./ModelSelect";
+import { ProviderSelect } from "./ProviderSelect";
 import { RoleSelect } from "./RoleSelect";
 import { RUNTIME_SUMMARY, RuntimeSelect } from "./RuntimeSelect";
 import { EdgePanel, PanelSection } from "./Panel";
@@ -257,6 +258,13 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
             ? "waiting for the limit to lift"
             : `resumes ${formatCountdown(new Date(agent.pausedUntil * 1000), now)}`}
         </span>
+      )}
+      {/* Which CLI this agent is. Only when it is not the default: a badge on every row would be
+          noise on the machines where every agent is a Claude one, and its absence is unambiguous. */}
+      {agent.provider !== DEFAULT_AGENT_PROVIDER && (
+        <Badge title={AGENT_PROVIDERS.find((p) => p.id === agent.provider)?.summary ?? agent.provider}>
+          {AGENT_PROVIDERS.find((p) => p.id === agent.provider)?.name ?? agent.provider}
+        </Badge>
       )}
       {agent.isOrchestrator && (
         <Badge variant="accent" title="The factory's senior agent: it routes work and records why">
@@ -541,12 +549,16 @@ function RoomRuntimeLine({ roomId, runtime, accountId, connected }: {
  */
 function NewAgentRole({
   roleId,
+  provider,
   connected,
   onChange,
+  onProviderChange,
 }: {
   roleId: string | null;
+  provider: AgentProvider;
   connected: boolean;
   onChange: (roleId: string | null) => void;
+  onProviderChange: (provider: AgentProvider) => void;
 }) {
   const problems = useRoleProblems();
 
@@ -558,6 +570,11 @@ function NewAgentRole({
         <span className="ml-auto">
           <RoleSelect value={roleId} disabled={!connected} short onChange={onChange} />
         </span>
+      </div>
+      {/* Which CLI the next agent runs on. Renders nothing at all on a machine that has only Claude
+          Code — one choice is not a choice — so this line is invisible until it means something. */}
+      <div className="mt-1 flex items-center gap-1.5 empty:hidden">
+        <ProviderSelect value={provider} disabled={!connected} short onChange={onProviderChange} />
       </div>
       {/* A preset that did not load is the operator's own file being broken, and it is the one thing
           about roles they cannot discover any other way — the picker would just be one entry short. */}
@@ -577,6 +594,8 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
   const agents = useRoomAgents(roomId);
   /** The role the next "+ agent" click uses. Null is a plain agent, which is the default. */
   const [roleId, setRoleId] = useState<string | null>(null);
+  /** And which CLI it arrives on. Local to this panel: it is a property of the click, not the room. */
+  const [provider, setProvider] = useState<AgentProvider>(DEFAULT_AGENT_PROVIDER);
   if (room === undefined) return null;
 
   return (
@@ -587,7 +606,12 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
           size="xs"
           variant="accent"
           onClick={() =>
-            send({ kind: "create_session", roomId, ...(roleId === null ? {} : { roleId }) })
+            send({
+              kind: "create_session",
+              roomId,
+              ...(roleId === null ? {} : { roleId }),
+              ...(provider === DEFAULT_AGENT_PROVIDER ? {} : { provider }),
+            })
           }
           disabled={!connected}
           title="Start a Claude Code session in this room's folder"
@@ -618,7 +642,13 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
         accountId={room.accountId}
         connected={connected}
       />
-      <NewAgentRole roleId={roleId} connected={connected} onChange={setRoleId} />
+      <NewAgentRole
+        roleId={roleId}
+        provider={provider}
+        connected={connected}
+        onChange={setRoleId}
+        onProviderChange={setProvider}
+      />
       {/* The charter is where an agent learns it is a department with a bus. A room created here
           gets that section written for it; a folder that already had a CLAUDE.md keeps its own,
           untouched — so for those it is the operator who has to say it. */}

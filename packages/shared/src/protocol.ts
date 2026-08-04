@@ -11,6 +11,51 @@ import { z } from "zod";
  * - `bypass` — nothing is gated (SDK `"bypassPermissions"`). Per-agent opt-in, only appropriate
  *   for a sandboxed room (M4).
  */
+/**
+ * Which agent CLI a session runs on.
+ *
+ * **Fixed when an agent is created and never changed afterwards**, unlike `autonomy`, `model`,
+ * `account` and `role` — those are settings of one conversation, and this decides *whose* conversation
+ * it is. `claude_session_id` is a provider-native handle: a thread Codex is holding cannot be resumed
+ * by Claude Code, and pretending otherwise would produce an agent that silently forgot everything it
+ * had been told. Changing providers means creating another agent, which is what the UI offers.
+ *
+ * A closed enum rather than a free string (unlike `model`): every value here has to have an
+ * `Executor` implementation behind it, so an id we have never heard of is not a future release we
+ * should accept — it is an agent that cannot start.
+ */
+export const AgentProvider = z.enum(["claude", "codex"]);
+export type AgentProvider = z.infer<typeof AgentProvider>;
+
+/** What an agent runs on when nobody chose: the provider this product was built around. */
+export const DEFAULT_AGENT_PROVIDER: AgentProvider = "claude";
+
+/**
+ * One line per provider, for the picker. Kept next to the enum so adding a provider is one place.
+ *
+ * `bus` is the honest asterisk: the factory bus is an **in-process MCP server** built per session
+ * (`busTools`), which the Agent SDK can take as an object and a separate CLI process cannot. Until a
+ * bridge exists, a Codex agent works in its room but cannot talk to other rooms — said here, in the
+ * picker, rather than discovered by an operator whose message went nowhere.
+ */
+export const AGENT_PROVIDERS: { id: AgentProvider; name: string; command: string; bus: boolean; summary: string }[] = [
+  {
+    id: "claude",
+    name: "Claude Code",
+    command: "claude",
+    bus: true,
+    summary: "the Agent SDK: approval cards, the factory bus, container rooms, per-account subscriptions",
+  },
+  {
+    id: "codex",
+    name: "OpenAI Codex",
+    command: "codex",
+    bus: false,
+    summary: "codex exec, one process per turn, resumed by thread id. No factory bus and no approval "
+      + "cards yet — autonomy becomes its sandbox setting instead",
+  },
+];
+
 export const AutonomyMode = z.enum(["attended", "auto", "bypass"]);
 export type AutonomyMode = z.infer<typeof AutonomyMode>;
 
@@ -131,6 +176,29 @@ export type ProjectInfo = z.infer<typeof ProjectInfo>;
 export const ACCOUNT_CREDENTIALS_FILE = ".credentials.json";
 
 /**
+ * The same fact, per provider: which file inside a config directory means "this one is logged in".
+ *
+ * Codex keeps its tokens in `auth.json` under `CODEX_HOME` rather than in a dotfile, so a single
+ * constant stopped being enough the moment an account could belong to another CLI. One table, so the
+ * server's check and the UI's explanation cannot drift apart.
+ */
+export const PROVIDER_CREDENTIALS_FILE: Record<AgentProvider, string> = {
+  claude: ACCOUNT_CREDENTIALS_FILE,
+  codex: "auth.json",
+};
+
+/**
+ * Where each provider keeps its configuration when nobody has said otherwise, relative to `$HOME`.
+ *
+ * What "the ambient account" means for that CLI — the directory an unbound agent already runs on, and
+ * the one the server adopts on first boot when it finds a login in it.
+ */
+export const PROVIDER_HOME_DIRNAME: Record<AgentProvider, string> = {
+  claude: ".claude",
+  codex: ".codex",
+};
+
+/**
  * Where an account's in-app login has got to.
  *
  * `claude auth login` is a plain-pipe conversation (no terminal emulator involved — see
@@ -163,9 +231,21 @@ export type AccountLogin = z.infer<typeof AccountLogin>;
 export const AccountInfo = z.object({
   id: z.string(),
   label: z.string().min(1).max(120),
-  /** Absolute path of this account's `CLAUDE_CONFIG_DIR`. Unique across the server. */
+  /**
+   * Which CLI this account belongs to. Defaulted, so a row (or a client) written before providers
+   * existed still reads as what it is.
+   *
+   * It decides the vocabulary for everything read out of `configDir`: the name of the credentials
+   * file, and where the limits are and what shape they are in. An account cannot be moved between
+   * providers for the same reason a session cannot — the directory holds one CLI's login.
+   */
+  provider: AgentProvider.default(DEFAULT_AGENT_PROVIDER),
+  /**
+   * Absolute path of this account's configuration directory — `CLAUDE_CONFIG_DIR` for Claude Code,
+   * `CODEX_HOME` for Codex. Unique across the server, whichever provider wrote it.
+   */
   configDir: z.string().min(1),
-  /** `<configDir>/.credentials.json` exists — how the server knows a login finished. */
+  /** The provider's credentials file exists in that directory — how the server knows a login finished. */
   credentialsPresent: z.boolean(),
   createdAt: z.number().int(),
   /** When an agent last started on this account; null until one has. */
@@ -993,6 +1073,11 @@ export const ClientMessage = z.discriminatedUnion("kind", [
      * before M1c was.
      */
     roleId: RoleId.optional(),
+    /**
+     * Which CLI this agent runs on. Omitted => Claude Code, which is what every agent before this
+     * ran on. There is no `set_provider`: see `AgentProvider`.
+     */
+    provider: AgentProvider.optional(),
   }),
   z.object({ kind: z.literal("set_autonomy"), sessionId: z.string(), autonomy: AutonomyMode }),
   /**
@@ -1153,6 +1238,8 @@ export const ClientMessage = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("list_metrics") }),
   z.object({
     kind: z.literal("create_account"),
+    /** Which CLI this account is for. Omitted => Claude Code. */
+    provider: AgentProvider.optional(),
     label: z.string().min(1).max(120),
     /**
      * Absolute path of this account's `CLAUDE_CONFIG_DIR`. Created if it is not there yet, and
@@ -1351,6 +1438,14 @@ export const SessionInfo = z.object({
    * by a reboot comes back as the architect it was, not as a blank session in the architect's room.
    */
   roleId: z.string().nullable().default(null),
+  /**
+   * Which CLI this agent runs on.
+   *
+   * Defaulted rather than required so a client (or a database row) written before providers existed
+   * still parses as what it was: Claude Code. Fixed at creation — see `AgentProvider` — so unlike
+   * every other field here it never changes over a session's life.
+   */
+  provider: AgentProvider.default(DEFAULT_AGENT_PROVIDER),
   /**
    * This agent is the factory's orchestrator: the senior agent that routes work, unblocks rooms and
    * decides direction. It is an ordinary session in every other respect — same runtime, same event

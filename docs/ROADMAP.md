@@ -676,6 +676,56 @@ operator who is logged in must never be told otherwise about their own machine.
 1381 → **1402 tests green** (shared 88, server 853 + 1 skipped live-quota test, web 431,
 agent-runner 30).
 
+## A second provider ✅ **complete** (2026-08-05)
+
+The After-v1 item, brought forward on the operator's own argument: a factory that can only staff a
+room with one CLI is not the idea. `Executor` had said `"claude-code", later "codex"` since M0; this
+is the "later".
+
+- **`sessions.provider`** (migration 18) is the fifth per-session property and the only one with no
+  setter. `autonomy`/`model`/`account_id`/`role_id` are settings of a conversation and change by
+  restarting the executor onto the same `claude_session_id`; this decides *whose* conversation it is,
+  and that id is provider-native — a Codex thread cannot be resumed by Claude Code. Changing provider
+  means creating another agent, which is what the UI offers.
+- **`CodexExecutor`** drives `codex exec --json`: one process per turn, resumed by thread id, prompt
+  on stdin, and a queue so two quick turns never overlap. `codexEvents()` maps the JSONL onto the
+  same `SessionEvent` shapes every other agent produces, so the console, the thought bubble and the
+  chronicle read a Codex agent exactly as they read a Claude one. **Below `startExecutor` nothing
+  branches**: same row, same event log, same room, same board, same stop and delete paths.
+- **Where the provider is weaker, it says so.** `codex exec` is non-interactive, so approval cards
+  cannot exist: autonomy becomes its sandbox (`attended` → `read-only`, because an agent that cannot
+  ask must not be able to take), and the mapping is written into the agent's own log at the start of
+  the session. No factory bus (the bus is an in-process MCP server object) and no container runtime
+  (the image hosts the SDK) — both stated in the picker, both refused loudly rather than silently.
+- **Accounts grew a provider too** (migration 19). `CODEX_HOME` is to Codex what `CLAUDE_CONFIG_DIR`
+  is to Claude Code, so an account is still "a directory plus a row" — the row now says which
+  vocabulary to read it in: which file means "logged in", and where the limits are.
+- **Codex meters are the provider's own numbers.** Its CLI records the API's `rate_limits` on every
+  turn, so `CodexUsageAdapter` reads a file rather than asking anyone: no request, nothing estimated.
+  Three rules make it honest — `readAt` is the *record's* timestamp so a stale figure looks stale, a
+  window whose `resets_at` has passed is dropped rather than shown, and **100 % is not "stopped"**
+  (a free plan reports it while working on credits, so `blocked` comes from what the provider says
+  about spending).
+- **The picker only offers what is installed**, filtered by `list_toolchain`, and renders nothing at
+  all on a machine that has one CLI — one choice is not a choice.
+
+**Evidence.** `test/codexExecutor.test.ts` drives a *fake* `codex` (a script that prints captured
+JSONL and records its argv, environment and stdin): the mapping, the resume, the queue, `CODEX_HOME`,
+a missing binary reported as a session error rather than a crash, and the flag order. Then the real
+thing, twice: a Codex agent created in a real room answered a turn through the real CLI, and a second
+turn resumed the same thread and answered **"banana"** to "what word did I ask you to remember?" —
+which is the whole claim in one word. `test/providers.test.ts` holds the seam down (executor chosen
+by provider, resumed on the right one, refused when absent, kept out of container rooms, and every
+pre-provider row still Claude). `test/codexUsage.test.ts` covers the meters, including the two
+readings it must refuse to act on.
+
+The argument order was measured rather than assumed, and it cost a turn to learn: `codex exec resume`
+rejects `--sandbox` and `-C`, so the first version worked on every first turn and died on every
+second one. `notes/codex-cli.md` records that, the JSONL, and the limits format.
+
+1402 → **1435 tests green** (shared 89, server 885 + 1 skipped live-quota test, web 431,
+agent-runner 30).
+
 ## What is not built
 
 Stated here rather than left as an absence a reader has to discover. Everything in this list
@@ -732,8 +782,10 @@ so that nothing implies otherwise.
 
 ## After v1
 
-- **Multi-provider executors** behind the `Executor` interface (see the list above for exactly
-  how far that seam has actually been taken).
+- **A third provider, and a Codex agent that can talk on the bus.** Two are built (see "A second
+  provider"); the bus needs `busTools` exposed as a *process* speaking MCP over stdio, which is a
+  bridge that does not exist yet. `codex app-server` is the obvious route to approval cards and a
+  streaming session if one-process-per-turn ever becomes a limitation.
 - **Notifications off the tab**, which is what would make an eight-hour unattended run
   something an operator could walk away from.
 - **A directory-browse endpoint**, so the path fields can become a picker.

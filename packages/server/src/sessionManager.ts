@@ -18,8 +18,8 @@ import type { TaskRouter } from "./router.js";
 import { describeInstall, type SkillLibrary } from "./skills.js";
 import type { TaskStore } from "./taskStore.js";
 import {
-  AutonomyMode, DEFAULT_AUTONOMY, DEFAULT_ROOM_RUNTIME, RoomRuntime, SessionStatus,
-  type RoleSpec, type SessionInfo,
+  AgentProvider, AutonomyMode, DEFAULT_AGENT_PROVIDER, DEFAULT_AUTONOMY, DEFAULT_ROOM_RUNTIME,
+  RoomRuntime, SessionStatus, type RoleSpec, type SessionInfo,
 } from "@superfabric/shared";
 
 /**
@@ -81,6 +81,15 @@ export interface CreateSessionOptions {
    * behaviour has no visible explanation.
    */
   roleId?: string;
+  /**
+   * Which CLI this agent runs on. Omitted => Claude Code, which is what every agent before providers
+   * existed ran on.
+   *
+   * **Not changeable afterwards.** `claude_session_id` is a provider-native handle — a Codex thread
+   * cannot be resumed by Claude Code — so a setter would produce an agent that silently forgot
+   * everything it knew. Creating another agent is the supported way to change provider.
+   */
+  provider?: AgentProvider;
 }
 
 /**
@@ -131,6 +140,19 @@ export interface SessionManagerOptions {
    */
   containerExecutor?: Executor;
   /**
+   * Executors for providers other than Claude Code, by id — `{ codex: new CodexExecutor() }`.
+   *
+   * A map rather than a second named field, because "which CLI runs this agent" is now a *list* the
+   * product expects to grow, and a server that has one of them and not another is an ordinary
+   * configuration. Absent (or missing an entry) => `create_session` **refuses** that provider rather
+   * than starting the agent on Claude Code: an operator who picked Codex and silently got something
+   * else would have an agent whose behaviour has no visible explanation.
+   *
+   * The default provider is never looked up here — it is the executor this manager was constructed
+   * with, which is also what every session created before providers existed runs on.
+   */
+  providers?: Partial<Record<AgentProvider, Executor>>;
+  /**
    * A session was refused with a rate-limit error.
    *
    * The one thing the session runner knows about limits, and it reports it rather than acting on it:
@@ -164,6 +186,8 @@ interface RunSpec {
   isOrchestrator: boolean;
   /** The role this agent arrived as; null is a plain agent. Resolved to a spec at start time. */
   roleId: string | null;
+  /** Which CLI runs this agent. Fixed at creation — see `AgentProvider`. */
+  provider: AgentProvider;
 }
 
 /** The spec that brings a stored session back exactly as it was. */
@@ -177,6 +201,7 @@ function specOf(row: SessionRow): RunSpec {
     accountId: row.account_id,
     isOrchestrator: isOrchestratorRow(row),
     roleId: row.role_id,
+    provider: asProvider(row.provider),
   };
 }
 
@@ -261,8 +286,8 @@ export class SessionManager {
   ) {
     this.stmts = {
       insertSession: db.prepare(
-        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator, account_id, role_id)"
-        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator,"
+        + " account_id, role_id, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
       activeSessions: db.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE state = 'active'`),
@@ -396,12 +421,19 @@ export class SessionManager {
     // Baking it into the column would turn a suggestion into a choice, and clearing the role would
     // then leave the agent silently pinned to a model nobody picked.
     const model = opts.model ?? null;
+    const provider = opts.provider ?? DEFAULT_AGENT_PROVIDER;
+    if (provider !== DEFAULT_AGENT_PROVIDER && this.opts.providers?.[provider] === undefined) {
+      // Refused rather than quietly started on Claude Code: an operator who picked Codex and got
+      // something else would have an agent whose behaviour has no visible explanation.
+      throw new Error(`this server has no executor for provider ${provider}`);
+    }
     const spec: RunSpec = {
       cwd, resume: null, autonomy, roomId, model, accountId: accountId ?? null, isOrchestrator,
-      roleId: role?.id ?? null,
+      roleId: role?.id ?? null, provider,
     };
     this.stmts.insertSession.run(
       id, projectId, cwd, autonomy, roomId, model, isOrchestrator ? 1 : 0, spec.accountId, spec.roleId,
+      provider,
     );
     // Before the executor starts, so a skill this agent is meant to have is on disk by the time the
     // CLI reads the folder rather than one turn later.
@@ -800,10 +832,23 @@ export class SessionManager {
    * silently got the operator's own machine would have every reason to believe their agent was
    * contained when it was not, which is worse than never offering the choice.
    */
-  private runtimeFor(sessionId: string, roomId: string | null): RoomRuntime {
+  private runtimeFor(sessionId: string, roomId: string | null, provider: AgentProvider): RoomRuntime {
     if (roomId === null) return "host";
     const wanted = this.rooms.getRoom(roomId)?.runtime ?? DEFAULT_ROOM_RUNTIME;
     if (wanted !== "container") return "host";
+    // The `agent-runner` image is built around the Agent SDK, so a contained room cannot yet hold an
+    // agent from another provider. Said in the agent's own log for the same reason the missing
+    // container runtime is: an operator who chose a sandbox and got the host must be told.
+    if (provider !== DEFAULT_AGENT_PROVIDER) {
+      this.store.append(sessionId, {
+        type: "session_status",
+        status: "starting",
+        detail: `this room runs agents in a container, but the container image only hosts `
+          + `${DEFAULT_AGENT_PROVIDER} agents — this ${provider} agent is starting on the host `
+          + "instead, with the operator's own filesystem and credentials",
+      });
+      return "host";
+    }
     if (this.opts.containerExecutor !== undefined) return "container";
     this.store.append(sessionId, {
       type: "session_status",
@@ -852,13 +897,29 @@ export class SessionManager {
       ...this.busToolServers(id, roomId, isOrchestrator, role?.id === ONBOARDING_ROLE_ID),
     };
 
-    // Which executor an agent gets is decided here and nowhere else, from the room's runtime. Below
-    // this line nothing branches on it: the same options go to whichever executor answered, and the
-    // events, the approvals, the log and the resume are the same in both directions. That is the
-    // seam paying for itself, and `test/containerEquivalence.test.ts` is what holds it down.
+    // Which executor an agent gets is decided here and nowhere else, from two facts: the session's
+    // provider and the room's runtime. Below this line nothing branches on either — the same options
+    // go to whichever executor answered, and the events, the approvals, the log and the resume are
+    // the same in every direction. That is the seam paying for itself, and
+    // `test/containerEquivalence.test.ts` is what holds it down for the runtime half.
     const contained = this.opts.containerExecutor;
-    const runtime = this.runtimeFor(id, roomId);
-    const executor = runtime === "container" && contained !== undefined ? contained : this.executor;
+    const runtime = this.runtimeFor(id, roomId, spec.provider);
+    const byProvider = spec.provider === DEFAULT_AGENT_PROVIDER
+      ? this.executor
+      : this.opts.providers?.[spec.provider];
+    if (byProvider === undefined) {
+      // A stored row naming a provider this server no longer has: said out loud in the agent's own
+      // log and left stopped, rather than silently resumed on a different CLI. Same reasoning as a
+      // role whose file has gone, one step stronger — a provider is not a suggestion.
+      this.store.append(id, {
+        type: "session_error",
+        message: `this server has no executor for provider ${spec.provider}, so this agent cannot `
+          + "start. Install that CLI (or create the agent on another provider) and restart the server.",
+      });
+      this.stmts.markError.run(id);
+      return;
+    }
+    const executor = runtime === "container" && contained !== undefined ? contained : byProvider;
     this.liveRuntime.set(id, runtime);
 
     const handle = executor.start(
@@ -1327,7 +1388,7 @@ export class SessionManager {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
       autonomy: string; model: string | null; room_id: string | null; last_seq: number;
       status: string | null; blocked: number; is_orchestrator: number; account_id: string | null;
-      role_id: string | null; paused_until: number | null;
+      role_id: string | null; paused_until: number | null; provider: string;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
@@ -1338,6 +1399,7 @@ export class SessionManager {
       roomId: r.room_id,
       accountId: r.account_id,
       roleId: r.role_id,
+      provider: asProvider(r.provider),
       pausedUntil: r.paused_until,
       status: asStatus(r.status),
       blocked: r.blocked === 1,
@@ -1355,7 +1417,8 @@ export class SessionManager {
  * per-session property cannot be remembered in `resumeAll` and forgotten in `setModel`.
  */
 const SESSION_COLUMNS =
-  "id, state, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator, account_id, role_id";
+  "id, state, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator, account_id, role_id,"
+  + " provider";
 
 /**
  * What an agent's system prompt is appended with: the orchestrator's charter, the role's, or both.
@@ -1386,7 +1449,7 @@ function sessionListSql(where: string): string {
     SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
            s.autonomy AS autonomy, s.model AS model, s.room_id AS room_id,
            s.is_orchestrator AS is_orchestrator, s.account_id AS account_id,
-           s.role_id AS role_id,
+           s.role_id AS role_id, s.provider AS provider,
            s.paused_until AS paused_until,
            COALESCE(MAX(e.seq), 0) AS last_seq,
            -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
@@ -1426,6 +1489,8 @@ interface SessionRow {
   account_id: string | null;
   /** NULL is "a plain agent", not a missing value. An id whose file has gone resolves to the same. */
   role_id: string | null;
+  /** Which CLI runs this agent. Anything unrecognised folds to the default — see `asProvider`. */
+  provider: string;
 }
 
 /**
@@ -1445,6 +1510,17 @@ function isOrchestratorRow(row: SessionRow): boolean {
 function asAutonomy(value: string): AutonomyMode {
   const parsed = AutonomyMode.safeParse(value);
   return parsed.success ? parsed.data : DEFAULT_AUTONOMY;
+}
+
+/**
+ * `sessions.provider` is a TEXT column, so a hand-edited or downgraded database could hold anything.
+ * An unparseable value folds to the product default — which is also the *conservative* direction: a
+ * row that says nothing must not be started on a provider whose rules (no approval cards, a sandbox
+ * instead) differ from the one the operator has been reading about.
+ */
+function asProvider(value: string | null | undefined): AgentProvider {
+  const parsed = AgentProvider.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_AGENT_PROVIDER;
 }
 
 /**

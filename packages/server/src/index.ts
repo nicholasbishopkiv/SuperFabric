@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import Docker from "dockerode";
 import Fastify from "fastify";
-import { RUNNER_SOCKET_FILE } from "@superfabric/shared";
+import { AgentProvider, PROVIDER_HOME_DIRNAME, RUNNER_SOCKET_FILE } from "@superfabric/shared";
 import { WebSocketServer, type WebSocket } from "ws";
 import { AccountLoginManager, CredentialsWatcher } from "./accountLogin.js";
 import { AccountManager } from "./accountManager.js";
@@ -25,7 +25,9 @@ import { LimitScheduler } from "./scheduler.js";
 import { TaskRouter } from "./router.js";
 import { SessionManager } from "./sessionManager.js";
 import { TaskStore } from "./taskStore.js";
+import { CodexUsageAdapter } from "./usageAdapters.js";
 import { ClaudeCodeExecutor } from "./executors/claudeCode.js";
+import { CodexExecutor } from "./executors/codex.js";
 import { ContainerExecutor, type DockerLike } from "./executors/container.js";
 import { isOriginAllowed } from "./origin.js";
 import { RunnerHub } from "./runnerHub.js";
@@ -71,10 +73,15 @@ const accounts = new AccountManager(db);
 // agent already runs on it. Adopting it means the operator sees their own account — with a meter —
 // on first run instead of "No accounts yet", which was never true on such a machine. Once only, and
 // only when `.credentials.json` is actually there: see `AccountManager.adoptAmbient`.
-const ambientConfigDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(homedir(), ".claude");
-const adopted = accounts.adoptAmbient(ambientConfigDir);
-if (adopted !== undefined) {
-  console.log(`found a logged-in Claude Code at ${adopted.configDir} — added it as account "${adopted.label}"`);
+// Both providers, the same way: an account is a config directory plus a row, and which CLI wrote it
+// only decides which file means "logged in" (`PROVIDER_CREDENTIALS_FILE`).
+for (const provider of AgentProvider.options) {
+  const fromEnv = provider === "claude" ? process.env.CLAUDE_CONFIG_DIR : process.env.CODEX_HOME;
+  const dir = fromEnv ?? path.join(homedir(), PROVIDER_HOME_DIRNAME[provider]);
+  const adopted = accounts.adoptAmbient(dir, provider);
+  if (adopted !== undefined) {
+    console.log(`found a logged-in ${provider} at ${adopted.configDir} — added it as account "${adopted.label}"`);
+  }
 }
 // Roles are files, not rows: the shipped presets in `roles/` at the product root, the operator's own
 // in `<data dir>/roles/` overriding them by id. Both are re-read when they change, so tuning a preset
@@ -158,6 +165,11 @@ const containerExecutor = new ContainerExecutor({
 });
 mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
   bus, tasks, router, chronicle, accounts, roles, skills, containerExecutor,
+  // The other CLIs an agent can run on. Registered unconditionally: whether the binary is actually
+  // installed is a question for the moment a turn is spawned (which reports it in the agent's own
+  // log), not for boot — a machine that installs `codex` tomorrow should not need a restart to have
+  // asked us today. What the *picker* offers is decided from `list_toolchain`, which does look.
+  providers: { codex: new CodexExecutor() },
   // A getter for the same reason `onRateLimited` below is a closure: it is read when an executor
   // starts, which is long after both objects exist.
   get onboarding() { return onboarding; },
@@ -175,7 +187,12 @@ let hub!: WsHub;
 onboarding = new OnboardingManager({
   db, projects, rooms, sessions: mgr, onChange: () => hub.announceOnboarding(),
 });
-limits = new LimitMonitor(db, accounts, { onChange: () => hub.announceUsage() });
+limits = new LimitMonitor(db, accounts, {
+  onChange: () => hub.announceUsage(),
+  // Codex records the provider's own rate limits on every turn, so reading them is a file read
+  // rather than a request — no endpoint to be polite to, and nothing estimated.
+  byProvider: { codex: new CodexUsageAdapter() },
+});
 // Utilisation into action: warn at 80 %, hold at 95 % (at a turn boundary, never mid-turn), and
 // bring everyone back when the window rolls. It never moves an agent to another subscription — see
 // the class comment, and `docs/RESEARCH.md` §5 for why that line is where it is.

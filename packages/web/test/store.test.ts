@@ -52,7 +52,7 @@ beforeEach(() => {
 const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
   id: "s1", state: "active", claudeSessionId: null, lastSeq: 0,
   autonomy: "auto", model: null, roomId: null, accountId: null, roleId: null, pausedUntil: null,
-  status: "idle", blocked: false, isOrchestrator: false, runtime: null, ...over,
+  status: "idle", blocked: false, isOrchestrator: false, runtime: null, provider: "claude", ...over,
 });
 
 const room = (over: Partial<RoomInfo> = {}): RoomInfo => ({
@@ -1710,7 +1710,7 @@ describe("projects", () => {
 
 describe("accounts", () => {
   const account = (over: Partial<AccountInfo> = {}): AccountInfo => ({
-    id: "a1", label: "Work", configDir: "/home/me/.claude-work",
+    id: "a1", label: "Work", provider: "claude", configDir: "/home/me/.claude-work",
     credentialsPresent: true, createdAt: 1_800_000_000, lastUsedAt: null,
     login: { status: "idle", url: null, message: null }, ...over,
   });

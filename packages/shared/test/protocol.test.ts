@@ -468,13 +468,20 @@ describe("protocol", () => {
 
   describe("accounts", () => {
     const ACCOUNT = {
-      id: "a1", label: "Work", configDir: "/home/me/.claude-work",
+      id: "a1", label: "Work", provider: "claude", configDir: "/home/me/.claude-work",
       credentialsPresent: false, createdAt: 1_800_000_000, lastUsedAt: null,
       login: { status: "idle", url: null, message: null },
     } as const;
 
     it("parses an account, login state and all", () => {
       expect(AccountInfo.parse(ACCOUNT)).toEqual(ACCOUNT);
+    });
+
+    it("reads a row written before providers existed as the Claude account it is", () => {
+      const { provider: _dropped, ...beforeProviders } = ACCOUNT;
+      // The default is what makes this a widening rather than a breaking change: an older server, an
+      // older row, or a client that has not been updated all still describe a Claude Code account.
+      expect(AccountInfo.parse(beforeProviders).provider).toBe("claude");
     });
 
     it("requires a label and a config directory", () => {

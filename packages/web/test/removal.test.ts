@@ -52,7 +52,7 @@ function session(id: string): SessionInfo {
   return {
     id, state: "active", claudeSessionId: null, lastSeq: 2, autonomy: "auto", model: null,
     roomId: "r1", accountId: null, roleId: null, pausedUntil: null, status: "idle", blocked: false,
-    isOrchestrator: false, runtime: "host",
+    isOrchestrator: false, runtime: "host", provider: "claude",
   };
 }
 
