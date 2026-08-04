@@ -13,6 +13,14 @@ import type { TaskRouter } from "./router.js";
 import type { TaskStore } from "./taskStore.js";
 import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
 
+/**
+ * How many prompts may pile up while one session's executor restarts before further ones are
+ * refused outright. A restart is a subprocess teardown and a resume — a second or two — so a queue
+ * this deep already means something is wrong, and silently accepting more would turn "your
+ * instruction is on its way" into a lie that grows.
+ */
+const MAX_HELD_PROMPTS = 20;
+
 /** A tool call waiting on an operator decision, bound to the session that asked. */
 interface PendingApproval {
   sessionId: string;
@@ -79,6 +87,17 @@ export class SessionManager {
   private turnInFlight = new Set<string>();
   /** Set by stopAll(): no new executor may be started once shutdown has begun. */
   private stopping = false;
+  /**
+   * sessionId -> prompts that arrived while that session's executor was being restarted.
+   *
+   * A restart (`setAutonomy`, `setModel`) tears the old executor down and awaits it before starting
+   * the replacement, and for that window the session has no handle. An instruction landing there
+   * used to be refused with "no live session", which is technically an error but reads to the
+   * operator as the agent having died — and the instruction was gone either way. It is held here
+   * instead and delivered the moment the replacement is up. An entry exists **only** while a restart
+   * is in flight, so `prompt()` can tell "restarting" from "not running" without a second flag.
+   */
+  private heldPrompts = new Map<string, string[]>();
   private readonly stmts;
 
   constructor(
@@ -203,22 +222,7 @@ export class SessionManager {
       return;
     }
 
-    this.store.append(id, {
-      type: "session_status", status: "starting", detail: `autonomy: ${autonomy}`,
-    });
-    // Order matters: the old executor must be gone before a new one resumes the same provider
-    // session. Pending approvals belong to the turn that is being torn down, so deny them.
-    this.handles.delete(id);
-    // Whatever turn was in flight died with that executor; the replacement starts idle.
-    this.turnInFlight.delete(id);
-    this.denyPendingApprovals(id);
-    // A wedged CLI subprocess must not wedge the toggle; the abort in stop() still fires.
-    await this.stopWithTimeout(handle, 5000).catch(() => {});
-    // Shutdown may have started while we were stopping the old executor. Spawning a replacement
-    // now would leak a CLI subprocess past the server's exit; the stored mode still applies on the
-    // next boot.
-    if (this.stopping) return;
-    this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id, row.model, isOrchestratorRow(row));
+    await this.restartExecutor(id, row, handle, autonomy, row.model, `autonomy: ${autonomy}`);
   }
 
   /**
@@ -247,19 +251,81 @@ export class SessionManager {
       return;
     }
 
-    this.store.append(id, {
-      type: "session_status", status: "starting", detail: `model: ${model ?? "default"}`,
-    });
-    // Order matters exactly as in setAutonomy: the old executor is gone before a new one resumes the
-    // same provider session, and the turn that died with it takes its approvals with it.
+    await this.restartExecutor(
+      id, row, handle, asAutonomy(row.autonomy), model, `model: ${model ?? "default"}`,
+    );
+  }
+
+  /**
+   * Swap a live session's executor for a new one that resumes the same provider session — the one
+   * mechanism behind both `setAutonomy` and `setModel`, because both change an `Options` field that
+   * is fixed for the lifetime of a `query()`.
+   *
+   * The ordering is the design: the old executor must be gone before a new one resumes the same
+   * provider session, whatever turn was in flight died with it, and its pending approvals are denied
+   * rather than left to hang. `heldPrompts` opens **before the first await**, so there is no instant
+   * in which a prompt can arrive to a session that is neither live nor known to be restarting.
+   */
+  private async restartExecutor(
+    id: string,
+    row: SessionRow,
+    handle: ExecutorHandle,
+    autonomy: AutonomyMode,
+    model: string | null,
+    detail: string,
+  ): Promise<void> {
+    this.store.append(id, { type: "session_status", status: "starting", detail });
     this.handles.delete(id);
     this.turnInFlight.delete(id);
     this.denyPendingApprovals(id);
-    await this.stopWithTimeout(handle, 5000).catch(() => {});
-    if (this.stopping) return;
-    this.startExecutor(
-      id, row.cwd, row.claude_session_id, asAutonomy(row.autonomy), row.room_id, model, isOrchestratorRow(row),
-    );
+    this.heldPrompts.set(id, []);
+
+    let undeliverable = "the restart did not complete";
+    try {
+      // A wedged CLI subprocess must not wedge the toggle; the abort in stop() still fires.
+      await this.stopWithTimeout(handle, 5000).catch(() => {});
+      // Shutdown may have started while we were stopping the old executor. Spawning a replacement
+      // now would leak a CLI subprocess past the server's exit; the stored value still applies on
+      // the next boot.
+      if (this.stopping) {
+        undeliverable = "the server is shutting down";
+        return;
+      }
+      this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id, model, isOrchestratorRow(row));
+    } catch (err) {
+      undeliverable = `the restart failed: ${String(err)}`;
+      throw err;
+    } finally {
+      this.releaseHeldPrompts(id, undeliverable);
+    }
+  }
+
+  /**
+   * Hand everything held during a restart to the new executor, in the order it arrived.
+   *
+   * If the restart produced no executor (shutdown, or a failed start) the prompts cannot be
+   * delivered — but they are still not dropped in silence, which is the failure this whole mechanism
+   * exists to prevent. Each one is appended to the session's own log as a `session_error` carrying
+   * its text, so the operator sees in the transcript both that the instruction did not land and what
+   * it said. Appended here rather than through the executor's own `onEvent`, so it does not move the
+   * session off 'active': a session that failed to restart during shutdown is healthy and must come
+   * back on the next boot.
+   */
+  private releaseHeldPrompts(id: string, undeliverable: string): void {
+    const held = this.heldPrompts.get(id);
+    this.heldPrompts.delete(id);
+    if (held === undefined || held.length === 0) return;
+    const handle = this.handles.get(id);
+    if (handle === undefined) {
+      for (const text of held) {
+        this.store.append(id, {
+          type: "session_error",
+          message: `prompt not delivered — ${undeliverable}. It said: ${text}`,
+        });
+      }
+      return;
+    }
+    for (const text of held) handle.send(text);
   }
 
   /**
@@ -365,10 +431,35 @@ export class SessionManager {
     void handle.providerSessionId.then((psid) => this.stmts.setProviderSessionId.run(psid, id));
   }
 
+  /**
+   * Send a turn to an agent.
+   *
+   * A session whose executor is mid-restart (`setAutonomy`, `setModel`) has no handle for a moment.
+   * The instruction is **held** and delivered as soon as the replacement is up, because a dropped
+   * instruction is the worst outcome available here: the operator watched themselves type it and
+   * nothing in the transcript ever mentions it again. The hold is bounded — past
+   * `MAX_HELD_PROMPTS` the call throws, which the hub turns into an `error` the UI shows, so a
+   * restart that never finishes cannot quietly swallow an unbounded pile of instructions.
+   */
   prompt(id: string, text: string): void {
     const h = this.handles.get(id);
-    if (!h) throw new Error(`no live session ${id}`);
-    h.send(text);
+    if (h !== undefined) { h.send(text); return; }
+    const held = this.heldPrompts.get(id);
+    if (held === undefined) throw new Error(`no live session ${id}`);
+    if (held.length >= MAX_HELD_PROMPTS) {
+      throw new Error(
+        `session ${id} is restarting and already has ${held.length} prompts waiting; `
+        + "this one was not accepted — wait for it to come back and send it again",
+      );
+    }
+    held.push(text);
+    // Not a `user_prompt`: nothing has been said to the agent yet, and the log must not claim it
+    // has. This is the operator's receipt that the instruction was taken and is waiting.
+    this.store.append(id, {
+      type: "session_status",
+      status: "starting",
+      detail: `prompt held until the restart finishes (${held.length} waiting)`,
+    });
   }
 
   /**

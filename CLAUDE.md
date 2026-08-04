@@ -34,6 +34,13 @@ and a subscription limit monitor with auto-pause/resume.
   release schedule, not our protocol: the wire takes any non-empty string, `AGENT_MODELS` in
   `packages/shared` is a shortlist for the UI, and a free-text field covers everything else. Never
   hard-code an id you are not sure of — a wrong one is a 404 mid-turn.
+- **A restart never eats an instruction.** `set_autonomy`/`set_model` restart a live session's
+  executor, and a `prompt` landing in that window is *held* and delivered the moment the replacement
+  is up — never dropped. The hold is bounded (`MAX_HELD_PROMPTS` in `sessionManager.ts`); past it the
+  call throws and the hub answers with an `error`. If the restart never produces an executor
+  (shutdown, a failed start) each held prompt is appended to the session's log as a `session_error`
+  carrying its text, so the operator sees both that it did not land and what it said. Delivered, or
+  refused out loud — never neither.
 - **A room is never taken from tool input.** The room an agent speaks for comes from its session
   row, and `busTools` bakes it into the closures — an agent cannot send a bus message *as* another
   department, whatever it puts in the arguments. A roomless session gets no bus tools at all. The
