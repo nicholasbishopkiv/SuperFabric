@@ -1,33 +1,42 @@
 import type { TaskInfo, TaskStatus } from "@superfabric/shared";
+import { FlagIcon, ListChecksIcon, PlusIcon } from "lucide-react";
 import { memo, useState } from "react";
-import {
-  TASK_STATUS_ORDER,
-  tasksByStatus,
-  useFabric,
-  useHudInsets,
-  useTasks,
-} from "../store";
+import { TASK_STATUS_ORDER, tasksByStatus, useFabric, useHudInsets, useTasks } from "../store";
+import { Badge } from "../ui/badge";
+import { Button } from "../ui/button";
+import { FieldNote, Input } from "../ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
+import { cn } from "../ui/utils";
 import { send } from "../wsClient";
-import { HUD } from "./theme";
-import { useHudInset } from "./useHudInset";
+import { EdgePanel } from "./Panel";
 
 /**
  * The task board: what the factory is supposed to be doing, as opposed to what it is doing right
  * now (the floor) or what one agent said (the console).
  *
- * It takes the **bottom** edge because the other two are spoken for, and it spans only the strip the
- * side panels leave uncovered — it reads `hudInsets` for that, the same numbers the camera framing
- * uses, so the board and the floor are laid out against one shared idea of where the free space is.
- * It reports its own height into the same record, so opening it re-frames the factory into what is
- * still visible instead of hiding a row of buildings behind it.
+ * ## It stays a bottom strip, and it got much shorter
  *
- * Cards are grouped by status rather than laid out as columns of equal weight: the board is read
- * left to right as a pipeline, and the group that matters — `blocked` — is called out in the middle
- * where a reader lands rather than at the end.
+ * The bottom edge is the only one left, and it is the right one anyway: five statuses read left to
+ * right as a pipeline, which is a shape a horizontal strip has and a vertical list does not. What
+ * changed is the density. The old board spent its height on furniture — a standing paragraph
+ * explaining unassigned tasks, a permanently-open new-task form in the header, and two-line cards
+ * with a button inside each — and could take 38% of the screen to show a handful of tasks. So:
+ *
+ * - **A task is one line.** Title, then its room, its agent and its blocked flag as inline meta at
+ *   11px. Two lines per card is what made five columns tall.
+ * - **The new-task form is a popover** behind a `+` in the header. It is the same form, defaulting
+ *   the same way (no room — the orchestrator decides), and the explanation that used to be a
+ *   standing line of the board now lives in it, where it is read at the moment it applies.
+ * - **The ceiling came down to 30vh**, because it now fits.
+ *
+ * It spans only the strip the side panels leave uncovered — it reads `hudInsets` for that, the same
+ * numbers the camera framing uses — and it reports its own height into the same record, so opening
+ * it re-frames the factory into what is still visible instead of hiding a row of buildings.
  */
 
 /** How tall the open board is allowed to get before its groups scroll. */
-const BOARD_MAX_HEIGHT = "38vh";
+const BOARD_MAX_HEIGHT = "30vh";
 
 /** Plain-words labels; the protocol's own strings are snake_case and read as code. */
 const STATUS_LABEL: Record<TaskStatus, string> = {
@@ -39,11 +48,11 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
 };
 
 /**
- * `blocked` is the only status with a colour, and it is the amber the rest of the HUD already uses
- * for "this wants attention". Colouring all five would make the board a rainbow in which nothing is
- * emphasised, which is the same as colouring none of them.
+ * `blocked` is the only status with a colour, and it is the floor's own amber for "this wants
+ * attention". Colouring all five would make the board a rainbow in which nothing is emphasised,
+ * which is the same as colouring none of them.
  */
-const STATUS_TINT: Partial<Record<TaskStatus, string>> = { blocked: HUD.card };
+const STATUS_TINT: Partial<Record<TaskStatus, string>> = { blocked: "text-status-blocked" };
 
 /** One card. Subscribes to nothing: the board hands it the task, and identity is preserved upstream. */
 const TaskCard = memo(function TaskCard({ task }: { task: TaskInfo }) {
@@ -53,42 +62,40 @@ const TaskCard = memo(function TaskCard({ task }: { task: TaskInfo }) {
 
   return (
     <li
-      style={{
-        border: `1px solid ${blocked ? HUD.card : HUD.line}`,
-        borderRadius: 4,
-        background: "#fff",
-        padding: "5px 7px",
-        marginBottom: 4,
-      }}
+      className={cn(
+        "rounded-[3px] border bg-panel-raised/60 px-1.5 py-1",
+        blocked ? "border-status-blocked/60" : "border-line",
+      )}
     >
-      <div style={{ marginBottom: 2 }} title={task.detail === "" ? undefined : task.detail}>
+      <div className="truncate text-xs text-fg" title={task.detail === "" ? task.title : task.detail}>
         {task.title}
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 12 }}>
+      <div className="mt-0.5 flex flex-wrap items-center gap-1 text-2xs">
         {room === undefined ? (
           // Not a failure and not a placeholder: an unrouted task is the intended state of a task
-          // nobody has assigned yet. See the note under the form.
-          <span style={{ color: HUD.dim, fontStyle: "italic" }}>unassigned</span>
+          // nobody has assigned yet. See the note in the new-task popover.
+          <span className="italic text-fg-faint">unassigned</span>
         ) : (
           <button
             onClick={() => selectRoom(room.id)}
             title={`Show the ${room.name} room on the floor`}
-            style={{ font: "inherit", fontSize: 12, padding: "1px 5px", cursor: "pointer" }}
+            className="rounded-[2px] text-accent underline underline-offset-2 hover:text-accent/80"
           >
             {room.name}
           </button>
         )}
         {task.agentId !== null && (
-          <code style={{ color: HUD.dim }} title={task.agentId}>
+          <code className="font-mono text-fg-faint" title={task.agentId}>
             {task.agentId.slice(0, 8)}
           </code>
         )}
         {blocked && (
           <span
-            style={{ color: HUD.card }}
+            className="inline-flex items-center gap-0.5 text-status-blocked"
             title={`Waiting on bus message ${task.blockedOnMessageId}`}
           >
-            ⚑ waiting on another room
+            <FlagIcon className="size-2.5" />
+            waiting on another room
           </span>
         )}
       </div>
@@ -99,26 +106,22 @@ const TaskCard = memo(function TaskCard({ task }: { task: TaskInfo }) {
 /** One status group, always drawn: an empty "Blocked" column is worth seeing. */
 function StatusGroup({ status, tasks }: { status: TaskStatus; tasks: TaskInfo[] }) {
   // Narrow on purpose: five groups have to fit the strip between the side panels before the row
-  // starts scrolling, and a card's title wraps happily.
+  // starts scrolling, and a card's title truncates rather than wraps.
   return (
-    <section style={{ flex: "1 1 120px", minWidth: 120 }}>
+    <section className="min-w-[130px] flex-1">
       <h3
-        style={{
-          font: "inherit",
-          fontWeight: 700,
-          fontSize: 12,
-          margin: "0 0 4px",
-          color: STATUS_TINT[status] ?? HUD.dim,
-          textTransform: "uppercase",
-          letterSpacing: 0.4,
-        }}
+        className={cn(
+          "mb-1 flex items-center gap-1 text-2xs font-semibold uppercase tracking-[0.08em]",
+          STATUS_TINT[status] ?? "text-fg-faint",
+        )}
       >
-        {STATUS_LABEL[status]} <span style={{ color: HUD.dim, fontWeight: 400 }}>{tasks.length}</span>
+        {STATUS_LABEL[status]}
+        <span className="font-normal tabular-nums text-fg-faint">{tasks.length}</span>
       </h3>
       {tasks.length === 0 ? (
-        <div style={{ color: HUD.line, fontSize: 12 }}>—</div>
+        <div className="text-2xs text-fg-faint/60">—</div>
       ) : (
-        <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+        <ul className="space-y-1">
           {tasks.map((t) => (
             <TaskCard key={t.id} task={t} />
           ))}
@@ -129,16 +132,22 @@ function StatusGroup({ status, tasks }: { status: TaskStatus; tasks: TaskInfo[] 
 }
 
 /**
- * The new-task form. **Leaving the room empty is the intended path**, not a shortcut: an unrouted
- * task is one the orchestrator will route (M3b), and until that exists it sits in the board's
- * unassigned cards saying so. Nothing here guesses a room — a fake routing would be a board that
- * lies about who owns the work.
+ * The new-task form, in a popover off the board's header.
+ *
+ * **Leaving the room empty is the intended path**, not a shortcut: an unrouted task is one the
+ * orchestrator will route (M3b), and until that exists it sits in the board's unassigned cards
+ * saying so. Nothing here guesses a room — a fake routing would be a board that lies about who owns
+ * the work. The Radix select needs a real sentinel for "no room" because it reserves the empty
+ * string; the wire still just leaves the field out.
  */
+const NO_ROOM = "__none__";
+
 function NewTask({ connected }: { connected: boolean }) {
   const rooms = useFabric((s) => s.rooms);
+  const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [detail, setDetail] = useState("");
-  const [roomId, setRoomId] = useState("");
+  const [roomId, setRoomId] = useState(NO_ROOM);
 
   function submit(e: React.FormEvent): void {
     e.preventDefault();
@@ -150,45 +159,60 @@ function NewTask({ connected }: { connected: boolean }) {
       ...(detail.trim() === "" ? {} : { detail: detail.trim() }),
       // Omitted, never null: "the orchestrator decides" is the absence of a room, and the protocol
       // says so by leaving the field out.
-      ...(roomId === "" ? {} : { roomId }),
+      ...(roomId === NO_ROOM ? {} : { roomId }),
     });
     setTitle("");
     setDetail("");
+    setOpen(false);
   }
 
   return (
-    <form onSubmit={submit} style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
-      <input
-        name="taskTitle"
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        placeholder="new task…"
-        style={{ flex: "2 1 200px", minWidth: 0, padding: "4px 6px", font: "inherit" }}
-      />
-      <input
-        name="taskDetail"
-        value={detail}
-        onChange={(e) => setDetail(e.target.value)}
-        placeholder="detail (optional)"
-        style={{ flex: "3 1 240px", minWidth: 0, padding: "4px 6px", font: "inherit" }}
-      />
-      <select
-        aria-label="Room"
-        value={roomId}
-        onChange={(e) => setRoomId(e.target.value)}
-        style={{ font: "inherit" }}
-      >
-        <option value="">no room — the orchestrator decides</option>
-        {rooms.map((r) => (
-          <option key={r.id} value={r.id}>
-            {r.name}
-          </option>
-        ))}
-      </select>
-      <button type="submit" disabled={!connected} style={{ font: "inherit" }}>
-        Add
-      </button>
-    </form>
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button size="xs" variant="accent" disabled={!connected} title="Add a task to the board">
+          <PlusIcon />
+          task
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" side="top" className="w-80">
+        <form onSubmit={submit} className="space-y-1.5">
+          <Input
+            name="taskTitle"
+            autoFocus
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="new task…"
+          />
+          <Input
+            name="taskDetail"
+            value={detail}
+            onChange={(e) => setDetail(e.target.value)}
+            placeholder="detail (optional)"
+          />
+          <div className="flex items-center gap-1.5">
+            <Select value={roomId} onValueChange={setRoomId}>
+              <SelectTrigger aria-label="Room" className="flex-1">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NO_ROOM}>no room — the orchestrator decides</SelectItem>
+                {rooms.map((r) => (
+                  <SelectItem key={r.id} value={r.id}>
+                    {r.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button type="submit" variant="accent" disabled={!connected}>
+              Add
+            </Button>
+          </div>
+          <FieldNote>
+            A task with no room stays unassigned — routing arrives with the orchestrator (M3b).
+          </FieldNote>
+        </form>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -197,79 +221,55 @@ export function TaskPanel() {
   const tasks = useTasks();
   const connected = useFabric((s) => s.connected);
   const insets = useHudInsets();
-  // The board measures its own height into the same record it reads the side panels' widths from.
-  const inset = useHudInset<HTMLElement>("bottom");
 
   const groups = tasksByStatus(tasks);
   const unfinished = tasks.filter((t) => t.status !== "done").length;
   const blocked = tasks.filter((t) => t.blockedOnMessageId !== null).length;
 
   return (
-    <aside
-      ref={inset}
-      style={{
-        position: "fixed",
-        // The strip the side panels leave: the same numbers the camera frames into.
-        left: insets.left,
-        right: insets.right,
-        bottom: 0,
-        boxSizing: "border-box",
-        maxHeight: BOARD_MAX_HEIGHT,
-        display: "flex",
-        flexDirection: "column",
-        fontFamily: "system-ui, sans-serif",
-        fontSize: 14,
-        color: HUD.text,
-        background: open ? HUD.panel : "transparent",
-        borderTop: open ? `1px solid ${HUD.line}` : "none",
-        padding: open ? "8px 12px 10px" : 8,
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <button
-          onClick={() => setOpen(!open)}
-          title={open ? "Collapse the task board" : "Open the task board"}
-          style={{ font: "inherit" }}
-        >
-          {open ? "⌄ tasks" : "⌃ tasks"}
-        </button>
-        <span style={{ color: HUD.dim, fontSize: 12 }}>
-          {tasks.length === 0
-            ? "no tasks yet"
-            : `${unfinished} open · ${tasks.length} total${blocked > 0 ? ` · ${blocked} waiting on another room` : ""}`}
-        </span>
-        {open && (
-          <>
-            <span style={{ flex: 1 }} />
-            <NewTask connected={connected} />
-          </>
-        )}
-      </div>
-
-      {open && (
+    <EdgePanel
+      side="bottom"
+      open={open}
+      onOpenChange={setOpen}
+      label="Tasks"
+      icon={<ListChecksIcon />}
+      summary={
+        blocked > 0 ? (
+          <span className="text-status-blocked">
+            {unfinished}·{blocked}⚑
+          </span>
+        ) : (
+          unfinished
+        )
+      }
+      summaryTitle={`Open the task board — ${unfinished} unfinished${blocked > 0 ? `, ${blocked} waiting on another room` : ""}`}
+      headerExtra={
         <>
-          <div style={{ color: HUD.dim, fontSize: 12, margin: "4px 0 6px" }}>
-            A task with no room stays unassigned — routing arrives with the orchestrator (M3b).
-          </div>
-          {/* Scrolls inside itself, on both axes: five groups do not fit a narrow strip, and a board
-              that pushed the page sideways would move the whole factory with it. */}
-          <div
-            style={{
-              display: "flex",
-              gap: 12,
-              alignItems: "flex-start",
-              flex: 1,
-              minHeight: 0,
-              overflow: "auto",
-            }}
-          >
-            {groups.map((g) => (
-              <StatusGroup key={g.status} status={g.status} tasks={g.tasks} />
-            ))}
-          </div>
+          <span className="text-2xs tabular-nums text-fg-muted">
+            {tasks.length === 0 ? "none yet" : `${unfinished} open · ${tasks.length} total`}
+          </span>
+          {blocked > 0 && (
+            <Badge variant="warn" title={`${blocked} waiting on another room`}>
+              <FlagIcon />
+              {blocked}
+            </Badge>
+          )}
+          <span className="ml-auto">
+            <NewTask connected={connected} />
+          </span>
         </>
-      )}
-    </aside>
+      }
+      // The strip the side panels leave: the same numbers the camera frames into.
+      style={{ left: insets.left, right: insets.right, maxHeight: BOARD_MAX_HEIGHT }}
+    >
+      {/* Scrolls inside itself, on both axes: five groups do not fit a narrow strip, and a board
+          that pushed the page sideways would move the whole factory with it. */}
+      <div className="hud-scroll flex min-h-0 flex-1 items-start gap-3 overflow-auto px-3 pb-2.5">
+        {groups.map((g) => (
+          <StatusGroup key={g.status} status={g.status} tasks={g.tasks} />
+        ))}
+      </div>
+    </EdgePanel>
   );
 }
 
