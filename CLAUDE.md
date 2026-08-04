@@ -36,7 +36,18 @@ and a subscription limit monitor with auto-pause/resume.
   hard-code an id you are not sure of — a wrong one is a 404 mid-turn.
 - **A room is never taken from tool input.** The room an agent speaks for comes from its session
   row, and `busTools` bakes it into the closures — an agent cannot send a bus message *as* another
-  department, whatever it puts in the arguments. A roomless session gets no bus tools at all.
+  department, whatever it puts in the arguments. A roomless session gets no bus tools at all. The
+  same holds for the orchestrator: `isOrchestrator` comes from the session row, so the two
+  orchestrator-only tools are both absent from an ordinary agent's list *and* refused by their own
+  handlers — being unadvertised is not being gated.
+- **Nothing fabricates an assignment.** A task with no room is routed by *asking the orchestrator*
+  and waiting; with no orchestrator it stays unassigned and the board says so. A heuristic here
+  (first room, most idle room, name similarity) would be the server inventing a decision it has no
+  standing to make, and the operator could not tell it from a real one.
+- **A decision is a file; the row is an index over it.** `factory_record_decision` writes
+  `<project>/docs/decisions/NNNN-<slug>.md` *before* it inserts, so a failure leaves a greppable
+  orphan ADR rather than an index entry pointing at nothing. Someone who clones the repository and
+  never runs SuperFabric must still find the reasoning.
 - **The factory's own bus tools are never gated.** `canUseTool` auto-allows tool names belonging
   to this session's own in-process (`type: "sdk"`) MCP servers — for a room, `mcp__factory__*` —
   in every autonomy mode, and still appends a `tool_use` event so the log records the call.
@@ -118,13 +129,11 @@ out in the README so users know what they're installing.
 ## Status
 
 Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folders and the 3D
-floor)**, **M3a (the factory bus, tasks, and packages that ride real messages)** and the structural
-half of **M1b (several projects in one server, settable room folders, attachments — files in, paths
-out)** are complete — see
-`docs/ROADMAP.md` for the acceptance evidence of each. **M1b is now complete**: the HUD is rebuilt
-on Tailwind v4 + Radix (`docs/decisions/0003-ui-library.md`). Next:
-**M3b — the orchestrator and task auto-routing**, the rest of M1 (roles library, onboarding agent)
-and M2 (multi-account and the limit monitor).
+floor)**, **M1b (several projects in one server, settable room folders, attachments, and the HUD
+rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M3a (the factory bus,
+tasks, and packages that ride real messages)** and **M3b (the orchestrator, task auto-routing and
+the Chronicle)** are complete — see `docs/ROADMAP.md` for the acceptance evidence of each. Next:
+the rest of M1 (roles library, onboarding agent) and M2 (multi-account and the limit monitor).
 
 ## Running it
 
@@ -171,7 +180,12 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   listing is filtered by) · `roomManager.ts` (rooms as folders, charters, settable folders)
   · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
   each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
-  `busTools.ts` (the bus as an in-process MCP server, one per session's room) ·
+  `busTools.ts` (the bus as an in-process MCP server, one per session's room — seven tools for a
+  room, nine for the orchestrator) · `orchestrator.ts` (the role prompt, and `ensureOrchestrator`:
+  the only supported way to make one) · `router.ts` (routing as a bus round trip — ask, and move
+  the card only when it answers) · `chronicle.ts` (ADR files in the project's own
+  `docs/decisions/`, plus one FTS5 query spanning decisions **and** the event log; the triggers in
+  `db.ts` keep the index in step, not this class) ·
   `taskStore.ts` (the task board; announces its own changes) ·
   `attachmentStore.ts` (files in, paths out: filename sanitising, MIME→extension, containment
   against whichever root the file is going into, and never overwriting) ·
@@ -187,7 +201,8 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   `attachments.ts` (upload over HTTP, stage the returned paths, and `composeTurn` — the pure
   function that decides what an agent is actually told about a file) ·
   `App.tsx` (the 3D floor plus three HUD edges) · `scene/*` (the floor) · `hud/*` (room panel,
-  console drawer, task board, window-wide paste/drop target, the one `NoticeBar`, and `Panel.tsx`
+  console drawer, task board, the chronicle popover, window-wide paste/drop target, the one
+  `NoticeBar`, and `Panel.tsx`
   — the shared collapsible edge-panel chrome all three edges are built from) ·
   `ui/*` (shadcn components vendored as our own source: button, input, select, popover, badge).
   **Styling is Tailwind v4** (`src/index.css`, `@theme`, no config file). Chrome colours are

@@ -132,7 +132,7 @@ tests.
 
 **Done when**: 2+ accounts run in parallel; limit pause/resume needs no human.
 
-## M3 — Factory bus and the orchestrator
+## M3 — Factory bus and the orchestrator ✅ **complete** (2026-08-04)
 
 **M3a is complete (2026-08-04)** — the bus, tasks, and packages that mean something:
 
@@ -164,16 +164,44 @@ a message sent to a room whose agent was mid-turn stayed `delivered_at = NULL` o
 hard kill, and after the restart the boot flush carried exactly one, the second draining at the
 next boundary. 474 tests green (shared 33, server 247 + 1 skipped live-quota test, web 194).
 
-Still open for M3 (M3b):
+**M3b is complete (2026-08-04)** — the orchestrator, task auto-routing and the Chronicle:
 
-- Orchestrator: dedicated session (Opus) with an overview of all rooms, task
-  distribution, blocker resolution; orchestrator console in the UI, `factory_ask_orchestrator`.
-- **Task auto-routing**: a task from the task panel with no department chosen goes to
-  the orchestrator — it analyzes, assigns room and assignee, and dispatches. Until then such a
-  task is shown as unassigned and nothing pretends otherwise.
-- **Chronicle v1**: `factory_record_decision` + `factory_search_history` tools,
-  ADR files in `docs/decisions/`, FTS5 search over decisions + prompt/event history,
-  chronicle timeline in the UI.
+- [x] **The orchestrator is a session with a role**, not a new runtime: an ordinary session in the
+      project room with `sessions.is_orchestrator` (migration 7), at most one per project, its own
+      system-prompt append and a larger tool surface. `ensure_orchestrator` is idempotent and
+      argument-free — the room, the role prompt and the tools are the server's to decide.
+- [x] `factory_ask_orchestrator(question, task_id?)` for every room, and two orchestrator-only
+      tools (`factory_assign_task`, `factory_list_rooms`) that are **absent** from an ordinary
+      agent's tool set *and* refused by their own handlers.
+- [x] **Task auto-routing** (`router.ts`): a task with no room becomes a bus `request` to the
+      project room describing it and every room's charter; the orchestrator's `factory_assign_task`
+      moves the card and notifies the receiving room. No orchestrator ⇒ no message and no change —
+      nothing fabricates an assignment.
+- [x] **Chronicle v1** (`chronicle.ts`, migration 8): `factory_record_decision` writes an ADR file
+      into the project's own `docs/decisions/` *and* a row indexing it, and `factory_search_history`
+      is one FTS5 query over the decisions **and** what agents actually said. The operator gets the
+      same index over the wire (`search_chronicle`) in a popover off the top strip.
+- [x] **UI**: the orchestrator is marked on the floor (a standard on its figure, headquarters' slate
+      helmet, the word on the building's label, a flag on the room row), created from the project
+      room's detail, and an unassigned card carries a working "route it".
+
+**Acceptance run (live, one operator click)**: a throwaway factory with a `payments` room ("all
+money-handling code lives here") and a `docs` room ("no product code"), one `auto` agent each, plus
+an orchestrator created from the room panel. One task with no room — *"Refunds: charge back a failed
+webhook delivery and document the retry contract"* — routed by pressing "route it" on the board.
+All six observations held: the orchestrator received the routing request as an injected turn nobody
+prompted; it searched the chronicle first (as its charter tells it to), then called
+`mcp__factory__factory_assign_task(task_id, room: "payments")`; the card moved to payments on the
+board; the payments agent was notified as an injected turn and started work; and the orchestrator
+recorded `0001-webhook-retry-behaviour-is-owned-by-payments-docs-publishes.md` — a real ADR on disk
+with context, decision and rejected alternatives — which the HUD's chronicle search then found.
+The factory then kept going on its own: docs and payments asked the orchestrator two rulings through
+`factory_ask_orchestrator`, and five ADRs (0001–0005) were written by two different agents with no
+numbering collision. Tool surface verified against the real CLI: the orchestrator's session is
+offered **nine** `mcp__factory__*` tools, and ADR 0002's ungated rule holds for all of them — with
+the orchestrator switched to `attended`, `factory_search_history` executed with no card while
+`Write` in the same turn raised one. 760 tests green (shared 53, server 463 + 1 skipped live-quota
+test, web 244).
 
 ## M4 — Containerization
 
