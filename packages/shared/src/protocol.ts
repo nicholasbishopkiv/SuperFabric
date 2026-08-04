@@ -163,6 +163,98 @@ export const AccountInfo = z.object({
 });
 export type AccountInfo = z.infer<typeof AccountInfo>;
 
+// ---- M2: limits ----
+
+/**
+ * Where a usage reading came from, and therefore how much it can be trusted.
+ *
+ * - `endpoint` — Anthropic's own `GET /api/oauth/usage`, the same authoritative, cross-device
+ *   numbers Claude Code's `/usage` shows. A percentage from here is a fact.
+ * - `estimate` — counted from the account's local JSONL transcripts. It **cannot see other
+ *   devices**, it does not know when the real window began, and the limits it is measured against
+ *   are not published. A percentage from here is a guess, and every surface that shows one has to
+ *   say so.
+ */
+export const UsageSource = z.enum(["endpoint", "estimate"]);
+export type UsageSource = z.infer<typeof UsageSource>;
+
+/**
+ * One rate-limit window, as a meter.
+ *
+ * `key` is machine-stable and `label` is what a person reads, because the endpoint reports both
+ * fixed windows (`five_hour`, `seven_day`) and per-model ones whose identity is a display name the
+ * API chooses (`weekly_scoped` scoped to "Opus"). A closed enum here would mean a SuperFabric
+ * release is required before a window Anthropic added this morning can be shown at all — the same
+ * argument that makes `ModelId` a free string.
+ */
+export const UsageWindow = z.object({
+  /** Stable id: `five_hour`, `seven_day`, `seven_day_opus`, or e.g. `weekly_scoped:Opus`. */
+  key: z.string().min(1).max(120),
+  /** What the meter is called on screen. */
+  label: z.string().min(1).max(120),
+  /** How full this window is, 0–100. */
+  utilization: z.number().min(0).max(100),
+  /** ISO-8601 instant the window rolls, or null when the source did not say. */
+  resetsAt: z.string().nullable(),
+  /**
+   * One line of "where this number came from", when it is worth saying — the token count behind an
+   * estimate, say. Null for the ordinary case, where the meter speaks for itself.
+   */
+  detail: z.string().max(200).nullable().default(null),
+});
+export type UsageWindow = z.infer<typeof UsageWindow>;
+
+/**
+ * What is known about one account's limits right now.
+ *
+ * **Honesty is the whole design of this type.** `approximate` is not decoration: an estimate shown
+ * as a fact is worse than an honest gap, because the operator would plan around it. `note` carries
+ * the reason in the reader's own words whenever the primary source failed or returned a shape we
+ * only partly recognised — the usage endpoint is undocumented and *will* change, and the failure
+ * mode must be a visible degradation rather than a silent blank meter.
+ */
+export const AccountUsage = z.object({
+  accountId: z.string(),
+  source: UsageSource,
+  /** These numbers are a guess. Every surface showing them must say so. */
+  approximate: z.boolean(),
+  /** The meters, in the order they should be read. Empty means "nothing is known yet". */
+  windows: z.array(UsageWindow),
+  /** Unix **seconds** this reading was taken; null when there has never been one. */
+  readAt: z.number().int().nullable(),
+  /** Why this reading is degraded, verbatim, or null when it is not. */
+  note: z.string().max(500).nullable(),
+  /**
+   * This account is at its limit *now* — either a window reached 100, or a session on it was
+   * answered with a 429 before the poller caught up. The second path is why this is a field rather
+   * than something derived from `windows`: a limit error from a live session is the earliest and
+   * most certain signal there is, and waiting up to three minutes to believe it would be silly.
+   */
+  limited: z.boolean(),
+  /** ISO-8601 instant the limit is expected to lift, or null when nothing said when. */
+  limitedUntil: z.string().nullable(),
+});
+export type AccountUsage = z.infer<typeof AccountUsage>;
+
+/**
+ * The thresholds the scheduler acts on, as percentages of any one window.
+ *
+ * Shared rather than server-only because the UI marks the same lines on its meters: a bar that turns
+ * amber at a different number from the one that actually warns the agents would be a lie drawn to
+ * scale.
+ */
+export const LIMIT_WARN_PERCENT = 80;
+export const LIMIT_PAUSE_PERCENT = 95;
+
+/**
+ * The floor under how often one account's usage may be read, in milliseconds.
+ *
+ * `docs/RESEARCH.md` §2: the endpoint is undocumented and aggressive polling earns a 429 — which
+ * would be a monitor that causes the condition it exists to watch for. Three minutes is what the
+ * research calls safe, and a five-hour window does not move meaningfully faster than that.
+ */
+export const USAGE_POLL_INTERVAL_MS = 180_000;
+
 // ---- rooms ----
 
 /**
@@ -386,6 +478,15 @@ export const ClientMessage = z.discriminatedUnion("kind", [
   // Accounts. Machine-wide rather than project-scoped (see `AccountInfo`), so unlike every other
   // listing here these four take no project and their answer is the same on every floor.
   z.object({ kind: z.literal("list_accounts") }),
+  /**
+   * What each account's limits look like right now. Machine-wide like `list_accounts`, and for the
+   * same reason: a subscription's quota is the operator's, not a factory's.
+   *
+   * A *query* over state the server already holds — it never triggers a read of the usage endpoint,
+   * because a client asking is not a reason to spend a request against a rate-limited API. The
+   * poller owns when that happens; this hands back the newest snapshot it took.
+   */
+  z.object({ kind: z.literal("list_usage") }),
   z.object({
     kind: z.literal("create_account"),
     label: z.string().min(1).max(120),
@@ -537,6 +638,15 @@ export const ServerMessage = z.discriminatedUnion("kind", [
    * every attached socket rather than only to those looking at one factory.
    */
   z.object({ kind: z.literal("accounts"), accounts: z.array(AccountInfo) }),
+  /**
+   * Every account's limit meters. Machine-wide, so like `accounts` it goes to every attached socket
+   * rather than only to those on one floor.
+   *
+   * A separate message from `accounts` on purpose: the account list changes when the operator
+   * configures something, and the meters change on a three-minute poll. Folding the two together
+   * would rebroadcast every account row (and every in-flight login's state) on every tick.
+   */
+  z.object({ kind: z.literal("usage"), usage: z.array(AccountUsage) }),
   z.object({ kind: z.literal("tasks"), tasks: z.array(TaskInfo) }),
   /**
    * The bus's traffic. This is what drives the conveyor animation, so it carries `deliveredAt`:

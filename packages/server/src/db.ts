@@ -156,6 +156,33 @@ const MIGRATIONS: readonly Migration[] = [
     ALTER TABLE rooms ADD COLUMN account_id TEXT;
     CREATE INDEX IF NOT EXISTS sessions_account ON sessions (account_id);
   `,
+  // 10 — M2 the limit monitor. One row per reading, per account, forever: the meters must survive a
+  // restart (a blank meter after a reboot reads as "you have used nothing", which is the wrong
+  // direction to be wrong in) and the history is what makes "we were fine an hour ago" answerable.
+  //
+  // `windows` is JSON rather than a table of its own, and deliberately: the endpoint is
+  // **undocumented** and already reports windows we had never heard of (`weekly_scoped` scoped to a
+  // model, plus a dozen nullable code-named buckets). A normalised schema would need a migration
+  // every time Anthropic adds one, and the adapter exists precisely so that does not happen. The
+  // shape stored here is our own `UsageWindow[]`, which the parser has already made sense of.
+  //
+  // No foreign key to `accounts`, for the same reason nothing else here has one: a reading is a
+  // record of a moment and must outlive the account row it was taken from.
+  `
+    CREATE TABLE IF NOT EXISTS usage_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL,
+      read_at INTEGER NOT NULL,           -- unix seconds
+      source TEXT NOT NULL,               -- endpoint | estimate
+      approximate INTEGER NOT NULL,       -- SQLite has no boolean
+      windows TEXT NOT NULL,              -- JSON UsageWindow[]
+      note TEXT,
+      limited INTEGER NOT NULL DEFAULT 0,
+      limited_until TEXT                  -- ISO-8601, or NULL when nothing said when
+    );
+    -- "the newest reading for this account", which is the only query the UI path makes.
+    CREATE INDEX IF NOT EXISTS usage_snapshots_account ON usage_snapshots (account_id, read_at DESC);
+  `,
 ];
 
 /**

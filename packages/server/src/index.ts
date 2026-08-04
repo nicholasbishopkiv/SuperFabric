@@ -8,6 +8,7 @@ import { registerAttachmentRoutes } from "./attachmentRoutes.js";
 import { Chronicle } from "./chronicle.js";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
+import { LimitMonitor } from "./limitMonitor.js";
 import { FactoryBus } from "./factoryBus.js";
 import { ProjectManager } from "./projectManager.js";
 import { RoomManager } from "./roomManager.js";
@@ -58,28 +59,50 @@ const router = new TaskRouter({
   orchestratorFor: (projectId) => mgr.orchestratorFor(projectId),
   roomAgents: (roomId) => mgr.roomAgents(roomId),
 });
+// The limit monitor needs the accounts and nothing else; the session runner needs to be able to
+// tell it about a 429 without knowing what it is. Declared before `mgr` and populated after, the
+// same one-way-callback shape the bus and the router use.
+let limits!: LimitMonitor;
 mgr = new SessionManager(db, store, new ClaudeCodeExecutor(), rooms, projects, {
   bus, tasks, router, chronicle, accounts,
+  // A rate-limit error from any session marks that account at once, rather than waiting up to three
+  // minutes for the poller to agree. A session on the ambient `~/.claude` has no row to mark.
+  onRateLimited: (sessionId, accountId) => {
+    if (accountId === null) return;
+    limits.markLimited(accountId, `a session was refused with a rate-limit error (${sessionId})`);
+  },
 });
 // The same one-way-callback shape as the bus and the router: the login flow announces itself and the
 // hub turns that into a frame, rather than the two holding each other. `hub` exists before anything
 // can call back — nothing here runs until a socket sends something.
 let hub!: WsHub;
+limits = new LimitMonitor(db, accounts, { onChange: () => hub.announceUsage() });
 const logins = new AccountLoginManager({ accounts, onChange: () => hub.announceAccounts() });
 // So one `AccountInfo` describes the whole account — the row, whether it has credentials, and where
 // its login has got to — rather than the UI joining two lists that can disagree.
 accounts.setLoginStateSource((id) => logins.stateOf(id));
-hub = new WsHub(store, mgr, rooms, projects, { tasks, bus, router, chronicle, accounts, logins });
+hub = new WsHub(store, mgr, rooms, projects, {
+  tasks, bus, router, chronicle, accounts, logins, limits,
+});
 
 // `.credentials.json` appearing is how the server learns a login finished — and it works whether the
 // login was driven from the UI or by the operator running `claude auth login` in their own terminal,
 // which is the whole reason it is a filesystem watch rather than something the login flow reports.
-const credentials = new CredentialsWatcher(() => hub.announceAccounts());
+const credentials = new CredentialsWatcher(() => {
+  hub.announceAccounts();
+  // An account that has just been logged in can be read for the first time. The monitor's per-account
+  // floor makes this free when it is not due, so it is safe to ask on every file event.
+  void limits.pollAll();
+});
 const watchAccountDirs = (): void => credentials.sync(accounts.list().map((a) => a.configDir));
 // Re-synced on every account change, so a directory added at runtime is watched from the moment it
 // exists and a removed account stops holding a watcher.
 accounts.onChange(watchAccountDirs);
 watchAccountDirs();
+
+// The meters. `start()` reads everything due immediately and then no faster than
+// `USAGE_POLL_INTERVAL_MS` per account — the floor that keeps us welcome at an undocumented endpoint.
+limits.start();
 
 const bootProject = projects.defaultProject();
 // Every project needs its central building, including one that existed before this boot.
@@ -164,6 +187,7 @@ async function shutdown(signal: string): Promise<void> {
   // subprocess and a pipe nobody can reach any more.
   logins.stopAll();
   credentials.close();
+  limits.stop();
 
   console.log("shutdown: closing fastify");
   await app.close();

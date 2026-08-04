@@ -1,0 +1,7 @@
+{
+  "_note": "The shape docs/RESEARCH.md §2 documents: all four named windows populated, and no `limits` array at all. Not what the endpoint returned on 2026-08-04 (see oauth-usage.json) — kept because the adapter must survive the endpoint changing back as readily as changing on, and because a build that only ever parsed one recording would not know it was parsing a shape rather than a file.",
+  "five_hour": { "utilization": 12.5, "resets_at": "2026-08-04T09:00:00+00:00" },
+  "seven_day": { "utilization": 61, "resets_at": "2026-08-09T09:00:00+00:00" },
+  "seven_day_opus": { "utilization": 96, "resets_at": "2026-08-09T09:00:00+00:00" },
+  "seven_day_sonnet": { "utilization": 4, "resets_at": "2026-08-09T09:00:00+00:00" }
+}

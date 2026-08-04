@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
-  ACCOUNT_CREDENTIALS_FILE, AGENT_MODELS, ATTACHMENTS_DIRNAME, AccountInfo,
+  ACCOUNT_CREDENTIALS_FILE, AGENT_MODELS, ATTACHMENTS_DIRNAME, AccountInfo, AccountUsage,
   AttachmentUploadResult, AutonomyMode,
   CHRONICLE_SEARCH_LIMIT, ChronicleHit, ClientMessage,
-  DEFAULT_AUTONOMY, MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
+  DEFAULT_AUTONOMY, LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT,
+  MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
   ProjectInfo, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
+  USAGE_POLL_INTERVAL_MS, UsageWindow,
 } from "../src/protocol.js";
 
 /** Every field `SessionInfo` requires, so a case can vary exactly the one it is about. */
@@ -552,6 +554,61 @@ describe("protocol", () => {
         .toMatchObject({ sessions: [{ accountId: null }] });
       expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...SESSION_INFO, accountId: "a1" }] }))
         .toMatchObject({ sessions: [{ accountId: "a1" }] });
+    });
+  });
+  describe("limits", () => {
+    const WINDOW = {
+      key: "five_hour", label: "5-hour", utilization: 43,
+      resetsAt: "2026-08-04T04:10:00.849724+00:00",
+    };
+    const USAGE = {
+      accountId: "a1", source: "endpoint", approximate: false, windows: [WINDOW],
+      readAt: 1_754_269_200, note: null, limited: false, limitedUntil: null,
+    };
+
+    it("takes a window whose key this build has never heard of", () => {
+      // The endpoint is undocumented and already invents keys (`weekly_scoped:Opus`,
+      // `seven_day_cowork`). A closed enum here would mean a release is needed before a window
+      // Anthropic added this morning can be shown at all.
+      expect(UsageWindow.parse({ ...WINDOW, key: "fortnightly_gerbil", label: "Fortnightly Gerbil" }).key)
+        .toBe("fortnightly_gerbil");
+    });
+
+    it("refuses a utilization outside 0–100 and allows a window with no reset time", () => {
+      expect(() => UsageWindow.parse({ ...WINDOW, utilization: 140 })).toThrow();
+      expect(() => UsageWindow.parse({ ...WINDOW, utilization: -1 })).toThrow();
+      expect(UsageWindow.parse({ ...WINDOW, resetsAt: null }).resetsAt).toBeNull();
+    });
+
+    it("defaults a window's detail to null, so an older sender still parses", () => {
+      expect(UsageWindow.parse(WINDOW).detail).toBeNull();
+    });
+
+    it("carries `approximate` as a required fact, not an optional flourish", () => {
+      // An estimate shown as a measurement is the failure this field exists to prevent, so it may
+      // never be omitted and default to "trustworthy".
+      const { approximate: _omitted, ...withoutIt } = USAGE;
+      expect(() => AccountUsage.parse(withoutIt)).toThrow();
+      expect(AccountUsage.parse({ ...USAGE, source: "estimate", approximate: true }).approximate).toBe(true);
+    });
+
+    it("allows an account that has never been read — null readAt, no windows", () => {
+      const fresh = AccountUsage.parse({ ...USAGE, readAt: null, windows: [] });
+      expect(fresh.readAt).toBeNull();
+      expect(fresh.windows).toEqual([]);
+    });
+
+    it("puts the meters on the wire, and asks for them without naming a project", () => {
+      expect(ServerMessage.parse({ kind: "usage", usage: [USAGE] })).toMatchObject({ kind: "usage" });
+      // Machine-wide, like `list_accounts`: a subscription's quota is the operator's, not a floor's.
+      expect(ClientMessage.parse({ kind: "list_usage" }).kind).toBe("list_usage");
+    });
+
+    it("keeps the thresholds and the poll floor in one place for both sides", () => {
+      expect(LIMIT_WARN_PERCENT).toBeLessThan(LIMIT_PAUSE_PERCENT);
+      expect(LIMIT_PAUSE_PERCENT).toBeLessThan(100);
+      // docs/RESEARCH.md §2: ~180 s is what is safe against an endpoint nobody documented.
+      expect(USAGE_POLL_INTERVAL_MS).toBeGreaterThanOrEqual(180_000);
     });
   });
 });

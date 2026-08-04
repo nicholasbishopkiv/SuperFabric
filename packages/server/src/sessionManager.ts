@@ -6,6 +6,7 @@ import type { Chronicle } from "./chronicle.js";
 import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
+import { classifyExecutorError } from "./executors/claudeCode.js";
 import type { FactoryBus, RoomAgent } from "./factoryBus.js";
 import { ORCHESTRATOR_SYSTEM_PROMPT } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
@@ -84,6 +85,18 @@ export interface SessionManagerOptions {
    * `tasks` are optional.
    */
   accounts?: AccountManager;
+  /**
+   * A session was refused with a rate-limit error.
+   *
+   * The one thing the session runner knows about limits, and it reports it rather than acting on it:
+   * a 429 mid-turn is the earliest, most certain evidence that an account is spent, and the limit
+   * monitor's poller may be minutes behind. A callback rather than the monitor itself, for the same
+   * reason the bus and the router are callbacks — the dependency stays one-way, and a server with no
+   * monitor is a valid (pre-M2) shape rather than a broken one.
+   *
+   * `accountId` is null for a session on the ambient `~/.claude`, which has no row to mark.
+   */
+  onRateLimited?: (sessionId: string, accountId: string | null) => void;
 }
 
 /**
@@ -521,7 +534,15 @@ export class SessionManager {
           this.store.append(id, event);
           // A terminal executor failure must move the session off 'active', otherwise resumeAll()
           // re-spawns a known-broken session on every boot, forever.
-          if (event.type === "session_error") this.stmts.markError.run(id);
+          if (event.type === "session_error") {
+            this.stmts.markError.run(id);
+            // A limit error is not just a failure, it is *evidence about the subscription*. Reported
+            // straight away so the monitor can mark the account and the scheduler can hold everyone
+            // else on it, instead of each agent discovering the same wall one at a time.
+            if (classifyExecutorError(event.message) === "rate_limited") {
+              this.opts.onRateLimited?.(id, accountId);
+            }
+          }
           if (event.type === "session_status") {
             if (event.status === "working") this.turnInFlight.add(id);
             else this.turnInFlight.delete(id);

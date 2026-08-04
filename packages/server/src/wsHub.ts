@@ -1,6 +1,7 @@
 import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@superfabric/shared";
 import type { AccountLoginManager } from "./accountLogin.js";
 import type { AccountManager } from "./accountManager.js";
+import type { LimitMonitor } from "./limitMonitor.js";
 import type { Chronicle } from "./chronicle.js";
 import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
@@ -24,7 +25,7 @@ const SESSION_SHAPE_EVENTS = new Set(["session_status", "approval_request", "app
 const BROADCAST_DEBOUNCE_MS = 250;
 
 /** State the server pushes on its own, as opposed to answering a query. */
-type PushedList = "sessions" | "tasks" | "messages" | "accounts";
+type PushedList = "sessions" | "tasks" | "messages" | "accounts" | "usage";
 
 export interface WsHubOptions {
   /** The task board. Absent => `create_task`/`update_task`/`list_tasks` are refused with an error. */
@@ -50,6 +51,12 @@ export interface WsHubOptions {
   accounts?: AccountManager;
   /** The in-app login flow. Absent => an account can still be created and bound, just not logged in here. */
   logins?: AccountLoginManager;
+  /**
+   * The limit monitor. Absent => `list_usage` is refused with an error rather than answered with an
+   * empty list, for the same reason the chronicle is: "this server reads no limits" and "your
+   * accounts have used nothing" are different facts, and one of them is dangerous to show.
+   */
+  limits?: LimitMonitor;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -78,6 +85,7 @@ export class WsHub {
   private readonly chronicle: Chronicle | undefined;
   private readonly accounts: AccountManager | undefined;
   private readonly logins: AccountLoginManager | undefined;
+  private readonly limits: LimitMonitor | undefined;
 
   constructor(
     private store: EventStore,
@@ -93,6 +101,7 @@ export class WsHub {
     this.chronicle = opts.chronicle;
     this.accounts = opts.accounts;
     this.logins = opts.logins;
+    this.limits = opts.limits;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -103,6 +112,9 @@ export class WsHub {
     // inside starting a session, which is a path that holds no socket — and `resumeAll` on a busy
     // server fires it once per agent, which the coalescing window turns into one frame.
     opts.accounts?.onChange(() => this.scheduleBroadcast("accounts"));
+    // The meters announce themselves too: a poll finishes on a timer that holds no socket, and a
+    // 429 seen mid-turn marks an account from inside the session runner.
+    opts.limits?.onChange(() => this.scheduleBroadcast("usage"));
     store.onAppend((sessionId, seq, event) => {
       const msg: ServerMessage = { kind: "event", sessionId, seq, event };
       for (const [sock, sessions] of this.subs) {
@@ -167,6 +179,7 @@ export class WsHub {
     if (kind === "sessions") this.broadcastSessions();
     else if (kind === "tasks") this.broadcastTasks();
     else if (kind === "accounts") this.broadcastAccounts();
+    else if (kind === "usage") this.broadcastUsage();
     else this.broadcastMessages();
   }
 
@@ -328,6 +341,12 @@ export class WsHub {
         // to those on one floor. See `AccountInfo`.
         case "list_accounts":
           this.safeSend(sock, { kind: "accounts", accounts: this.accountStore().list() });
+          break;
+        // The meters, as the monitor last read them. Deliberately does **not** trigger a read: a
+        // client connecting is not a reason to spend a request against an undocumented, rate-limited
+        // endpoint, and ten tabs opening at once must not become ten requests.
+        case "list_usage":
+          this.safeSend(sock, { kind: "usage", usage: this.limitStore().list() });
           break;
         case "create_account": {
           // The store announces its own change (see the constructor), so the fresh list reaches every
@@ -506,9 +525,29 @@ export class WsHub {
     this.scheduleBroadcast("accounts");
   }
 
+  /**
+   * Public entry point for "the meters changed", on the same coalescing window as every other pushed
+   * list: a poll finishing and a 429 landing in the same second cost one frame, not two.
+   */
+  announceUsage(): void {
+    this.scheduleBroadcast("usage");
+  }
+
   private broadcastAccounts(): void {
     if (this.accounts === undefined) return;
     const msg: ServerMessage = { kind: "accounts", accounts: this.accounts.list() };
+    for (const sock of [...this.subs.keys()]) {
+      if (!this.safeSend(sock, msg)) this.detach(sock);
+    }
+  }
+
+  /**
+   * The meters, to **every** attached socket — the same reasoning as `broadcastAccounts`: an
+   * account's quota is machine-wide, so there is one answer and every tab has it.
+   */
+  private broadcastUsage(): void {
+    if (this.limits === undefined) return;
+    const msg: ServerMessage = { kind: "usage", usage: this.limits.list() };
     for (const sock of [...this.subs.keys()]) {
       if (!this.safeSend(sock, msg)) this.detach(sock);
     }
@@ -621,6 +660,12 @@ export class WsHub {
   private loginStore(): AccountLoginManager {
     if (this.logins === undefined) throw new Error("this server cannot log accounts in");
     return this.logins;
+  }
+
+  /** Likewise for the limit monitor: no meters is an answer, all-zero meters would be a lie. */
+  private limitStore(): LimitMonitor {
+    if (this.limits === undefined) throw new Error("this server does not monitor limits");
+    return this.limits;
   }
 
   /** Likewise for the bus: "no factory bus here" is an answer, an empty list would be a lie. */
