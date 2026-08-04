@@ -121,16 +121,74 @@ JS plus 33 kB of CSS (gzip 355 → 409 kB). 637 tests green (shared 46, server 3
 live-quota test, web 231) — unchanged and untouched, since the web suite is store and pure-logic
 tests.
 
-## M2 — Multi-account and the limit monitor
+## M2 — Multi-account and the limit monitor ✅ **complete** (2026-08-04)
 
-- AccountManager: profiles via `CLAUDE_CONFIG_DIR`; **"Add session" button** opening an
-  embedded terminal (xterm.js ↔ node-pty) where the user logs in; binding rooms/agents
-  to a chosen account at creation time.
-- LimitMonitor: polling the OAuth usage endpoint per account, 5h/weekly/per-model
-  meters in the UI, catching 429s.
-- Scheduler: warn agents at 80%, pause at 95%, auto-resume at `resets_at`.
+- [x] `AccountManager` (`accountManager.ts`): an account is a `CLAUDE_CONFIG_DIR` plus a row
+      (migration 9). **Machine-wide, not per project** — a subscription is the operator's and serves
+      every floor; the per-project choice is the binding. **One directory is one account**, refused
+      by `create` *and* by a UNIQUE column, with the path canonicalised through `realpath` first so
+      `/a/b`, `/a/b/` and a symlink are the one directory they are.
+- [x] Per-session config dirs: `ExecutorStartOptions.configDir`, `sessions.account_id` resolved once
+      at creation (explicit choice, else the room's default) and re-applied on resume;
+      `set_session_account` restarts the executor exactly as `set_model` does, because
+      `Options.env` is fixed for the lifetime of a `query()`. A session with no account uses the
+      ambient `~/.claude`, unchanged.
+- [x] Login, **and it is not the terminal the plan expected**. Probing found `claude auth login`
+      needs no TTY at all: over plain pipes it prints its OAuth URL and reads the code from stdin.
+      So the flow is a link and a text box, not an xterm — no `node-pty`, no `node-gyp`, no new
+      dependency. `CredentialsWatcher` lights an account up when `.credentials.json` appears, which
+      also covers an operator who logs in from their own terminal. Full probe results and the two
+      rejected alternatives: `docs/decisions/0004-account-login-over-a-pipe.md`.
+- [x] Protocol + UI: an account switcher beside the project switcher (a popover, not a fourth edge
+      panel), the room's default account, and which account each agent runs on.
+- [x] `LimitMonitor` (`limitMonitor.ts`) behind an adapter seam (`usageAdapters.ts`). The primary
+      reads `GET https://api.anthropic.com/api/oauth/usage` with that account's bearer from
+      `.credentials.json`, `anthropic-beta: oauth-2025-04-20` and a `claude-code/<version>`
+      User-Agent, **no faster than 180 s per account** — the research's floor, because a monitor
+      that earns a 429 causes the thing it watches for. Readings are persisted
+      (`usage_snapshots`, migration 10) so a restart does not blank the meters, and a 429 from any
+      live session marks that account immediately rather than waiting for the poller.
+- [x] **The endpoint had already moved, and the adapter absorbed it.** Verified live on 2026-08-04:
+      `seven_day_opus`/`seven_day_sonnet` are now *present and null*, and the per-model weekly
+      figures live in a `limits[]` array of `{kind, group, percent, severity, resets_at, scope}`.
+      Both shapes are recorded as fixtures and both parse; a body we only half recognise yields the
+      meters we could read plus a note saying how many fields we could not.
+- [x] Fallback: an estimate counted from the account's own JSONL transcripts, **marked approximate
+      everywhere** — hatched bars, an "estimate" badge, a `≈` on every figure, and a note naming the
+      three things it structurally cannot know. The scheduler will warn on one and will never pause
+      on one.
+- [x] `LimitScheduler` (`scheduler.ts`): warn at 80 % with a short system-style turn to that
+      account's agents, pause at 95 % **at the next turn boundary** (persisted via
+      `sessions.state='paused'` + `paused_at`/`paused_until`, migration 11), resume at `resets_at`
+      through `options.resume` and tell the agent what happened to it. Each threshold fires once per
+      window instance, not per poll.
+- [x] UI: per-account meters in the accounts popover with countdowns and the warn/pause lines drawn
+      from the server's own constants; `paused` as the fifth `FactoryStatus` on the floor, with a
+      countdown on the agent's row.
 
-**Done when**: 2+ accounts run in parallel; limit pause/resume needs no human.
+**Done when**: 2+ accounts run in parallel; limit pause/resume needs no human. ✅
+
+**Acceptance**:
+
+- Two accounts on two throwaway config dirs, a room bound to each, agents inheriting them — asserted
+  from the real executor's recorded `Options` (each `CLAUDE_CONFIG_DIR` its own, `PATH` and `HOME`
+  intact) in `test/accountIsolation.test.ts` and `test/m2Acceptance.test.ts`, and confirmed in a live
+  browser run where the spawned CLI wrote its `.claude.json` and `sessions/` into the bound account's
+  folder rather than into `~/.claude`.
+- **Real meters**: a browser run on throwaway ports with the operator's own `~/.claude` added as an
+  account showed 5-hour 49 %, Weekly 88 % and a per-model weekly window at 100 %, each with its reset
+  countdown — read from the live endpoint. A second account with a deliberately invalid token showed
+  the fallback beside it: hatched bars, `≈34 %`, and the 401 quoted verbatim above the caveat. Two
+  polls were taken 180 s apart, exactly the floor.
+- **The thresholds were forced with a stubbed adapter on a fake clock — no real limit was
+  approached.** 84 % produced one warning turn into the Alpha agent and none into Beta's; 97 % while
+  mid-turn armed the pause and left the turn running; the pause landed on `turn_complete`
+  (`state=paused`, `pausedUntil=2026-08-04T18:00:00Z`); at the reset the agent came back on its own
+  with `resume="alpha-conversation"` on the same `CLAUDE_CONFIG_DIR` and was told it had been paused.
+  Beta stayed `active` throughout — an exhausted subscription's agents wait for its window and are
+  never moved to one with room.
+
+937 tests green (shared 72, server 627 + 1 skipped live-quota test, web 268).
 
 ## M3 — Factory bus and the orchestrator ✅ **complete** (2026-08-04)
 

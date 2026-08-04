@@ -53,6 +53,24 @@ export interface BusToolsDeps {
 const INBOX_RECENT = 10;
 
 /**
+ * How much of one prose field of a decision is stored. Past this the field is **truncated, never
+ * refused** — see `fitDecisionField`.
+ */
+const DECISION_FIELD_CHARS = 8000;
+
+/** Longest stored title, longest stored link, and how many links one decision may carry. */
+const DECISION_TITLE_CHARS = 200;
+const DECISION_LINK_CHARS = 500;
+const DECISION_LINKS = 20;
+
+/**
+ * What a truncated field ends with. It is written into the ADR itself, so the file says of its own
+ * accord that something is missing — a reader who never sees the tool's reply still knows.
+ */
+const TRUNCATION_MARK =
+  "\n\n[truncated by SuperFabric: the rest of this field did not fit. Edit this file to restore it.]";
+
+/**
  * What a tool handler hands back to the SDK: the SDK's `CallToolResult` narrowed to the one content
  * shape we produce. The index signature is part of that type (MCP results are open to extra fields),
  * and `CallToolResult` itself lives in `@modelcontextprotocol/sdk`, which is the agent SDK's
@@ -266,33 +284,67 @@ export function chronicleToolDefinitions(
     "Write down a decision that shapes how this project is built — an interface, a technology, a "
       + "convention, a plan that supersedes another — as an ADR file in the repository's "
       + "docs/decisions/. Record the reasoning, not just the outcome: the next agent reads this to "
-      + "find out WHY before changing it. Search first with factory_search_history.",
+      + "find out WHY before changing it. Search first with factory_search_history. "
+      + "KEEP IT SHORT: a decision, not an essay — a few sentences per field. A very large tool "
+      + "input can fail to send at all, and then nothing is recorded; the ADR is an ordinary file "
+      + "you can edit afterwards to add detail. Nothing here is ever rejected for being too long — "
+      + "an over-long field is stored truncated, with a marker saying so.",
     {
-      title: z.string().min(1).max(200)
+      title: z.string().min(1)
         .describe("One line naming the decision, e.g. 'Retries live in the payments room'."),
-      context: z.string().max(8000)
-        .describe("What made this a question: the constraint, the disagreement, what was true at the time."),
-      decision: z.string().min(1).max(8000)
-        .describe("What was decided, stated so someone can act on it without reading the context."),
-      alternatives: z.string().max(8000).optional()
-        .describe("What else was considered and why it was not chosen. This is what stops it being re-litigated."),
-      links: z.array(z.string().max(500)).max(20).optional()
-        .describe("Files, tasks, messages or URLs this decision rests on."),
+      context: z.string()
+        .describe(
+          "What made this a question: the constraint, the disagreement, what was true at the time. "
+          + "A short paragraph, not a transcript.",
+        ),
+      decision: z.string().min(1)
+        .describe(
+          "What was decided, stated so someone can act on it without reading the context. "
+          + "One or two sentences.",
+        ),
+      alternatives: z.string().optional()
+        .describe(
+          "What else was considered and why it was not chosen. This is what stops it being "
+          + "re-litigated. A line or two each.",
+        ),
+      links: z.array(z.string()).optional()
+        .describe(`Files, tasks, messages or URLs this decision rests on. At most ${DECISION_LINKS}.`),
     },
     (args) => {
+      // Truncate, never refuse. The upstream failure this guards against is the model's own
+      // tool-input serialisation giving out on a large payload, which is not something we can fix
+      // from here; what we *can* stop is our own schema throwing away a decision that did arrive
+      // intact but ran long. A decision that says it was cut short is recoverable — the ADR is a
+      // file, and the agent is told to go and edit it. A rejected one is simply gone.
+      const cuts: string[] = [];
+      const fit = (value: string, limit: number, field: string): string =>
+        fitDecisionField(value, limit, field, cuts);
+
+      const links = (args.links ?? []).slice(0, DECISION_LINKS)
+        .map((l, i) => fit(l, DECISION_LINK_CHARS, `link ${i + 1}`));
+      if ((args.links?.length ?? 0) > DECISION_LINKS) {
+        cuts.push(`links (${args.links!.length} given, first ${DECISION_LINKS} kept)`);
+      }
+
       const record = chronicle.record({
         projectId: projectOf(),
         // The room and the author come from the session that owns this tool set, never from `args`.
         roomId,
         agentId: deps.sessionId ?? null,
-        title: args.title,
-        context: args.context,
-        decision: args.decision,
-        ...(args.alternatives !== undefined ? { alternatives: args.alternatives } : {}),
-        ...(args.links !== undefined ? { links: args.links } : {}),
+        title: fit(args.title, DECISION_TITLE_CHARS, "title"),
+        context: fit(args.context, DECISION_FIELD_CHARS, "context"),
+        decision: fit(args.decision, DECISION_FIELD_CHARS, "decision"),
+        ...(args.alternatives !== undefined
+          ? { alternatives: fit(args.alternatives, DECISION_FIELD_CHARS, "alternatives") }
+          : {}),
+        ...(args.links !== undefined ? { links } : {}),
       });
-      return `Decision recorded as ${record.path}. It is a file in the repository, so it is there `
-        + "for anyone who works on this next, with or without SuperFabric running.";
+      const recorded = `Decision recorded as ${record.path}. It is a file in the repository, so it `
+        + "is there for anyone who works on this next, with or without SuperFabric running.";
+      if (cuts.length === 0) return recorded;
+      return `${recorded} NOTE: this record was too long, so ${cuts.join(", ")} was truncated and `
+        + "marked as such in the file. Nothing was lost that you cannot put back: edit the file "
+        + "directly to restore whatever mattered, and keep the next record shorter.";
     },
   );
 
@@ -413,6 +465,23 @@ export function busTools(deps: BusToolsDeps): McpSdkServerConfigWithInstance {
     // at all, so they must never be deferred behind tool search.
     alwaysLoad: true,
   });
+}
+
+/**
+ * One field of a decision, cut to fit and marked where it was cut.
+ *
+ * The alternative — a `.max()` on the schema — turns "this decision ran long" into "this decision
+ * was never recorded", which is the worst outcome available: the reasoning is lost and only the
+ * agent that wrote it ever knew it existed. Truncating keeps the ADR, the index row and the
+ * greppable file, and the marker plus the tool's reply tell both the agent and the next reader that
+ * something is missing and where to put it back.
+ *
+ * Records what it cut into `cuts`, so one call can report every field it had to shorten.
+ */
+function fitDecisionField(value: string, limit: number, field: string, cuts: string[]): string {
+  if (value.length <= limit) return value;
+  cuts.push(`${field} (${value.length} characters, kept ${limit})`);
+  return value.slice(0, Math.max(0, limit - TRUNCATION_MARK.length)) + TRUNCATION_MARK;
 }
 
 /** A message as one readable line for `factory_inbox`. */

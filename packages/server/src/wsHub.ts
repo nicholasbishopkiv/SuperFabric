@@ -1,4 +1,7 @@
 import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@superfabric/shared";
+import type { AccountLoginManager } from "./accountLogin.js";
+import type { AccountManager } from "./accountManager.js";
+import type { LimitMonitor } from "./limitMonitor.js";
 import type { Chronicle } from "./chronicle.js";
 import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
@@ -22,7 +25,7 @@ const SESSION_SHAPE_EVENTS = new Set(["session_status", "approval_request", "app
 const BROADCAST_DEBOUNCE_MS = 250;
 
 /** State the server pushes on its own, as opposed to answering a query. */
-type PushedList = "sessions" | "tasks" | "messages";
+type PushedList = "sessions" | "tasks" | "messages" | "accounts" | "usage";
 
 export interface WsHubOptions {
   /** The task board. Absent => `create_task`/`update_task`/`list_tasks` are refused with an error. */
@@ -40,6 +43,20 @@ export interface WsHubOptions {
    * different facts, and a surface that showed the second for the first would be lying.
    */
   chronicle?: Chronicle;
+  /**
+   * The accounts on this machine. Absent => the five account messages are refused with an error
+   * rather than answered with an empty list, for the same reason the chronicle is: "this server has
+   * no accounts configured" and "you have no accounts" are different facts.
+   */
+  accounts?: AccountManager;
+  /** The in-app login flow. Absent => an account can still be created and bound, just not logged in here. */
+  logins?: AccountLoginManager;
+  /**
+   * The limit monitor. Absent => `list_usage` is refused with an error rather than answered with an
+   * empty list, for the same reason the chronicle is: "this server reads no limits" and "your
+   * accounts have used nothing" are different facts, and one of them is dangerous to show.
+   */
+  limits?: LimitMonitor;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -66,6 +83,9 @@ export class WsHub {
   private readonly bus: FactoryBus | undefined;
   private readonly router: TaskRouter | undefined;
   private readonly chronicle: Chronicle | undefined;
+  private readonly accounts: AccountManager | undefined;
+  private readonly logins: AccountLoginManager | undefined;
+  private readonly limits: LimitMonitor | undefined;
 
   constructor(
     private store: EventStore,
@@ -79,12 +99,22 @@ export class WsHub {
     this.bus = opts.bus;
     this.router = opts.router;
     this.chronicle = opts.chronicle;
+    this.accounts = opts.accounts;
+    this.logins = opts.logins;
+    this.limits = opts.limits;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
     // `factory_task_update`, and the bus blocking a task on a request, never pass through this hub.
     opts.bus?.onChange(() => this.scheduleBroadcast("messages"));
     opts.tasks?.onChange(() => this.scheduleBroadcast("tasks"));
+    // Accounts announce their own changes for the same reason the board does: `touch()` fires from
+    // inside starting a session, which is a path that holds no socket — and `resumeAll` on a busy
+    // server fires it once per agent, which the coalescing window turns into one frame.
+    opts.accounts?.onChange(() => this.scheduleBroadcast("accounts"));
+    // The meters announce themselves too: a poll finishes on a timer that holds no socket, and a
+    // 429 seen mid-turn marks an account from inside the session runner.
+    opts.limits?.onChange(() => this.scheduleBroadcast("usage"));
     store.onAppend((sessionId, seq, event) => {
       const msg: ServerMessage = { kind: "event", sessionId, seq, event };
       for (const [sock, sessions] of this.subs) {
@@ -148,6 +178,8 @@ export class WsHub {
   private broadcastList(kind: PushedList): void {
     if (kind === "sessions") this.broadcastSessions();
     else if (kind === "tasks") this.broadcastTasks();
+    else if (kind === "accounts") this.broadcastAccounts();
+    else if (kind === "usage") this.broadcastUsage();
     else this.broadcastMessages();
   }
 
@@ -184,6 +216,10 @@ export class WsHub {
           // project is passed so a room from another factory is refused rather than adopted.
           const id = this.mgr.createSession({
             cwd: msg.cwd, roomId: msg.roomId, autonomy: msg.autonomy, model: msg.model,
+            // Omitted => the room's default account, and failing that the ambient `~/.claude`. The
+            // resolution is the session runner's, not this hub's: an agent's account is decided once,
+            // where it is written to the row.
+            accountId: msg.accountId,
             projectId: this.activeProject(sock),
           });
           this.broadcastSessions();
@@ -205,6 +241,15 @@ export class WsHub {
         // of a query(), so the session's executor is restarted and resumed.
         case "set_model":
           void this.mgr.setModel(msg.sessionId, msg.model).then(
+            () => { this.broadcastSessions(); },
+            (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
+          );
+          break;
+        // And the third of the family. Same shape again: `CLAUDE_CONFIG_DIR` lives in `Options.env`,
+        // which is fixed for the lifetime of a `query()`, so the session's executor is restarted and
+        // resumed rather than mutated.
+        case "set_session_account":
+          void this.mgr.setAccount(msg.sessionId, msg.accountId).then(
             () => { this.broadcastSessions(); },
             (err: unknown) => { this.safeSend(sock, { kind: "error", message: String(err) }); },
           );
@@ -270,8 +315,75 @@ export class WsHub {
           });
           break;
         }
+        // The room's default account for *new* agents. Nobody already working there moves — the SDK
+        // owns a live session's environment — so the notice says so rather than leaving the operator
+        // to infer it from an agent that did not change.
+        case "set_room_account": {
+          this.requireRoomOnFloor(sock, msg.roomId);
+          if (msg.accountId !== null) this.accountStore().require(msg.accountId);
+          const room = this.rooms.setAccount(msg.roomId, msg.accountId);
+          this.broadcastRooms();
+          const label = msg.accountId === null
+            ? "the ambient ~/.claude"
+            : this.accountStore().require(msg.accountId).label;
+          this.safeSend(sock, {
+            kind: "notice",
+            message: `new agents in ${room.name} will run on ${label} — agents already working there `
+              + "keep the account they started on",
+          });
+          break;
+        }
         case "list_rooms":
           this.safeSend(sock, { kind: "rooms", rooms: this.rooms.listRooms(this.activeProject(sock)) });
+          break;
+        // Accounts. The one group of messages here that is *not* scoped to a project: a subscription is
+        // the operator's and serves every factory, so the answer goes to every socket rather than only
+        // to those on one floor. See `AccountInfo`.
+        case "list_accounts":
+          this.safeSend(sock, { kind: "accounts", accounts: this.accountStore().list() });
+          break;
+        // The meters, as the monitor last read them. Deliberately does **not** trigger a read: a
+        // client connecting is not a reason to spend a request against an undocumented, rate-limited
+        // endpoint, and ten tabs opening at once must not become ten requests.
+        case "list_usage":
+          this.safeSend(sock, { kind: "usage", usage: this.limitStore().list() });
+          break;
+        case "create_account": {
+          // The store announces its own change (see the constructor), so the fresh list reaches every
+          // tab without this branch having to push it — the same arrangement the board has.
+          const account = this.accountStore().create({ label: msg.label, configDir: msg.configDir });
+          this.safeSend(sock, {
+            kind: "notice",
+            message: `account ${account.label} uses ${account.configDir} — log it in to give it a `
+              + "subscription of its own",
+          });
+          break;
+        }
+        case "remove_account": {
+          const { label, roomsUnbound } = this.accountStore().remove(msg.accountId);
+          // A room's default silently becoming "the operator's own account" is exactly the kind of
+          // change that has to be said out loud.
+          if (roomsUnbound > 0) this.broadcastRooms();
+          this.safeSend(sock, {
+            kind: "notice",
+            message: roomsUnbound === 0
+              ? `account ${label} removed`
+              : `account ${label} removed — ${roomsUnbound} room${roomsUnbound === 1 ? "" : "s"} `
+                + "now default to the ambient ~/.claude",
+          });
+          break;
+        }
+        // The in-app login. Three messages for one conversation: start it, hand over the code the
+        // OAuth page gives you, or give up. Nothing here blocks — the flow reports itself through the
+        // `accounts` broadcast, which is also what makes it visible in a second tab.
+        case "begin_account_login":
+          this.loginStore().begin(msg.accountId);
+          break;
+        case "submit_account_login_code":
+          this.loginStore().submitCode(msg.accountId, msg.code);
+          break;
+        case "cancel_account_login":
+          this.loginStore().cancel(msg.accountId);
           break;
         // Projects. `list_projects` answers the asking socket; the other two change global state (a
         // new project) or per-socket state (which floor this tab is on), and both end with this socket
@@ -397,6 +509,58 @@ export class WsHub {
     this.broadcastPerProject((p) => ({ kind: "tasks", tasks: this.tasks!.list(p) }));
   }
 
+  /**
+   * The account list, to **every** attached socket.
+   *
+   * The one broadcast here that does not go through `broadcastPerProject`, and deliberately: accounts
+   * are machine-wide (see `AccountInfo`), so there is one list and every tab has the same one whatever
+   * factory it is looking at. Building it per project would send identical frames N times and imply a
+   * scoping that does not exist.
+   *
+   * `announceAccounts` is the public entry point, and it goes through the same coalescing window as
+   * every other pushed list: the login flow reports a state change on each chunk the CLI prints, and
+   * a frame per chunk would be a frame per few characters of a URL.
+   */
+  announceAccounts(): void {
+    this.scheduleBroadcast("accounts");
+  }
+
+  /**
+   * Public entry point for "the meters changed", on the same coalescing window as every other pushed
+   * list: a poll finishing and a 429 landing in the same second cost one frame, not two.
+   */
+  /**
+   * Public entry point for "an agent's state changed for a reason that came from outside a socket" —
+   * the scheduler pausing or resuming one. Coalesced like every other pushed list.
+   */
+  announceSessions(): void {
+    this.scheduleBroadcast("sessions");
+  }
+
+  announceUsage(): void {
+    this.scheduleBroadcast("usage");
+  }
+
+  private broadcastAccounts(): void {
+    if (this.accounts === undefined) return;
+    const msg: ServerMessage = { kind: "accounts", accounts: this.accounts.list() };
+    for (const sock of [...this.subs.keys()]) {
+      if (!this.safeSend(sock, msg)) this.detach(sock);
+    }
+  }
+
+  /**
+   * The meters, to **every** attached socket — the same reasoning as `broadcastAccounts`: an
+   * account's quota is machine-wide, so there is one answer and every tab has it.
+   */
+  private broadcastUsage(): void {
+    if (this.limits === undefined) return;
+    const msg: ServerMessage = { kind: "usage", usage: this.limits.list() };
+    for (const sock of [...this.subs.keys()]) {
+      if (!this.safeSend(sock, msg)) this.detach(sock);
+    }
+  }
+
   private broadcastMessages(): void {
     if (this.bus === undefined) return;
     this.broadcastPerProject((p) => ({ kind: "messages", messages: this.bus!.list(p) }));
@@ -488,6 +652,28 @@ export class WsHub {
   private chronicleStore(): Chronicle {
     if (this.chronicle === undefined) throw new Error("this server has no chronicle");
     return this.chronicle;
+  }
+
+  /** Likewise for accounts: a server with none configured says so rather than answering with `[]`. */
+  private accountStore(): AccountManager {
+    if (this.accounts === undefined) throw new Error("this server has no accounts");
+    return this.accounts;
+  }
+
+  /**
+   * Likewise for the login flow. Separate from `accountStore` because they can genuinely differ: a
+   * server can list and bind accounts without being able to log one in here, and "logging in from the
+   * app is not available" is a better answer than a button that does nothing.
+   */
+  private loginStore(): AccountLoginManager {
+    if (this.logins === undefined) throw new Error("this server cannot log accounts in");
+    return this.logins;
+  }
+
+  /** Likewise for the limit monitor: no meters is an answer, all-zero meters would be a lie. */
+  private limitStore(): LimitMonitor {
+    if (this.limits === undefined) throw new Error("this server does not monitor limits");
+    return this.limits;
   }
 
   /** Likewise for the bus: "no factory bus here" is an answer, an empty list would be a lie. */

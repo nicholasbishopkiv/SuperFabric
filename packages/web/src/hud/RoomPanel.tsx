@@ -1,9 +1,10 @@
 import type { AutonomyMode, SessionInfo } from "@superfabric/shared";
 import { RoomName } from "@superfabric/shared";
-import { BotIcon, FlagIcon, FolderIcon, PencilIcon, PlusIcon, WarehouseIcon } from "lucide-react";
+import { BotIcon, CircleUserIcon, FlagIcon, FolderIcon, PencilIcon, PlusIcon, WarehouseIcon } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import type { FactoryStatus } from "../store";
 import {
+  accountLabel,
   agentStatus,
   useFabric,
   useIsSelected,
@@ -17,16 +18,19 @@ import {
   useRoomStatus,
   useRoomTaskCount,
   useSelectedRoomId,
+  useAccounts,
 } from "../store";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { cn } from "../ui/utils";
 import { send } from "../wsClient";
+import { AccountSelect } from "./AccountSelect";
 import { AutonomySelect } from "./AutonomySelect";
 import { ModelSelect } from "./ModelSelect";
 import { EdgePanel, PanelSection } from "./Panel";
 import { StatusDot } from "./StatusDot";
+import { formatCountdown, useTickingNow } from "./UsageMeters";
 
 /**
  * The room panel: the first surface from which a person can actually build a factory.
@@ -170,6 +174,8 @@ function OrchestratorLine({ connected }: { connected: boolean }) {
 /** One agent of the selected room: what it is doing, how much rope it has, and what it runs on. */
 function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolean }) {
   const status = agentStatus(agent);
+  // Only a paused agent with a known return time has anything to count down.
+  const now = useTickingNow(status === "paused" && agent.pausedUntil !== null);
   return (
     // Two rows rather than one: the panel is narrow and an agent carries two controls. Wrapping
     // keeps them both readable instead of squeezing each into a few characters.
@@ -179,6 +185,22 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
         {agent.id.slice(0, 8)}
       </code>
       <span className="text-2xs text-fg-muted">{status}</span>
+      {/* A held agent says *when it comes back*, not merely that it stopped. "Paused" with no
+          horizon reads as broken; a countdown reads as a thing that is being handled. */}
+      {status === "paused" && (
+        <span
+          className="text-2xs text-status-paused"
+          title={
+            agent.pausedUntil === null
+              ? "Held because its account is at its limit. Nothing said when that lifts, so it resumes as soon as a reading says the window has rolled."
+              : new Date(agent.pausedUntil * 1000).toLocaleString()
+          }
+        >
+          {agent.pausedUntil === null
+            ? "waiting for the limit to lift"
+            : `resumes ${formatCountdown(new Date(agent.pausedUntil * 1000), now)}`}
+        </span>
+      )}
       {agent.isOrchestrator && (
         <Badge variant="accent" title="The factory's senior agent: it routes work and records why">
           <FlagIcon />
@@ -206,6 +228,17 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
           disabled={!connected}
           short
           onChange={(model) => send({ kind: "set_model", sessionId: agent.id, model })}
+        />
+        {/* Which subscription this agent is spending. Shown on every agent rather than only on the
+            ones that are bound, because "the operator's own ~/.claude" is a real answer to that
+            question and an agent whose account is invisible is an agent whose cost is invisible.
+            Changing it restarts the executor for the same reason the model does — `Options.env` is
+            fixed for the lifetime of a `query()`. */}
+        <AccountSelect
+          value={agent.accountId}
+          disabled={!connected}
+          short
+          onChange={(accountId) => send({ kind: "set_session_account", sessionId: agent.id, accountId })}
         />
       </span>
     </div>
@@ -307,6 +340,52 @@ function RoomFolder({
   );
 }
 
+/**
+ * The account new agents in this room start on.
+ *
+ * A *default*, and the line underneath says so: an agent resolves its account once, when it is
+ * created, and carries it on its own row from then on. Changing it here cannot move someone already
+ * working, because the SDK bakes the subprocess environment in when the session starts — the same
+ * constraint the room's folder has, and said the same way.
+ */
+function RoomAccount({ roomId, accountId, connected }: {
+  roomId: string;
+  accountId: string | null;
+  connected: boolean;
+}) {
+  const accounts = useAccounts();
+  const running = useRoomAgentCount(roomId);
+  const clearError = useFabric((s) => s.clearError);
+
+  return (
+    <div className="mt-1.5">
+      <div className="flex items-center gap-1.5">
+        <CircleUserIcon className="size-3 shrink-0 text-fg-faint" />
+        <span className="text-2xs text-fg-muted">New agents run on</span>
+        <span className="ml-auto">
+          <AccountSelect
+            value={accountId}
+            disabled={!connected}
+            short
+            onChange={(next) => {
+              clearError();
+              send({ kind: "set_room_account", roomId, accountId: next });
+            }}
+          />
+        </span>
+      </div>
+      {running > 0 && (
+        <FieldNote>
+          {running} agent{running === 1 ? "" : "s"} already here{" "}
+          {running === 1 ? "keeps" : "keep"} the account{" "}
+          {running === 1 ? "it was" : "they were"} started on ({accountLabel(accounts, accountId)} is
+          only the default for new ones) — a live session's environment is the SDK's, not ours.
+        </FieldNote>
+      )}
+    </div>
+  );
+}
+
 /** The selected room in full: where it lives on disk, who works there, and how to add someone. */
 function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolean }) {
   const room = useRoom(roomId);
@@ -342,6 +421,8 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
       ) : (
         <RoomFolder roomId={roomId} path={room.path} connected={connected} />
       )}
+      {/* Every room, including the central building: the orchestrator spends quota like anyone. */}
+      <RoomAccount roomId={roomId} accountId={room.accountId} connected={connected} />
       {/* The charter is where an agent learns it is a department with a bus. A room created here
           gets that section written for it; a folder that already had a CLAUDE.md keeps its own,
           untouched — so for those it is the operator who has to say it. */}

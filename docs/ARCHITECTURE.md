@@ -88,23 +88,51 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   itself describing the task and every room's charter summary; the orchestrator answers with
   `factory_assign_task`, which moves the card and delivers an `info` message to the receiving room.
   With no orchestrator nothing is sent and nothing changes.
-- **LimitMonitor** — per account: polls `GET https://api.anthropic.com/api/oauth/usage`
-  (bearer from that account's `.credentials.json`, `anthropic-beta: oauth-2025-04-20`,
-  claude-code User-Agent, ~180s interval). Reads `five_hour`, `seven_day`,
-  `seven_day_opus/sonnet` → `utilization` + `resets_at`. Also catches 429/limit errors
-  from sessions. **Scheduler policy**: warn agents at 80% (inject system-reminder turn),
-  pause account at 95% (interrupt sessions, persist session_ids, show countdown), resume
-  automatically at `resets_at` via `options.resume`. Endpoint is undocumented → wrap in
-  an adapter with JSONL-estimation fallback (ccusage-style).
-- **AccountManager** — registry of accounts. Each account = a dedicated
-  `CLAUDE_CONFIG_DIR` (one volume/dir per account; never share across accounts, refresh
-  tokens rewrite in place). **Login flow ("Add session" button)**: the UI opens an
-  embedded terminal (xterm.js in the browser ↔ node-pty over the WS) running `claude`
-  against a fresh profile dir; the user completes login exactly as in a normal
-  terminal; the server watches for `.credentials.json` and registers the account.
-  Fallback: `claude setup-token` → long-lived `CLAUDE_CODE_OAUTH_TOKEN`. When creating
-  a room or agent, the user picks which registered account (session pool) it runs
-  under.
+- **LimitMonitor** (`limitMonitor.ts`) + **the usage adapters** (`usageAdapters.ts`) — per account,
+  behind a seam, because **the source is undocumented and has already changed under us**.
+  - *Primary*: `GET https://api.anthropic.com/api/oauth/usage` with that account's bearer from
+    `.credentials.json`, `anthropic-beta: oauth-2025-04-20` and a `claude-code/<version>`
+    User-Agent, **floored at 180 s per account** — a monitor that earns a 429 causes the condition
+    it exists to watch for. Verified live on 2026-08-04: `five_hour` and `seven_day` carry
+    `{utilization, resets_at}`; `seven_day_opus`/`seven_day_sonnet` are *present and null*; the
+    per-model weekly figures now live in `limits[]` as
+    `{kind, group, percent, severity, resets_at, scope: {model: {display_name}}}`, alongside a
+    dozen nullable code-named buckets. `parseUsagePayload` reads both that and the shape
+    `docs/RESEARCH.md` §2 documents, takes windows whose `kind` it has never heard of, and
+    **degrades rather than crashing**: a half-understood body yields the meters it could read plus
+    a note counting the fields it could not. Understanding nothing is the only failure.
+  - *Fallback*: an estimate counted from the account's own JSONL transcripts. Marked
+    `approximate` on the wire and on screen — it cannot see other devices, does not know when the
+    real window began, and is measured against a budget we assumed.
+  - Readings persist to `usage_snapshots` (migration 10), so a restart does not blank the meters —
+    an empty meter reads as a fresh window, which is the wrong direction to be wrong in. A 429 from
+    any live session marks the account immediately (`limitedBy: "rate_limit_error"`) rather than
+    waiting up to three minutes for the poller.
+- **LimitScheduler** (`scheduler.ts`) — utilisation into action. Warn at **80 %** with a short
+  system-style turn to that account's agents; pause at **95 %** at the agent's next
+  `turn_complete` (never mid-turn: the turn's tokens are already spent), persisting
+  `sessions.state='paused'` + `paused_at`/`paused_until` (migration 11) so `resumeAll` does not
+  resurrect a held agent and the countdown survives a restart; resume at `resets_at` through
+  `options.resume`, and tell the agent it was paused. Each threshold fires once per *window
+  instance* (`account|window|resets_at`), not per poll.
+  **Two refusals**: it never pauses on an approximate reading (a guess must not stop an agent that
+  had quota left — a 429 is not a guess and does pause), and it **never moves an agent to another
+  account**. An exhausted subscription's agents wait for its window; rotation is the ToS line
+  (§6, `docs/RESEARCH.md` §5).
+- **AccountManager** (`accountManager.ts`) — registry of accounts, **machine-wide rather than
+  per project**: a subscription is the operator's and serves every floor, so the per-project choice
+  is the *binding* (`rooms.account_id` as a default for new agents, `sessions.account_id` as what an
+  agent actually runs on). Each account = a dedicated `CLAUDE_CONFIG_DIR`; **one directory is one
+  account**, refused by `create` and by a UNIQUE column, with the path canonicalised through
+  `realpath` first (refresh tokens rewrite in place, so two accounts sharing a directory would log
+  each other out days later with nothing in any log to explain it).
+  **Login flow** (`accountLogin.ts`) — *not* the embedded terminal this document originally
+  planned. Probing found `claude auth login` needs no TTY at all: over plain pipes it prints its
+  OAuth URL and reads the code from stdin, so the flow is a link and a text box — no `node-pty`, no
+  xterm.js, no `node-gyp`. `claude setup-token` was rejected: it needs a TTY *and* issues a
+  `user:inference`-only token that would not carry the usage endpoint. `CredentialsWatcher` lights
+  an account up when `.credentials.json` appears, which also covers an operator who logs in from
+  their own shell. See `docs/decisions/0004-account-login-over-a-pipe.md`.
 - **Executor abstraction** — SessionManager talks to agents through an `Executor`
   interface (start/steer/interrupt/resume/events), not to the Agent SDK directly.
   v1 ships `ClaudeCodeExecutor` only; the interface exists from M0 so that post-v1
@@ -173,7 +201,9 @@ Two layers, by explicit product decision — the factory must *look like a facto
   analyzes it, picks the room and assignee, and dispatches it), **chronicle search** (a popover in
   the free top strip, mirroring the project switcher — not a fourth edge panel, because the middle
   of the screen is the product), limit meters (per
-  account: 5h + weekly + per-model, reset timers), approval cards, agent chat drawer,
+  account: 5h + weekly + per-model, reset countdowns; an estimate is hatched and carries a `≈`,
+  a badge and its reason, because a guess shown as a measurement is worse than a gap), approval
+  cards, agent chat drawer,
   orchestrator console. Labels pinned to buildings use drei `<Html>`.
   The **orchestrator is marked on the floor rather than in a widget of its own**: it is an agent in
   the project room, so its figure carries a standard, its helmet is the project block's slate, the
@@ -307,10 +337,15 @@ the board and an `info` message is delivered as a turn in the receiving room →
 main building for that workshop. The card stays visibly unassigned until the orchestrator actually
 answers; routing is a model decision, so nothing pretends it has been made.
 
-**Limit pause/resume**: LimitMonitor sees account B at 96% of 5h window → interrupts B's
-sessions mid-turn-boundary, persists `{session_id, room, pending_inbox}`, UI shows
-"paused until 14:30" → at `resets_at` server re-creates queries with `resume:
-session_id`, injects "you were paused for rate limits, continue" turn.
+**Limit warn/pause/resume**: LimitMonitor reads account B at 84 % → the scheduler injects one
+short turn into every agent on B ("bring what you are doing to a safe stopping point"), once for
+that window instance. At 96 % it *arms* a pause on each of them; an agent mid-turn keeps running and
+the log says so, and the pause lands on its `turn_complete` — `state='paused'`, `paused_until` = the
+window's `resets_at`, executor stopped, the floor's beacon goes to the `paused` slate and the agent's
+row counts down. Agents on account A are untouched: a different subscription is a different quota,
+and nobody is moved. At `resets_at` (or as soon as a reading *taken after the pause* says the window
+rolled) the scheduler restarts exactly those sessions with `options.resume` on the same config dir
+and injects "you were paused… this is the same conversation, carry on".
 
 **Crash recovery**: on boot, server reads `sessions` table, resumes every session marked
 active (`options.resume` + JSONL transcripts persisted in each account's config dir).

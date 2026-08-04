@@ -1,0 +1,89 @@
+{
+  "_recorded": "GET https://api.anthropic.com/api/oauth/usage, 2026-08-04, claude 2.1.220, Max subscription. Verbatim body; nothing in it is a secret.",
+  "five_hour": {
+    "utilization": 43,
+    "resets_at": "2026-08-04T04:10:00.849724+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day": {
+    "utilization": 87,
+    "resets_at": "2026-08-06T20:00:00.849745+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "seven_day_cowork": null,
+  "seven_day_omelette": null,
+  "tangelo": null,
+  "iguana_necktie": null,
+  "omelette_promotional": null,
+  "nimbus_quill": null,
+  "cinder_cove": null,
+  "amber_ladder": null,
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": 0,
+    "used_credits": 0,
+    "utilization": null,
+    "currency": "USD",
+    "decimal_places": 2,
+    "disabled_reason": null,
+    "user_disabled": false,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": true,
+    "daily": null,
+    "weekly": null
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 43,
+      "severity": "normal",
+      "resets_at": "2026-08-04T04:10:00.849724+00:00",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "percent": 87,
+      "severity": "warning",
+      "resets_at": "2026-08-06T20:00:00.849745+00:00",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "weekly_scoped",
+      "group": "weekly",
+      "percent": 100,
+      "severity": "critical",
+      "resets_at": "2026-08-06T20:00:00.849745+00:00",
+      "scope": {
+        "model": { "id": null, "display_name": "Opus" },
+        "surface": null
+      },
+      "is_active": true
+    }
+  ],
+  "spend": {
+    "used": { "amount_minor": 0, "currency": "USD", "exponent": 2 },
+    "limit": { "amount_minor": 0, "currency": "USD", "exponent": 2 },
+    "percent": 0,
+    "severity": "normal",
+    "enabled": true,
+    "disabled_reason": null,
+    "cap": { "money": null, "credits": { "amount_minor": 0, "exponent": 2 } },
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "Usage credits cover you when you hit your plan limits.",
+    "can_purchase_credits": false,
+    "can_toggle": false
+  },
+  "member_dashboard_available": false
+}

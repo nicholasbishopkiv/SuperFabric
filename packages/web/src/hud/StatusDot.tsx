@@ -26,8 +26,9 @@ export function StatusDot({
       className={cn("inline-block size-2 shrink-0 rounded-full", className)}
       style={{
         background: STATUS_COLOR[status],
-        // An idle dot must not read as a light that is on; no halo says "known, quiet".
-        boxShadow: status === "idle" ? "none" : `0 0 7px ${STATUS_COLOR[status]}`,
+        // An idle dot must not read as a light that is on; no halo says "known, quiet". A paused
+        // one keeps a faint halo: it *is* an unusual state, even though it is a calm one.
+        boxShadow: status === "idle" ? "none" : `0 0 ${status === "paused" ? 4 : 7}px ${STATUS_COLOR[status]}`,
       }}
     />
   );

@@ -10,10 +10,22 @@ export interface ExecutorEvents {
 /**
  * Per-session configuration. Anything that varies between agents belongs here rather than on the
  * executor's constructor, so one executor instance can serve every session: the constructor only
- * carries process-wide defaults. (Multi-account `configDir` moves here the same way in M2.)
+ * carries process-wide defaults.
  */
 export interface ExecutorStartOptions {
   cwd: string;
+  /**
+   * This agent's account, as the `CLAUDE_CONFIG_DIR` its provider process should use. Omitted =>
+   * the executor's own default, and failing that the ambient `~/.claude` — which is what every
+   * session ran on before M2 and still does when nothing is bound.
+   *
+   * Per session rather than per executor because that is what "several subscriptions run agents in
+   * parallel" means: one executor instance serves the whole factory, and two agents in it are
+   * routinely on different accounts. Named as a directory rather than as an account id because the
+   * seam is provider-agnostic — a provider that authenticates differently ignores it, and nothing
+   * here has to know what a SuperFabric account row is.
+   */
+  configDir?: string;
   /** Provider-native session id to resume, if any. */
   resumeSessionId?: string | null;
   /** How much this agent is allowed to do unattended. Omitted => the executor's own default. */

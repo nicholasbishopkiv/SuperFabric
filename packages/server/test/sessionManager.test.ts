@@ -1147,4 +1147,147 @@ describe("SessionManager", () => {
       });
     });
   });
+
+  // ---- a prompt racing a session restart ----
+  //
+  // `setAutonomy`/`setModel` tear the executor down and await it before starting the replacement.
+  // For that window the session has no handle, and an instruction arriving then used to be refused
+  // with "no live session" — an error that reads as "your agent is dead" and loses the instruction
+  // either way. The rule these cases pin down: a prompt sent during a restart is either delivered
+  // or refused, and never neither.
+
+  describe("a prompt during a restart", () => {
+    /** An executor whose stop() blocks until the test lets it finish. */
+    class SlowStopExecutor implements Executor {
+      readonly name = "slow-stop";
+      readonly starts: ExecutorStartOptions[] = [];
+      readonly sent: string[] = [];
+      /** Resolves once the manager has actually called stop(), i.e. the restart window is open. */
+      readonly stopCalled: Promise<void>;
+      private openWindow!: () => void;
+      private release: (() => void) | null = null;
+
+      constructor() {
+        this.stopCalled = new Promise<void>((r) => { this.openWindow = r; });
+      }
+
+      /** Let the pending stop() finish, so the replacement executor starts. */
+      finishStop(): void { this.release?.(); }
+
+      start(opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
+        this.starts.push(opts);
+        ev.onEvent({ type: "session_status", status: "idle" });
+        return {
+          providerSessionId: Promise.resolve("claude-session-slow"),
+          send: (text) => { this.sent.push(text); ev.onEvent({ type: "user_prompt", text }); },
+          interrupt: async () => {},
+          stop: () => {
+            this.openWindow();
+            return new Promise<void>((r) => { this.release = r; });
+          },
+        };
+      }
+    }
+
+    const setup = () => {
+      const db = openDb(":memory:");
+      const store = new EventStore(db);
+      const exec = new SlowStopExecutor();
+      return { db, store, exec, mgr: new SessionManager(db, store, exec, ...manager(db)) };
+    };
+
+    const eventsOf = (store: EventStore, id: string) => store.listAfter(id, 0).map((e) => e.event);
+
+    it("holds it and delivers it to the executor the restart brings back", async () => {
+      const { store, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+
+      const toggling = mgr.setAutonomy(id, "bypass");
+      await exec.stopCalled;               // the restart window is open: no handle right now
+
+      // Accepted, not refused — and not yet claimed as said to the agent.
+      expect(() => mgr.prompt(id, "the instruction")).not.toThrow();
+      expect(exec.sent).toEqual([]);
+      expect(eventsOf(store, id).some((e) => e.type === "user_prompt")).toBe(false);
+      expect(eventsOf(store, id).some(
+        (e) => e.type === "session_status" && (e.detail ?? "").includes("prompt held"),
+      )).toBe(true);
+
+      exec.finishStop();
+      await toggling;
+
+      // …and it lands on the new executor, which is the one running the mode that was asked for.
+      expect(exec.sent).toEqual(["the instruction"]);
+      expect(exec.starts).toHaveLength(2);
+      expect(exec.starts[1]!.autonomy).toBe("bypass");
+      expect(eventsOf(store, id).some((e) => e.type === "user_prompt" && e.text === "the instruction"))
+        .toBe(true);
+    });
+
+    it("delivers several held prompts in the order they were sent", async () => {
+      const { exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+
+      const switching = mgr.setModel(id, "claude-haiku-4-5");
+      await exec.stopCalled;
+      mgr.prompt(id, "first");
+      mgr.prompt(id, "second");
+      exec.finishStop();
+      await switching;
+
+      expect(exec.sent).toEqual(["first", "second"]);
+    });
+
+    it("refuses rather than holding an unbounded pile, so a wedged restart cannot swallow work", async () => {
+      const { exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+
+      const toggling = mgr.setAutonomy(id, "bypass");
+      await exec.stopCalled;
+      for (let i = 0; i < 20; i++) mgr.prompt(id, `held ${i}`);
+      // The 21st is refused out loud — WsHub turns the throw into an `error` the UI renders.
+      expect(() => mgr.prompt(id, "one too many")).toThrow(/restarting/);
+
+      exec.finishStop();
+      await toggling;
+      // Everything that was accepted was delivered; the refused one was never claimed.
+      expect(exec.sent).toHaveLength(20);
+      expect(exec.sent).not.toContain("one too many");
+    });
+
+    it("records a held prompt that could not be delivered instead of dropping it", async () => {
+      const { store, exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+
+      const toggling = mgr.setAutonomy(id, "bypass");
+      await exec.stopCalled;
+      mgr.prompt(id, "do the thing");
+      // Shutdown begins mid-restart, so no replacement executor is ever started.
+      const stopping = mgr.stopAll();
+      exec.finishStop();
+      await Promise.all([toggling, stopping]);
+
+      expect(exec.sent).toEqual([]);
+      expect(exec.starts).toHaveLength(1);
+      // The instruction is in the session's own log, with its text, rather than gone in silence.
+      const failure = eventsOf(store, id).find((e) => e.type === "session_error");
+      expect(failure).toBeDefined();
+      expect((failure as { message: string }).message).toContain("do the thing");
+      expect((failure as { message: string }).message).toMatch(/shutting down/);
+      // …and the session is still active, so the next boot brings it back.
+      expect(mgr.listSessions().find((s) => s.id === id)!.state).toBe("active");
+    });
+
+    it("still refuses a prompt for a session that is simply not running", async () => {
+      const { exec, mgr } = setup();
+      const id = mgr.createSession({ cwd: "/tmp" });
+      const stopping = mgr.stopAll();
+      // A stopped session is not a restarting one: nothing is coming back to hand it to, so the
+      // caller has to be told rather than left believing the instruction is on its way.
+      expect(() => mgr.prompt(id, "hi")).toThrow(/no live session/);
+      expect(() => mgr.prompt("nope", "hi")).toThrow(/no live session/);
+      exec.finishStop();
+      await stopping;
+    });
+  });
 });

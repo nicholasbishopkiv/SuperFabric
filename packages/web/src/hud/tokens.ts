@@ -17,6 +17,7 @@ import { BYPASS_COLOR, SELECT_COLOR, STATUS_COLOR } from "../scene/palette";
 export const HUD_TOKENS: Readonly<Record<string, string>> = {
   "--sf-status-idle": STATUS_COLOR.idle,
   "--sf-status-working": STATUS_COLOR.working,
+  "--sf-status-paused": STATUS_COLOR.paused,
   "--sf-status-blocked": STATUS_COLOR.blocked,
   "--sf-status-error": STATUS_COLOR.error,
   /** Selection — the one colour the HUD points with, and the same cyan the floor selects in. */

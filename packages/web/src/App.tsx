@@ -4,9 +4,9 @@ import { ChroniclePanel } from "./hud/ChroniclePanel";
 import { ConsoleDrawer } from "./hud/ConsoleDrawer";
 import { FitButton } from "./hud/FitButton";
 import { NoticeBar } from "./hud/NoticeBar";
-import { ProjectSwitcher } from "./hud/ProjectSwitcher";
 import { RoomPanel } from "./hud/RoomPanel";
 import { TaskPanel } from "./hud/TaskPanel";
+import { TopLeftBar } from "./hud/TopLeftBar";
 import { FactoryScene } from "./scene/FactoryScene";
 import { connect } from "./wsClient";
 
@@ -25,12 +25,13 @@ export default function App() {
     <>
       <FactoryScene />
       {/* Three overlays, three edges: rooms on the left, the one-agent console on the right, the
-          task board along the bottom between them. The top edge carries only the project switcher —
-          which factory this tab is looking at — and is otherwise left clear. */}
+          task board along the bottom between them. The top edge carries only the two switchers —
+          which factory this tab is looking at, and which accounts it can run agents on — and is
+          otherwise left clear. */}
       <RoomPanel />
       <ConsoleDrawer />
       <TaskPanel />
-      <ProjectSwitcher />
+      <TopLeftBar />
       {/* The other end of the free top strip: the chronicle, on the same row as the switcher and
           offset by the console's width. A popover rather than a fourth edge — see `ChroniclePanel`. */}
       <ChroniclePanel />

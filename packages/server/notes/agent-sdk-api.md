@@ -644,6 +644,85 @@ called its biggest risk, so it is written down rather than re-derived.
 
 ---
 
+## How the SDK sources MCP servers (verified by probe, 2026-08-04)
+
+The question this answers: **what MCP servers does a factory agent actually get, and which of them
+can we control?** It was asked because obsidian / figma / computer-control were reported in a factory
+agent's tool list, and the answer decides whether that is a hole we can close from our side.
+
+### The sources, in the CLI the SDK spawns
+
+| Source | Where it lives | Gated by |
+|---|---|---|
+| `Options.mcpServers` | passed by us, in-process (`type: 'sdk'`) or stdio/sse/http | nothing — always applied |
+| user-scope servers | **`~/.claude.json`, top-level `mcpServers`** (this is where `claude mcp add -s user` writes) | `settingSources` excluding `'user'`, *empirically* — see the caveat below |
+| project `.mcp.json` | `<cwd>/.mcp.json` | `settingSources` including `'project'`, **plus** the operator's per-project approval in `~/.claude.json` (`enabledMcpjsonServers` / `disabledMcpjsonServers`, or the `enableAllProjectMcpServers` setting) |
+| plugin servers | `~/.claude/plugins/*` | `settingSources` including `'user'` |
+| claude.ai connectors | the operator's claude.ai account | `settingSources` including `'user'`; also `disableClaudeAiConnectors` in any settings source |
+| `agents` definitions | `Options.agents`, or agent frontmatter on disk | `strictMcpConfig` (for the on-disk ones) |
+
+`Options.strictMcpConfig?: boolean` maps to the CLI's `--strict-mcp-config` and is documented as:
+"Only use MCP servers passed via the `mcpServers` option (and servers declared by explicitly-passed
+agent definitions in `agents`), ignoring all other MCP configurations: project `.mcp.json`, user
+settings, plugins, and on-disk agent frontmatter — including subagent frontmatter MCP."
+
+Related `Settings` keys, for completeness: `enableAllProjectMcpServers`, `enabledMcpjsonServers`,
+`disabledMcpjsonServers`, `disableClaudeAiConnectors`, and the enterprise-tier
+`allowedMcpServers` / `deniedMcpServers` (name / command / URL matchers; denylist wins). The
+enterprise pair is only meaningfully settable by us through `Options.managedSettings`, which is
+filtered restrictive-only and is dropped entirely if the machine already has an admin tier — so it is
+not a lever we can rely on.
+
+### What the probe actually showed
+
+Method: build `busTools` exactly as `SessionManager` does, call `query()` with a prompt iterable that
+yields one `shouldQuery: false` message (appended to the transcript **without** triggering a turn)
+and then never yields again, read the `system`/`init` message's `mcp_servers` and `tools`, and close.
+No prompt is ever sent to a model, so this costs no quota. On this machine the operator has five
+user-scope servers in `~/.claude.json` (`mcp-video`, `figma-free`, `computer-control`,
+`dictate-voice`, `obsidian`), two plugin servers and ~20 claude.ai connectors.
+
+| Options | `mcp_servers` in the init message |
+|---|---|
+| `settingSources` omitted (the CLI default) | all 5 user servers + 2 plugin servers + ~20 claude.ai connectors + `factory` |
+| `settingSources: ['project','local']` | `factory` only |
+| same, `permissionMode: 'bypassPermissions'` | `factory` only |
+| same, plus a `.mcp.json` in the cwd | `factory` + that server, at status **`pending`**, contributing **no tools** |
+| same, plus `strictMcpConfig: true` | `factory` only |
+
+Three things follow, and they are the reason this section exists:
+
+1. **`settingSources: ['project','local']` already keeps the operator's personal servers out.** The
+   reported leak does not reproduce against this SDK (0.3.220) with the options the executor passes.
+   The likeliest explanation for the original observation is that the tool list inspected belonged to
+   the *development* agent working on SuperFabric — which does run with obsidian, figma and
+   computer-control — rather than to a factory agent.
+2. **That exclusion was undocumented, and therefore not something to rely on.** `settingSources` is
+   specified as controlling *filesystem settings files* (`settings.json` and friends), and user-scope
+   MCP servers do not live in one — they live in `~/.claude.json`. The observed behaviour is what the
+   CLI happens to do today. An isolation property must not rest on that, so the executor now sets
+   `strictMcpConfig: true`, which is the documented flag for exactly this.
+3. **A project `.mcp.json` is listed but not usable.** It reaches the init message at status
+   `pending` and offers no tools, because approving a project MCP server is an interactive act
+   recorded in the operator's `~/.claude.json`. So `strictMcpConfig` removes nothing that works
+   today — it removes a name from a list.
+
+### Consequences to remember
+
+- **A room that needs its own MCP server gets it through `Options.mcpServers`**, i.e. SuperFabric
+  decides and can show the operator what it decided. There is no room-level MCP configuration yet;
+  when there is, this is the seam.
+- **Servers we pass are trusted servers.** Anything in `Options.mcpServers` skips the CLI's approval
+  flow. So a future "read the room's `.mcp.json` and pass it through" feature must answer the trust
+  question itself — a cloned repository shipping a hostile `.mcp.json` is exactly what that approval
+  flow exists for.
+- **None of this is a sandbox.** `strictMcpConfig` decides what the *agent* is offered; it does not
+  stop anything else on the machine, and the agent still runs as the operator with the operator's
+  credentials and `~/.claude`. Real isolation is M4: a container per session and one
+  `CLAUDE_CONFIG_DIR` per account.
+
+---
+
 ## Implications for our ClaudeCodeExecutor
 
 Verdicts on the plan draft's five load-bearing assumptions, all against this pinned 0.3.220 API:

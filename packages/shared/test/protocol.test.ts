@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
-  AGENT_MODELS, ATTACHMENTS_DIRNAME, AttachmentUploadResult, AutonomyMode,
+  ACCOUNT_CREDENTIALS_FILE, AGENT_MODELS, ATTACHMENTS_DIRNAME, AccountInfo, AccountUsage,
+  AttachmentUploadResult, AutonomyMode,
   CHRONICLE_SEARCH_LIMIT, ChronicleHit, ClientMessage,
-  DEFAULT_AUTONOMY, MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
+  DEFAULT_AUTONOMY, LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT,
+  MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
   ProjectInfo, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
+  USAGE_POLL_INTERVAL_MS, UsageWindow,
 } from "../src/protocol.js";
 
 /** Every field `SessionInfo` requires, so a case can vary exactly the one it is about. */
@@ -459,6 +462,170 @@ describe("protocol", () => {
     it("fixes the destination folder and the size cap in one place", () => {
       expect(ATTACHMENTS_DIRNAME).toBe("attachments");
       expect(MAX_ATTACHMENT_BYTES).toBe(25 * 1024 * 1024);
+    });
+  });
+
+  describe("accounts", () => {
+    const ACCOUNT = {
+      id: "a1", label: "Work", configDir: "/home/me/.claude-work",
+      credentialsPresent: false, createdAt: 1_800_000_000, lastUsedAt: null,
+      login: { status: "idle", url: null, message: null },
+    } as const;
+
+    it("parses an account, login state and all", () => {
+      expect(AccountInfo.parse(ACCOUNT)).toEqual(ACCOUNT);
+    });
+
+    it("requires a label and a config directory", () => {
+      expect(() => AccountInfo.parse({ ...ACCOUNT, label: "" })).toThrow();
+      expect(() => AccountInfo.parse({ ...ACCOUNT, configDir: "" })).toThrow();
+    });
+
+    it("carries the four states an in-app login can be in, plus idle", () => {
+      for (const status of ["idle", "starting", "awaiting_code", "finishing", "failed"]) {
+        expect(AccountInfo.parse({ ...ACCOUNT, login: { status, url: null, message: null } })
+          .login.status).toBe(status);
+      }
+      expect(() => AccountInfo.parse({ ...ACCOUNT, login: { status: "confused", url: null, message: null } }))
+        .toThrow();
+    });
+
+    it("names the file that means a login finished, once, for both sides", () => {
+      expect(ACCOUNT_CREDENTIALS_FILE).toBe(".credentials.json");
+    });
+
+    it("carries the account list as its own server message", () => {
+      const m = ServerMessage.parse({ kind: "accounts", accounts: [ACCOUNT] });
+      expect(m.kind === "accounts" && m.accounts[0]!.label).toBe("Work");
+      expect(ServerMessage.parse({ kind: "accounts", accounts: [] })).toEqual({ kind: "accounts", accounts: [] });
+    });
+
+    it("parses the five account client messages", () => {
+      expect(ClientMessage.parse({ kind: "list_accounts" }).kind).toBe("list_accounts");
+      expect(ClientMessage.parse({ kind: "create_account", label: "Work", configDir: "/c" }).kind)
+        .toBe("create_account");
+      expect(ClientMessage.parse({ kind: "remove_account", accountId: "a1" }).kind).toBe("remove_account");
+      expect(ClientMessage.parse({ kind: "begin_account_login", accountId: "a1" }).kind)
+        .toBe("begin_account_login");
+      expect(ClientMessage.parse({ kind: "submit_account_login_code", accountId: "a1", code: "x" }).kind)
+        .toBe("submit_account_login_code");
+      expect(ClientMessage.parse({ kind: "cancel_account_login", accountId: "a1" }).kind)
+        .toBe("cancel_account_login");
+    });
+
+    it("refuses an account with no label or no directory on the wire too", () => {
+      expect(() => ClientMessage.parse({ kind: "create_account", label: "", configDir: "/c" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "create_account", label: "Work", configDir: "" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "submit_account_login_code", accountId: "a1", code: "" }))
+        .toThrow();
+    });
+
+    it("null is a real value on both bindings: it means the ambient ~/.claude", () => {
+      // Distinguishable from "leave it alone", which is what an omitted field would mean — the two
+      // are different instructions and the wire has to be able to say either.
+      expect(ClientMessage.parse({ kind: "set_room_account", roomId: "r1", accountId: null }))
+        .toEqual({ kind: "set_room_account", roomId: "r1", accountId: null });
+      expect(ClientMessage.parse({ kind: "set_session_account", sessionId: "s1", accountId: null }))
+        .toEqual({ kind: "set_session_account", sessionId: "s1", accountId: null });
+      expect(() => ClientMessage.parse({ kind: "set_room_account", roomId: "r1" })).toThrow();
+      expect(() => ClientMessage.parse({ kind: "set_session_account", sessionId: "s1" })).toThrow();
+    });
+
+    it("an agent may be created on a named account, or on none", () => {
+      expect(ClientMessage.parse({ kind: "create_session", roomId: "r1", accountId: "a1" }))
+        .toMatchObject({ accountId: "a1" });
+      // Omitted is the normal path: the room's default decides.
+      expect(ClientMessage.parse({ kind: "create_session", roomId: "r1" }))
+        .not.toHaveProperty("accountId");
+    });
+
+    it("a room and a session both report which account they are on, defaulting to none", () => {
+      const room = RoomInfo.parse({
+        id: "r1", name: "backend", path: "/p/backend", kind: "room", agentCount: 0,
+      });
+      // A client written before accounts existed sends no field, and the answer is the pre-M2
+      // behaviour rather than a parse failure.
+      expect(room.accountId).toBeNull();
+      expect(RoomInfo.parse({
+        id: "r1", name: "backend", path: "/p/backend", kind: "room", agentCount: 0, accountId: "a1",
+      }).accountId).toBe("a1");
+
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [SESSION_INFO] }))
+        .toMatchObject({ sessions: [{ accountId: null }] });
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [{ ...SESSION_INFO, accountId: "a1" }] }))
+        .toMatchObject({ sessions: [{ accountId: "a1" }] });
+    });
+  });
+  describe("limits", () => {
+    const WINDOW = {
+      key: "five_hour", label: "5-hour", utilization: 43,
+      resetsAt: "2026-08-04T04:10:00.849724+00:00",
+    };
+    const USAGE = {
+      accountId: "a1", source: "endpoint", approximate: false, windows: [WINDOW],
+      readAt: 1_754_269_200, note: null, limited: false, limitedUntil: null,
+    };
+
+    it("takes a window whose key this build has never heard of", () => {
+      // The endpoint is undocumented and already invents keys (`weekly_scoped:Opus`,
+      // `seven_day_cowork`). A closed enum here would mean a release is needed before a window
+      // Anthropic added this morning can be shown at all.
+      expect(UsageWindow.parse({ ...WINDOW, key: "fortnightly_gerbil", label: "Fortnightly Gerbil" }).key)
+        .toBe("fortnightly_gerbil");
+    });
+
+    it("refuses a utilization outside 0–100 and allows a window with no reset time", () => {
+      expect(() => UsageWindow.parse({ ...WINDOW, utilization: 140 })).toThrow();
+      expect(() => UsageWindow.parse({ ...WINDOW, utilization: -1 })).toThrow();
+      expect(UsageWindow.parse({ ...WINDOW, resetsAt: null }).resetsAt).toBeNull();
+    });
+
+    it("defaults a window's detail to null, so an older sender still parses", () => {
+      expect(UsageWindow.parse(WINDOW).detail).toBeNull();
+    });
+
+    it("carries `approximate` as a required fact, not an optional flourish", () => {
+      // An estimate shown as a measurement is the failure this field exists to prevent, so it may
+      // never be omitted and default to "trustworthy".
+      const { approximate: _omitted, ...withoutIt } = USAGE;
+      expect(() => AccountUsage.parse(withoutIt)).toThrow();
+      expect(AccountUsage.parse({ ...USAGE, source: "estimate", approximate: true }).approximate).toBe(true);
+    });
+
+    it("allows an account that has never been read — null readAt, no windows", () => {
+      const fresh = AccountUsage.parse({ ...USAGE, readAt: null, windows: [] });
+      expect(fresh.readAt).toBeNull();
+      expect(fresh.windows).toEqual([]);
+    });
+
+    it("puts the meters on the wire, and asks for them without naming a project", () => {
+      expect(ServerMessage.parse({ kind: "usage", usage: [USAGE] })).toMatchObject({ kind: "usage" });
+      // Machine-wide, like `list_accounts`: a subscription's quota is the operator's, not a floor's.
+      expect(ClientMessage.parse({ kind: "list_usage" }).kind).toBe("list_usage");
+    });
+
+    it("says *how* an account is known to be limited, because the scheduler branches on it", () => {
+      // A reading from the estimate may never cut an agent off; the provider refusing a turn may.
+      expect(AccountUsage.parse(USAGE).limitedBy).toBeNull();
+      expect(AccountUsage.parse({ ...USAGE, limited: true, limitedBy: "rate_limit_error" }).limitedBy)
+        .toBe("rate_limit_error");
+      expect(() => AccountUsage.parse({ ...USAGE, limitedBy: "vibes" })).toThrow();
+    });
+
+    it("carries a paused agent's countdown, and allows a pause with no known end", () => {
+      expect(ServerMessage.parse({ kind: "sessions", sessions: [SESSION_INFO] }))
+        .toMatchObject({ sessions: [{ pausedUntil: null }] });
+      expect(ServerMessage.parse({
+        kind: "sessions",
+        sessions: [{ ...SESSION_INFO, state: "paused", status: "paused", pausedUntil: 1_754_269_200 }],
+      })).toMatchObject({ sessions: [{ pausedUntil: 1_754_269_200 }] });
+    });
+
+    it("keeps the thresholds and the poll floor in one place for both sides", () => {
+      expect(LIMIT_WARN_PERCENT).toBeLessThan(LIMIT_PAUSE_PERCENT);
+      expect(LIMIT_PAUSE_PERCENT).toBeLessThan(100);
+      // docs/RESEARCH.md §2: ~180 s is what is safe against an endpoint nobody documented.
+      expect(USAGE_POLL_INTERVAL_MS).toBeGreaterThanOrEqual(180_000);
     });
   });
 });

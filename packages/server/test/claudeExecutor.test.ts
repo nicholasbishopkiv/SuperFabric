@@ -410,6 +410,37 @@ describe("ClaudeCodeExecutor", () => {
     expect(o.abortController).toBeInstanceOf(AbortController);
   });
 
+  it("a session's own account beats the process-wide config dir, and the env still carries PATH", () => {
+    const fq = makeFakeQuery();
+    // One executor instance serves the whole factory, so the *session's* directory is what decides
+    // which subscription is spent — this is the entire multi-account mechanism.
+    const exec = new ClaudeCodeExecutor({ configDir: "/tmp/server-default", query: fq.fn });
+    exec.start(
+      { cwd: "/repo", configDir: "/tmp/account-alpha" },
+      { onEvent: () => {}, requestApproval: async () => "deny" },
+    );
+    const o = fq.options()!;
+    expect(o.env?.CLAUDE_CONFIG_DIR).toBe("/tmp/account-alpha");
+    expect(o.env?.PATH).toBe(process.env.PATH);
+    expect(o.env?.HOME).toBe(process.env.HOME);
+  });
+
+  it("a session with no account falls back to the process-wide config dir", () => {
+    const fq = makeFakeQuery();
+    const exec = new ClaudeCodeExecutor({ configDir: "/tmp/server-default", query: fq.fn });
+    exec.start({ cwd: "/repo" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+    expect(fq.options()!.env?.CLAUDE_CONFIG_DIR).toBe("/tmp/server-default");
+  });
+
+  it("with neither, the subprocess environment is not overridden at all", () => {
+    const fq = makeFakeQuery();
+    const exec = new ClaudeCodeExecutor({ query: fq.fn });
+    exec.start({ cwd: "/repo" }, { onEvent: () => {}, requestApproval: async () => "deny" });
+    // Not "an env with no CLAUDE_CONFIG_DIR" — no env at all, so the CLI inherits the server's and
+    // uses the ambient ~/.claude, exactly as it did before accounts existed.
+    expect(fq.options()!.env).toBeUndefined();
+  });
+
   it("owns its own configuration instead of inheriting the operator's global setup", () => {
     const fq = makeFakeQuery();
     const exec = new ClaudeCodeExecutor({ query: fq.fn });
@@ -421,6 +452,25 @@ describe("ClaudeCodeExecutor", () => {
     // "user" excluded so the operator's personal hooks/model/permission rules stay out of
     // factory agents; project/local stay because a room's own config lives in its folder.
     expect(o.settingSources).toEqual(["project", "local"]);
+    // An agent's MCP servers are exactly the ones the factory hands it. Not a nice-to-have: the
+    // operator's own servers (obsidian, a browser driver, a desktop-control server) reaching a
+    // factory agent is a hole a sandbox would not close, because the server runs on this side of it.
+    expect(o.strictMcpConfig).toBe(true);
+  });
+
+  it("gives a session its room's MCP servers and nothing the operator happens to run", () => {
+    const fq = makeFakeQuery();
+    const exec = new ClaudeCodeExecutor({ query: fq.fn });
+    const factory = { type: "sdk", name: "factory", instance: {} } as never;
+    exec.start(
+      { cwd: "/repo", mcpServers: { factory } },
+      { onEvent: () => {}, requestApproval: async () => "deny" },
+    );
+    const o = fq.options()!;
+    // The whole set, not a superset: strictMcpConfig is what makes this list exhaustive rather
+    // than "ours plus whatever the CLI found lying around".
+    expect(Object.keys(o.mcpServers ?? {})).toEqual(["factory"]);
+    expect(o.strictMcpConfig).toBe(true);
   });
 
   it("allows a room to opt into an autonomous permission mode", () => {

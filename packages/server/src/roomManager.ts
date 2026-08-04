@@ -78,7 +78,18 @@ interface RoomRow {
   pos_x: number;
   pos_z: number;
   agent_count: number;
+  /** The account new agents here start on; NULL is the ambient `~/.claude`. */
+  account_id: string | null;
 }
+
+/**
+ * The columns a room listing selects, with `r.` qualifiers. One list, used by both statements below,
+ * so a column added for the listing cannot be remembered in one and forgotten in the other.
+ */
+const ROOM_COLUMNS = `
+  r.id AS id, r.project_id AS project_id, r.name AS name, r.path AS path, r.kind AS kind,
+  r.pos_x AS pos_x, r.pos_z AS pos_z, r.account_id AS account_id, COUNT(s.id) AS agent_count
+`;
 
 /** What `createRoom` may be told beyond the name. */
 export interface CreateRoomOptions {
@@ -121,19 +132,18 @@ export class RoomManager {
       countRooms: db.prepare("SELECT COUNT(*) c FROM rooms WHERE project_id = ? AND kind != 'project'"),
       move: db.prepare("UPDATE rooms SET pos_x = ?, pos_z = ? WHERE id = ?"),
       setPath: db.prepare("UPDATE rooms SET path = ? WHERE id = ?"),
+      setAccount: db.prepare("UPDATE rooms SET account_id = ? WHERE id = ?"),
       // One statement for the whole listing: the agent count is a join, not a query per room, and
       // it is the only thing this class ever asks about sessions.
       list: db.prepare(`
-        SELECT r.id AS id, r.project_id AS project_id, r.name AS name, r.path AS path, r.kind AS kind,
-               r.pos_x AS pos_x, r.pos_z AS pos_z, COUNT(s.id) AS agent_count
+        SELECT ${ROOM_COLUMNS}
         FROM rooms r LEFT JOIN sessions s ON s.room_id = r.id
         WHERE r.project_id = ?
         GROUP BY r.id
         ORDER BY (CASE WHEN r.kind = 'project' THEN 0 ELSE 1 END), r.created_at, r.rowid
       `),
       one: db.prepare(`
-        SELECT r.id AS id, r.project_id AS project_id, r.name AS name, r.path AS path, r.kind AS kind,
-               r.pos_x AS pos_x, r.pos_z AS pos_z, COUNT(s.id) AS agent_count
+        SELECT ${ROOM_COLUMNS}
         FROM rooms r LEFT JOIN sessions s ON s.room_id = r.id
         WHERE r.id = ?
         GROUP BY r.id
@@ -202,6 +212,25 @@ export class RoomManager {
     const dir = explicitDir(newPath, room.name);
     this.adoptFolder(dir, room.name);
     this.stmts.setPath.run(dir, roomId);
+    return this.getRoom(roomId)!;
+  }
+
+  /**
+   * Bind this room to an account, or to none (`null` = the ambient `~/.claude`).
+   *
+   * A **default for agents not yet created**, and nothing more: an agent resolves its account once,
+   * at creation, and carries it on its own row from then on. Changing it here therefore never moves
+   * someone who is already working — the SDK bakes `Options.env` in when `query()` is called, so a
+   * live session's `CLAUDE_CONFIG_DIR` cannot be changed at all, and pretending otherwise would mean
+   * the panel and the running process disagreeing about which subscription is being spent.
+   *
+   * The account id is *not* validated here. `WsHub` checks it against `AccountManager` before calling
+   * — this class knows nothing about accounts beyond storing an id, and a second copy of that lookup
+   * is a second place for it to be wrong.
+   */
+  setAccount(roomId: string, accountId: string | null): RoomInfo {
+    const changed = this.stmts.setAccount.run(accountId, roomId).changes;
+    if (changed === 0) throw new Error(`unknown room ${roomId}`);
     return this.getRoom(roomId)!;
   }
 
@@ -320,5 +349,6 @@ function toRoomInfo(row: RoomRow): RoomInfo {
     position: { x: row.pos_x, z: row.pos_z },
     kind: row.kind === "project" ? "project" : "room",
     agentCount: row.agent_count,
+    accountId: row.account_id,
   };
 }

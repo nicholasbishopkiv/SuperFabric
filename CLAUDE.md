@@ -17,7 +17,12 @@ and a subscription limit monitor with auto-pause/resume.
 - The SQLite event log is the source of truth; WebSocket is a lossy tail with
   `afterSeq` replay.
 - Room = folder; without SuperFabric the project remains an ordinary repository.
-- One `CLAUDE_CONFIG_DIR` = one account; never share across accounts.
+- **One `CLAUDE_CONFIG_DIR` = one account; never share across accounts** — and this is now enforced
+  in code rather than only written down. The CLI rewrites its refresh token in place inside that
+  directory, so two accounts sharing one would invalidate each other days later with nothing in any
+  log to explain it. `AccountManager.create` refuses a duplicate, migration 9 puts UNIQUE on
+  `accounts.config_dir` so a future write path cannot lose it, and the path is canonicalised through
+  `realpath` first — the check is about the *directory*, not about the string that was typed.
 - Message delivery to agents is push (inject a turn into the input stream), not polling.
 - No account pooling/rotation to evade limits (hard ToS line) — only monitoring, pause,
   and resume of the user's own accounts.
@@ -34,6 +39,24 @@ and a subscription limit monitor with auto-pause/resume.
   release schedule, not our protocol: the wire takes any non-empty string, `AGENT_MODELS` in
   `packages/shared` is a shortlist for the UI, and a free-text field covers everything else. Never
   hard-code an id you are not sure of — a wrong one is a 404 mid-turn.
+- **An agent's tool servers are the factory's, not the operator's.** The executor sets
+  `strictMcpConfig: true`, so a session's MCP servers are exactly what SuperFabric passes in
+  `Options.mcpServers` — the room's factory bus today. The operator's own `~/.claude.json` servers,
+  their plugins' servers and their claude.ai connectors are all out, by a documented flag rather than
+  as a side effect of `settingSources` (`~/.claude.json` is not a settings *file*, so nothing
+  promised that). Anything we pass is *trusted* — it skips the CLI's approval flow — so a future
+  room-level MCP configuration has to answer the trust question itself. **Known limitation:** this
+  decides what the agent is *offered*; it is not isolation. The session still runs as the operator,
+  with their credentials and their `~/.claude`. The real fix is M4 — a container per session and one
+  `CLAUDE_CONFIG_DIR` per account. See `packages/server/notes/agent-sdk-api.md`, "How the SDK sources
+  MCP servers", for the probe and the measurements.
+- **A restart never eats an instruction.** `set_autonomy`/`set_model` restart a live session's
+  executor, and a `prompt` landing in that window is *held* and delivered the moment the replacement
+  is up — never dropped. The hold is bounded (`MAX_HELD_PROMPTS` in `sessionManager.ts`); past it the
+  call throws and the hub answers with an `error`. If the restart never produces an executor
+  (shutdown, a failed start) each held prompt is appended to the session's log as a `session_error`
+  carrying its text, so the operator sees both that it did not land and what it said. Delivered, or
+  refused out loud — never neither.
 - **A room is never taken from tool input.** The room an agent speaks for comes from its session
   row, and `busTools` bakes it into the closures — an agent cannot send a bus message *as* another
   department, whatever it puts in the arguments. A roomless session gets no bus tools at all. The
@@ -62,6 +85,52 @@ and a subscription limit monitor with auto-pause/resume.
   another factory must never see this one's rooms, board or belts — cross-project leakage is the
   bug to be most afraid of in this area, and the store-level tests exist to catch it. Room *names*
   are unique per project, not per server, so anything resolving a name (`busTools`) must scope it.
+
+- **An account is per session, persisted, and re-applied on resume** — the third member of the
+  `autonomy`/`model` family, and for the same mechanical reason: `CLAUDE_CONFIG_DIR` lives in
+  `Options.env`, which is fixed for the lifetime of a `query()`, so `set_session_account` restarts
+  the executor and resumes rather than mutating. `sessions.account_id` is resolved **once**, when the
+  agent is created (its own choice, else its room's default), so a room's default changing later
+  never silently moves someone already working. NULL means the ambient `~/.claude`, which is what
+  every pre-M2 session ran on and still does.
+- **A limit reading says how much it is worth.** `AccountUsage.approximate` is not decoration: the
+  primary source is Anthropic's own undocumented `GET /api/oauth/usage` (authoritative, cross-device),
+  the fallback counts tokens in this machine's transcripts (blind to other devices, ignorant of when
+  the real window began, measured against a budget we assumed). Every surface that shows an estimate
+  marks it — hatched bar, badge, `≈`, and the reason in words — and **the scheduler will never pause
+  an agent on one.** A 429 is a different thing: `limitedBy: "rate_limit_error"` is the provider
+  refusing a turn, not a meter reading, and it pauses whatever the meters say. An estimate presented
+  as a fact is worse than an honest gap, because the operator would plan around it.
+- **The usage endpoint is undocumented and has already moved under us.** It sits behind
+  `UsageAdapter` for that reason. Verified live on 2026-08-04: `seven_day_opus`/`seven_day_sonnet`
+  are now present-but-*null* and the per-model weekly figures have moved into a `limits[]` array
+  (`kind`/`group`/`percent`/`severity`/`resets_at`/`scope.model.display_name`). `parseUsagePayload`
+  reads both that and the shape `docs/RESEARCH.md` §2 documents, takes windows whose `kind` it has
+  never heard of, and **degrades rather than crashing** — a half-understood body yields the meters it
+  could read plus a note counting the fields it could not. Understanding *nothing* is the only
+  failure, and it is what hands over to the estimate. Polling is floored at 180 s **per account**: a
+  monitor that earns a 429 causes the condition it exists to watch for.
+- **An agent is paused at a turn boundary, never mid-turn**, and is never moved to another account.
+  The boundary is the one the runner already knows (`turn_complete`, where the bus flushes);
+  interrupting a live turn would throw away the tokens it has already spent. The pause is persisted
+  (`sessions.state='paused'` plus `paused_at`/`paused_until`), so `resumeAll` does not resurrect a
+  held agent on the next boot and the countdown survives a restart; the resume goes through
+  `options.resume` and tells the agent what happened to it. **If a subscription is exhausted, its
+  agents wait for its window.** There is no "least-loaded account" anywhere in `scheduler.ts` for
+  anything except the orchestrator's initial placement, and there must never be one — that is the ToS
+  line (`docs/RESEARCH.md` §5).
+- **An executor we have let go of may not write over the record of why we let it go.** Every
+  `startExecutor` closes over a generation number and anything that releases an executor (pause,
+  restart, shutdown) bumps it; events from a superseded incarnation are dropped. Without this the
+  `idle` the SDK emits one line after `result` would overwrite the `paused` a boundary pause had just
+  appended, and the row and the transcript would disagree about the same agent.
+- **Accounts are machine-wide, not per project.** A subscription belongs to the operator, not to a
+  repository: `accounts` is the one listing on the wire with no `project_id`, and its broadcast goes
+  to every socket rather than only to those on one floor. The per-project choice is the *binding* —
+  `rooms.account_id` (a default for new agents) and `sessions.account_id` (what an agent actually
+  runs on). A per-project account table would have meant re-creating and re-logging-in the same
+  account on every floor, which puts two rows on one directory: the invariant above, broken from the
+  other side.
 
 ## Autonomy (per-agent permission mode)
 
@@ -94,6 +163,27 @@ The picker's shortlist is `AGENT_MODELS` in `packages/shared/src/protocol.ts` an
 plain non-empty string, so an id we have never heard of still works. `Query.supportedModels()` (see
 `server/notes/agent-sdk-api.md`) is the authoritative list for the installed CLI and could populate
 this dynamically later.
+
+## Accounts and logging one in
+
+An account is a `CLAUDE_CONFIG_DIR` on disk plus a row. Adding one creates the folder; logging in
+fills it.
+
+**The login is not a terminal, and that is a measurement rather than a preference.** The M2 plan
+expected xterm.js over a PTY and expected `node-pty` to be unusable under Bun. Probing found
+`node-pty` *does* work under Bun (N-API) but ships no Linux prebuild, so it would put `node-gyp`
+back into `pnpm install`; that `script -qec` gives a PTY with no native module anyway; that
+`claude setup-token` needs a TTY and issues an inference-only token the limit monitor could not use;
+and that **`claude auth login` needs no TTY at all** — over plain pipes it prints its OAuth URL as
+plain text and reads the code from stdin. So the flow is two fields: a link to open and a box for
+the code. See `docs/decisions/0004-account-login-over-a-pipe.md` for the transcripts.
+
+`AccountLoginManager` owns that conversation (`SpawnLogin` is the test seam — no test ever runs the
+real CLI). `CredentialsWatcher` watches each config directory and lights an account up when
+`.credentials.json` appears, so an operator who prefers `CLAUDE_CONFIG_DIR=… claude auth login` in
+their own shell is served by the same mechanism; the UI shows that command, quoted and copyable,
+next to the button. `credentialsPresent` is a **hint**, not a proof — on macOS the tokens may go to
+the keychain instead — so a clean exit from the CLI counts as success too.
 
 ## Stack
 
@@ -130,10 +220,11 @@ out in the README so users know what they're installing.
 
 Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folders and the 3D
 floor)**, **M1b (several projects in one server, settable room folders, attachments, and the HUD
-rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M3a (the factory bus,
-tasks, and packages that ride real messages)** and **M3b (the orchestrator, task auto-routing and
-the Chronicle)** are complete — see `docs/ROADMAP.md` for the acceptance evidence of each. Next:
-the rest of M1 (roles library, onboarding agent) and M2 (multi-account and the limit monitor).
+rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M2 (multi-account, the
+in-app login, the limit monitor and the pause/resume scheduler)**, **M3a (the factory bus, tasks, and
+packages that ride real messages)** and **M3b (the orchestrator, task auto-routing and the
+Chronicle)** are complete — see `docs/ROADMAP.md` for the acceptance evidence of each. Next: the rest
+of M1 (roles library, onboarding agent), then M4 (a container per session).
 
 ## Running it
 
@@ -178,6 +269,13 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   · `executor.ts` (provider seam) · `executors/claudeCode.ts` (Agent SDK, streaming input)
   · `executors/fake.ts` (scripted, for tests) · `projectManager.ts` (projects: the scope every
   listing is filtered by) · `roomManager.ts` (rooms as folders, charters, settable folders)
+  · `accountManager.ts` (accounts: one `CLAUDE_CONFIG_DIR` each, machine-wide, duplicate directories
+  refused) · `accountLogin.ts` (`claude auth login` over plain pipes — no PTY, no native module —
+  plus the `.credentials.json` watcher)
+  · `usageAdapters.ts` (the limit-reading seam: the OAuth usage endpoint, and the
+  honestly-approximate JSONL estimate behind it) · `limitMonitor.ts` (per-account polling at the
+  180 s floor, persisted snapshots, and the immediate mark from a 429) · `scheduler.ts` (80 % warn,
+  95 % pause at a turn boundary, resume at `resets_at` — and no rotation, ever)
   · `sessionManager.ts` (sessions, approvals, resume/stopAll, per-session bus tools, flush at
   each turn boundary) · `factoryBus.ts` (durable inter-room messages, push delivery) ·
   `busTools.ts` (the bus as an in-process MCP server, one per session's room — seven tools for a
@@ -201,12 +299,17 @@ Server state lives in `.fabrica/fabrica.db` (override the directory with
   `attachments.ts` (upload over HTTP, stage the returned paths, and `composeTurn` — the pure
   function that decides what an agent is actually told about a file) ·
   `App.tsx` (the 3D floor plus three HUD edges) · `scene/*` (the floor) · `hud/*` (room panel,
-  console drawer, task board, the chronicle popover, window-wide paste/drop target, the one
-  `NoticeBar`, and `Panel.tsx`
+  console drawer, task board, the chronicle popover, the account switcher and its login flow
+  (`TopLeftBar` places it beside the project switcher), the per-account limit meters inside that
+  popover (`UsageMeters.tsx` — hatched bars and a `≈` wherever a figure is a guess),
+  window-wide paste/drop target, the one `NoticeBar`, and `Panel.tsx`
   — the shared collapsible edge-panel chrome all three edges are built from) ·
   `ui/*` (shadcn components vendored as our own source: button, input, select, popover, badge).
   **Styling is Tailwind v4** (`src/index.css`, `@theme`, no config file). Chrome colours are
   declared there and are deliberately neutral; every colour that *means* something —
-  the four statuses, selection, bypass — is generated from `scene/palette.ts` by
+  the five statuses, selection, bypass — is generated from `scene/palette.ts` by
   `hud/tokens.ts` and referenced as a CSS variable, so the HUD and the floor cannot disagree.
-  Never re-type one of those hexes.
+  Never re-type one of those hexes. `paused` is the fifth and is deliberately *quiet* — a cold dark
+  slate read against `idle` by temperature and value, not a fourth alarm colour — but it outranks
+  `working` in a room's beacon, because a half-stopped room is the half nobody would otherwise
+  notice.

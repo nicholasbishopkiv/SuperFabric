@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
+import type { AccountManager } from "./accountManager.js";
 import { FACTORY_MCP_SERVER_NAME, busTools } from "./busTools.js";
 import type { Chronicle } from "./chronicle.js";
 import type { Db } from "./db.js";
 import type { EventStore } from "./eventStore.js";
 import type { Executor, ExecutorHandle } from "./executor.js";
+import { classifyExecutorError } from "./executors/claudeCode.js";
 import type { FactoryBus, RoomAgent } from "./factoryBus.js";
 import { ORCHESTRATOR_SYSTEM_PROMPT } from "./orchestrator.js";
 import type { ProjectManager } from "./projectManager.js";
@@ -12,6 +14,14 @@ import type { RoomManager } from "./roomManager.js";
 import type { TaskRouter } from "./router.js";
 import type { TaskStore } from "./taskStore.js";
 import { AutonomyMode, DEFAULT_AUTONOMY, SessionStatus, type SessionInfo } from "@superfabric/shared";
+
+/**
+ * How many prompts may pile up while one session's executor restarts before further ones are
+ * refused outright. A restart is a subprocess teardown and a resume — a second or two — so a queue
+ * this deep already means something is wrong, and silently accepting more would turn "your
+ * instruction is on its way" into a lie that grows.
+ */
+const MAX_HELD_PROMPTS = 20;
 
 /** A tool call waiting on an operator decision, bound to the session that asked. */
 interface PendingApproval {
@@ -32,6 +42,15 @@ export interface CreateSessionOptions {
   autonomy?: AutonomyMode;
   /** Model id to pin this agent to. Omitted => the executor's default, i.e. the CLI's own. */
   model?: string;
+  /**
+   * Run this agent on a particular account, overriding whatever its room defaults to. Omitted => the
+   * room's account; a roomless session, or a room bound to none, => the ambient `~/.claude`, which is
+   * the pre-M2 behaviour and stays the behaviour of a factory that has configured no accounts.
+   *
+   * Whatever this resolves to is written onto the session's own row, so the room's default changing
+   * later cannot move an agent that is already running.
+   */
+  accountId?: string;
   /**
    * The factory this agent belongs to. With a `roomId` it is implied by the room and only has to be
    * passed to be *checked* — the hub passes the asking socket's active project, so a client that knew
@@ -60,6 +79,57 @@ export interface SessionManagerOptions {
   router?: TaskRouter;
   /** The Chronicle. Absent => no agent gets the decision tools; see `BusToolsDeps.chronicle`. */
   chronicle?: Chronicle;
+  /**
+   * The accounts this server knows about. Absent => every session runs on the ambient `~/.claude`,
+   * which is a valid (pre-M2-shaped) server rather than a broken one — the same reason `bus` and
+   * `tasks` are optional.
+   */
+  accounts?: AccountManager;
+  /**
+   * A session was refused with a rate-limit error.
+   *
+   * The one thing the session runner knows about limits, and it reports it rather than acting on it:
+   * a 429 mid-turn is the earliest, most certain evidence that an account is spent, and the limit
+   * monitor's poller may be minutes behind. A callback rather than the monitor itself, for the same
+   * reason the bus and the router are callbacks — the dependency stays one-way, and a server with no
+   * monitor is a valid (pre-M2) shape rather than a broken one.
+   *
+   * `accountId` is null for a session on the ambient `~/.claude`, which has no row to mark.
+   */
+  onRateLimited?: (sessionId: string, accountId: string | null) => void;
+}
+
+/**
+ * Everything `startExecutor` needs to bring one agent up — the session row, minus its identity.
+ *
+ * An object rather than the eight positional arguments this had grown into. Three of them are
+ * nullable strings, and `createSession`, `resumeAll` and `restartExecutor` all build the same list
+ * independently: one transposed pair there would silently start an agent in the wrong room on the
+ * wrong account, and nothing would fail loudly enough to notice.
+ */
+interface RunSpec {
+  cwd: string;
+  /** Provider-native session id to resume, or null for a fresh conversation. */
+  resume: string | null;
+  autonomy: AutonomyMode;
+  roomId: string | null;
+  model: string | null;
+  /** The account this agent runs on; null is the ambient `~/.claude`. */
+  accountId: string | null;
+  isOrchestrator: boolean;
+}
+
+/** The spec that brings a stored session back exactly as it was. */
+function specOf(row: SessionRow): RunSpec {
+  return {
+    cwd: row.cwd,
+    resume: row.claude_session_id,
+    autonomy: asAutonomy(row.autonomy),
+    roomId: row.room_id,
+    model: row.model,
+    accountId: row.account_id,
+    isOrchestrator: isOrchestratorRow(row),
+  };
 }
 
 export class SessionManager {
@@ -79,6 +149,40 @@ export class SessionManager {
   private turnInFlight = new Set<string>();
   /** Set by stopAll(): no new executor may be started once shutdown has begun. */
   private stopping = false;
+  /**
+   * sessionId -> prompts that arrived while that session's executor was being restarted.
+   *
+   * A restart (`setAutonomy`, `setModel`) tears the old executor down and awaits it before starting
+   * the replacement, and for that window the session has no handle. An instruction landing there
+   * used to be refused with "no live session", which is technically an error but reads to the
+   * operator as the agent having died — and the instruction was gone either way. It is held here
+   * instead and delivered the moment the replacement is up. An entry exists **only** while a restart
+   * is in flight, so `prompt()` can tell "restarting" from "not running" without a second flag.
+   */
+  private heldPrompts = new Map<string, string[]>();
+  /**
+   * sessionId -> a pause armed while that agent had a turn in flight.
+   *
+   * **An agent is never cut off mid-thought.** The bus already refuses to inject a message into a
+   * working agent and drains its queue at `turn_complete`; a pause is the same discipline pointed the
+   * other way, and for a stronger reason — interrupting a turn to save quota would throw away the
+   * tokens that turn already spent. So the pause waits for the boundary the runner already knows how
+   * to find.
+   */
+  private pausePending = new Map<string, { until: number | null; reason: string }>();
+  /**
+   * sessionId -> which executor incarnation is the current one.
+   *
+   * An executor keeps emitting for a moment after we have let go of it — the SDK's `result` message
+   * is immediately followed by an `idle` status, and a pause applied *at* that `result` would then be
+   * overwritten in the log by the `idle` that arrives one line later. The row would say paused and
+   * the transcript would say idle, and the transcript is what the operator reads.
+   *
+   * So every `startExecutor` closes over a generation number, and anything that lets an executor go
+   * (pause, restart, shutdown) bumps it. Events from a superseded incarnation are teardown noise and
+   * are dropped rather than appended.
+   */
+  private generation = new Map<string, number>();
   private readonly stmts;
 
   constructor(
@@ -91,8 +195,8 @@ export class SessionManager {
   ) {
     this.stmts = {
       insertSession: db.prepare(
-        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator)"
-        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (id, project_id, cwd, autonomy, room_id, model, is_orchestrator, account_id)"
+        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       ),
       setProviderSessionId: db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?"),
       activeSessions: db.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE state = 'active'`),
@@ -105,6 +209,23 @@ export class SessionManager {
       ),
       setAutonomy: db.prepare("UPDATE sessions SET autonomy = ? WHERE id = ?"),
       setModel: db.prepare("UPDATE sessions SET model = ? WHERE id = ?"),
+      setAccount: db.prepare("UPDATE sessions SET account_id = ? WHERE id = ?"),
+      // Pausing and coming back. `state` alone would be enough to stop `resumeAll` re-spawning a
+      // paused agent; the two timestamps are what an unattended resume and a countdown are made of.
+      markPaused: db.prepare(
+        "UPDATE sessions SET state = 'paused', paused_at = ?, paused_until = ? WHERE id = ? AND state = 'active'",
+      ),
+      markResumed: db.prepare(
+        "UPDATE sessions SET state = 'active', paused_at = NULL, paused_until = NULL WHERE id = ?",
+      ),
+      pausedSessions: db.prepare(
+        `SELECT ${SESSION_COLUMNS}, paused_at, paused_until FROM sessions WHERE state = 'paused' ORDER BY created_at, rowid`,
+      ),
+      // "Who is running on this subscription?" — the question the scheduler asks about every account
+      // it is about to warn or hold.
+      activeOnAccount: db.prepare(
+        "SELECT id FROM sessions WHERE account_id = ? AND state = 'active' ORDER BY created_at, rowid",
+      ),
       // One statement, one pass: a per-row MAX(seq) query inside a .map() is O(sessions) queries.
       // `status` and `blocked` are derived from the log by correlated subqueries rather than a
       // second round of queries per row, for the same reason — the 3D floor asks for this list on
@@ -127,6 +248,8 @@ export class SessionManager {
     let roomId: string | null = null;
     let cwd = opts.cwd ?? process.cwd();
     let projectId = opts.projectId ?? this.projects.defaultProject().id;
+    /** The room's default account, when the agent is being put in a room that has one. */
+    let roomAccountId: string | null = null;
 
     if (opts.roomId !== undefined) {
       const room = this.rooms.getRoom(opts.roomId);
@@ -140,6 +263,7 @@ export class SessionManager {
       projectId = roomProject;
       roomId = room.id;
       cwd = room.path;
+      roomAccountId = room.accountId;
     }
 
     // `cwd` comes straight off the wire. An unchecked value is persisted forever and makes the
@@ -157,11 +281,34 @@ export class SessionManager {
       throw new Error(`project ${projectId} already has an orchestrator`);
     }
 
+    // The agent's own choice wins over its room's default; with neither, the ambient `~/.claude`. An
+    // explicit id is checked here rather than allowed to become a dangling reference: an agent
+    // silently starting on the operator's own subscription because a typo'd account id fell back to
+    // "none" is the multi-account bug that would be hardest to see.
+    const accountId = opts.accountId ?? roomAccountId;
+    if (accountId !== null && accountId !== undefined) this.requireAccount(accountId);
+
     const id = randomUUID();
     const model = opts.model ?? null;
-    this.stmts.insertSession.run(id, projectId, cwd, autonomy, roomId, model, isOrchestrator ? 1 : 0);
-    this.startExecutor(id, cwd, null, autonomy, roomId, model, isOrchestrator);
+    const spec: RunSpec = {
+      cwd, resume: null, autonomy, roomId, model, accountId: accountId ?? null, isOrchestrator,
+    };
+    this.stmts.insertSession.run(
+      id, projectId, cwd, autonomy, roomId, model, isOrchestrator ? 1 : 0, spec.accountId,
+    );
+    this.startExecutor(id, spec);
     return id;
+  }
+
+  /**
+   * Refuse an account id this server does not have. Only for ids arriving from *outside* — a stored
+   * `account_id` is never re-validated, because a session row outlives the account row it names and a
+   * resumed agent must still come back rather than refusing to boot over a deleted account.
+   */
+  private requireAccount(accountId: string): void {
+    const accounts = this.opts.accounts;
+    if (accounts === undefined) throw new Error("this server has no accounts");
+    accounts.require(accountId);
   }
 
   /**
@@ -203,22 +350,7 @@ export class SessionManager {
       return;
     }
 
-    this.store.append(id, {
-      type: "session_status", status: "starting", detail: `autonomy: ${autonomy}`,
-    });
-    // Order matters: the old executor must be gone before a new one resumes the same provider
-    // session. Pending approvals belong to the turn that is being torn down, so deny them.
-    this.handles.delete(id);
-    // Whatever turn was in flight died with that executor; the replacement starts idle.
-    this.turnInFlight.delete(id);
-    this.denyPendingApprovals(id);
-    // A wedged CLI subprocess must not wedge the toggle; the abort in stop() still fires.
-    await this.stopWithTimeout(handle, 5000).catch(() => {});
-    // Shutdown may have started while we were stopping the old executor. Spawning a replacement
-    // now would leak a CLI subprocess past the server's exit; the stored mode still applies on the
-    // next boot.
-    if (this.stopping) return;
-    this.startExecutor(id, row.cwd, row.claude_session_id, autonomy, row.room_id, row.model, isOrchestratorRow(row));
+    await this.restartExecutor(id, handle, { ...specOf(row), autonomy }, `autonomy: ${autonomy}`);
   }
 
   /**
@@ -247,19 +379,120 @@ export class SessionManager {
       return;
     }
 
-    this.store.append(id, {
-      type: "session_status", status: "starting", detail: `model: ${model ?? "default"}`,
-    });
-    // Order matters exactly as in setAutonomy: the old executor is gone before a new one resumes the
-    // same provider session, and the turn that died with it takes its approvals with it.
+    await this.restartExecutor(id, handle, { ...specOf(row), model }, `model: ${model ?? "default"}`);
+  }
+
+  /**
+   * Move an agent onto another account. `null` hands it back to the ambient `~/.claude`.
+   *
+   * The third member of the `setAutonomy`/`setModel` family, with the same shape for the same reason:
+   * `Options.env` — which is where `CLAUDE_CONFIG_DIR` lives — is fixed when `query()` is called, so
+   * a live session is restarted (resuming from the stored `claude_session_id`, which keeps the
+   * conversation) rather than mutated. There is no in-place alternative here at all: the environment
+   * belongs to a subprocess that is already running.
+   *
+   * The new account is persisted first, so even a failed restart leaves the next boot starting the
+   * agent on the subscription the operator asked for.
+   *
+   * **What this does not do**: move the transcript. Sessions live under `<config dir>/projects/…`, so
+   * an agent resumed against a different account is resuming a `claude_session_id` that account has
+   * never seen. The CLI starts a fresh conversation in that case; the SuperFabric event log — which is
+   * the source of truth the operator reads — is untouched and complete either way. Said out loud in
+   * the UI rather than discovered.
+   */
+  async setAccount(id: string, accountId: string | null): Promise<void> {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    if (accountId !== null) this.requireAccount(accountId);
+    this.stmts.setAccount.run(accountId, id);
+
+    const label = accountId === null ? "the ambient ~/.claude" : this.accountLabel(accountId);
+    const handle = this.handles.get(id);
+    if (handle === undefined) {
+      this.store.append(id, {
+        type: "session_status", status: "idle",
+        detail: `account: ${label} (applies when the session next starts)`,
+      });
+      return;
+    }
+
+    await this.restartExecutor(id, handle, { ...specOf(row), accountId }, `account: ${label}`);
+  }
+
+  /** An account's label for the log, falling back to its id if the row has since gone. */
+  private accountLabel(accountId: string): string {
+    return this.opts.accounts?.get(accountId)?.label ?? accountId;
+  }
+
+  /**
+   * Swap a live session's executor for a new one that resumes the same provider session — the one
+   * mechanism behind `setAutonomy`, `setModel` and `setAccount`, because each changes an `Options`
+   * field that is fixed for the lifetime of a `query()`.
+   *
+   * The ordering is the design: the old executor must be gone before a new one resumes the same
+   * provider session, whatever turn was in flight died with it, and its pending approvals are denied
+   * rather than left to hang. `heldPrompts` opens **before the first await**, so there is no instant
+   * in which a prompt can arrive to a session that is neither live nor known to be restarting.
+   */
+  private async restartExecutor(
+    id: string,
+    handle: ExecutorHandle,
+    spec: RunSpec,
+    detail: string,
+  ): Promise<void> {
+    this.store.append(id, { type: "session_status", status: "starting", detail });
+    this.supersede(id);
     this.handles.delete(id);
     this.turnInFlight.delete(id);
     this.denyPendingApprovals(id);
-    await this.stopWithTimeout(handle, 5000).catch(() => {});
-    if (this.stopping) return;
-    this.startExecutor(
-      id, row.cwd, row.claude_session_id, asAutonomy(row.autonomy), row.room_id, model, isOrchestratorRow(row),
-    );
+    this.heldPrompts.set(id, []);
+
+    let undeliverable = "the restart did not complete";
+    try {
+      // A wedged CLI subprocess must not wedge the toggle; the abort in stop() still fires.
+      await this.stopWithTimeout(handle, 5000).catch(() => {});
+      // Shutdown may have started while we were stopping the old executor. Spawning a replacement
+      // now would leak a CLI subprocess past the server's exit; the stored value still applies on
+      // the next boot.
+      if (this.stopping) {
+        undeliverable = "the server is shutting down";
+        return;
+      }
+      this.startExecutor(id, spec);
+    } catch (err) {
+      undeliverable = `the restart failed: ${String(err)}`;
+      throw err;
+    } finally {
+      this.releaseHeldPrompts(id, undeliverable);
+    }
+  }
+
+  /**
+   * Hand everything held during a restart to the new executor, in the order it arrived.
+   *
+   * If the restart produced no executor (shutdown, or a failed start) the prompts cannot be
+   * delivered — but they are still not dropped in silence, which is the failure this whole mechanism
+   * exists to prevent. Each one is appended to the session's own log as a `session_error` carrying
+   * its text, so the operator sees in the transcript both that the instruction did not land and what
+   * it said. Appended here rather than through the executor's own `onEvent`, so it does not move the
+   * session off 'active': a session that failed to restart during shutdown is healthy and must come
+   * back on the next boot.
+   */
+  private releaseHeldPrompts(id: string, undeliverable: string): void {
+    const held = this.heldPrompts.get(id);
+    this.heldPrompts.delete(id);
+    if (held === undefined || held.length === 0) return;
+    const handle = this.handles.get(id);
+    if (handle === undefined) {
+      for (const text of held) {
+        this.store.append(id, {
+          type: "session_error",
+          message: `prompt not delivered — ${undeliverable}. It said: ${text}`,
+        });
+      }
+      return;
+    }
+    for (const text of held) handle.send(text);
   }
 
   /**
@@ -271,14 +504,13 @@ export class SessionManager {
     const started: string[] = [];
     for (const r of rows) {
       if (this.handles.has(r.id)) continue;
-      // The stored mode and the stored model are what a session comes back as: a bypass agent stays
-      // bypass across a restart, an attended one stays attended, and an agent pinned to a model
-      // comes back on that model rather than on the CLI's default. The role is stored the same way,
-      // so the factory's orchestrator comes back as the orchestrator — with its charter and its
-      // routing tools — rather than as an ordinary agent standing in the central building.
-      this.startExecutor(
-        r.id, r.cwd, r.claude_session_id, asAutonomy(r.autonomy), r.room_id, r.model, isOrchestratorRow(r),
-      );
+      // Everything stored on the row is what a session comes back as: a bypass agent stays bypass, an
+      // attended one stays attended, an agent pinned to a model comes back on that model rather than
+      // on the CLI's default, and — since M2 — an agent bound to an account comes back on that
+      // account's `CLAUDE_CONFIG_DIR` rather than on the operator's own. The role is stored the same
+      // way, so the factory's orchestrator comes back as the orchestrator, with its charter and its
+      // routing tools, rather than as an ordinary agent standing in the central building.
+      this.startExecutor(r.id, specOf(r));
       started.push(r.id);
     }
     return started;
@@ -317,18 +549,27 @@ export class SessionManager {
     };
   }
 
-  private startExecutor(
-    id: string,
-    cwd: string,
-    resume: string | null,
-    autonomy: AutonomyMode,
-    roomId: string | null,
-    model: string | null,
-    isOrchestrator = false,
-  ) {
+  /** Let go of a session's current executor: anything it says from now on is teardown noise. */
+  private supersede(id: string): void {
+    this.generation.set(id, (this.generation.get(id) ?? 0) + 1);
+  }
+
+  private startExecutor(id: string, spec: RunSpec) {
+    const { cwd, resume, autonomy, roomId, model, accountId, isOrchestrator } = spec;
+    const generation = (this.generation.get(id) ?? 0) + 1;
+    this.generation.set(id, generation);
+    // The account, as the one thing the provider seam understands: a directory. `undefined` (no
+    // account, or an account row that has since been deleted) leaves the executor's own default in
+    // charge, which is the ambient `~/.claude` — the pre-M2 behaviour, unchanged.
+    const configDir = this.opts.accounts?.configDirOf(accountId);
+    // "This subscription was last used just now", which is what the account list shows and what the
+    // limit monitor will poll. Only for an account that actually resolved to a directory.
+    if (accountId !== null && configDir !== undefined) this.opts.accounts?.touch(accountId);
+
     const handle = this.executor.start(
       {
         cwd, resumeSessionId: resume, autonomy, model,
+        ...(configDir !== undefined ? { configDir } : {}),
         mcpServers: this.busToolServers(id, roomId, isOrchestrator),
         // The role, as a system-prompt append. This — plus the flag and the extra tools — is the
         // entire difference between the orchestrator and any other session: same manager, same
@@ -337,16 +578,35 @@ export class SessionManager {
       },
       {
         onEvent: (event) => {
+          // See `generation`: an executor we have already released must not write over the record of
+          // why we released it.
+          if (this.generation.get(id) !== generation) return;
           this.store.append(id, event);
           // A terminal executor failure must move the session off 'active', otherwise resumeAll()
           // re-spawns a known-broken session on every boot, forever.
-          if (event.type === "session_error") this.stmts.markError.run(id);
+          if (event.type === "session_error") {
+            this.stmts.markError.run(id);
+            // A limit error is not just a failure, it is *evidence about the subscription*. Reported
+            // straight away so the monitor can mark the account and the scheduler can hold everyone
+            // else on it, instead of each agent discovering the same wall one at a time.
+            if (classifyExecutorError(event.message) === "rate_limited") {
+              this.opts.onRateLimited?.(id, accountId);
+            }
+          }
           if (event.type === "session_status") {
             if (event.status === "working") this.turnInFlight.add(id);
             else this.turnInFlight.delete(id);
           }
           if (event.type === "turn_complete") {
             this.turnInFlight.delete(id);
+            // The turn boundary is also where an armed pause lands. Before the bus flush, so a
+            // message is never delivered to an agent that is about to stop and would not answer it.
+            const pending = this.pausePending.get(id);
+            if (pending !== undefined) {
+              this.pausePending.delete(id);
+              void this.applyPause(id, pending.until, pending.reason);
+              return;
+            }
             // The turn boundary: the one moment a message from another room may be injected into
             // this agent without interrupting anything. Delivery is idempotent, so flushing here on
             // every boundary costs nothing when the room's queue is empty.
@@ -365,10 +625,35 @@ export class SessionManager {
     void handle.providerSessionId.then((psid) => this.stmts.setProviderSessionId.run(psid, id));
   }
 
+  /**
+   * Send a turn to an agent.
+   *
+   * A session whose executor is mid-restart (`setAutonomy`, `setModel`) has no handle for a moment.
+   * The instruction is **held** and delivered as soon as the replacement is up, because a dropped
+   * instruction is the worst outcome available here: the operator watched themselves type it and
+   * nothing in the transcript ever mentions it again. The hold is bounded — past
+   * `MAX_HELD_PROMPTS` the call throws, which the hub turns into an `error` the UI shows, so a
+   * restart that never finishes cannot quietly swallow an unbounded pile of instructions.
+   */
   prompt(id: string, text: string): void {
     const h = this.handles.get(id);
-    if (!h) throw new Error(`no live session ${id}`);
-    h.send(text);
+    if (h !== undefined) { h.send(text); return; }
+    const held = this.heldPrompts.get(id);
+    if (held === undefined) throw new Error(`no live session ${id}`);
+    if (held.length >= MAX_HELD_PROMPTS) {
+      throw new Error(
+        `session ${id} is restarting and already has ${held.length} prompts waiting; `
+        + "this one was not accepted — wait for it to come back and send it again",
+      );
+    }
+    held.push(text);
+    // Not a `user_prompt`: nothing has been said to the agent yet, and the log must not claim it
+    // has. This is the operator's receipt that the instruction was taken and is waiting.
+    this.store.append(id, {
+      type: "session_status",
+      status: "starting",
+      detail: `prompt held until the restart finishes (${held.length} waiting)`,
+    });
   }
 
   /**
@@ -419,6 +704,110 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Hold an agent because its account is at its limit — **at the next turn boundary, never mid-turn**.
+   *
+   * A turn already in flight is left to finish: interrupting it would throw away the tokens it has
+   * already spent, which is the opposite of the point, and it would cut the agent off mid-sentence in
+   * a transcript the operator later has to read. So a working agent has the pause *armed* and the
+   * `turn_complete` the runner already watches for is what applies it — exactly how the bus decides
+   * when it may inject a message.
+   *
+   * `until` is unix **seconds**, or `null` for "nobody knows when this lifts" (a 429 with no reading
+   * behind it). Null is a real state and the scheduler reads it as "hold until a reading says
+   * otherwise" — it is never treated as "resume now".
+   *
+   * Idempotent: a session already paused, or already armed, is not paused twice.
+   */
+  async pauseSession(
+    id: string,
+    until: number | null,
+    reason: string,
+  ): Promise<"paused" | "at-turn-boundary" | "already-paused"> {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    if (row.state === "paused" || this.pausePending.has(id)) return "already-paused";
+
+    if (this.turnInFlight.has(id)) {
+      this.pausePending.set(id, { until, reason });
+      // Said out loud now rather than at the boundary: the operator watching an agent work has to be
+      // able to see that it is about to stop, and why.
+      this.store.append(id, {
+        type: "session_status",
+        status: "working",
+        detail: `${reason} — pausing at the end of this turn`,
+      });
+      return "at-turn-boundary";
+    }
+
+    await this.applyPause(id, until, reason);
+    return "paused";
+  }
+
+  /**
+   * Actually stop an agent and record that it is held.
+   *
+   * The order is the design: the row and the log say "paused" *before* the executor is torn down, so
+   * a client watching the floor never sees an agent vanish and reappear as paused a second later. The
+   * stop races the same timeout `stopAll` uses — a wedged CLI subprocess must not wedge a pause that
+   * exists to save quota.
+   */
+  private async applyPause(id: string, until: number | null, reason: string): Promise<void> {
+    const changed = this.stmts.markPaused.run(Math.floor(Date.now() / 1000), until, id).changes;
+    // A session that is not 'active' any more (it errored, or shutdown beat us here) is not paused.
+    if (changed === 0) return;
+
+    const handle = this.handles.get(id);
+    this.supersede(id);
+    this.handles.delete(id);
+    this.turnInFlight.delete(id);
+    this.pausePending.delete(id);
+    this.denyPendingApprovals(id);
+    this.store.append(id, { type: "session_status", status: "paused", detail: reason });
+    if (handle !== undefined) await this.stopWithTimeout(handle, 5000).catch(() => {});
+  }
+
+  /**
+   * Bring a paused agent back, resuming the conversation it was holding.
+   *
+   * `options.resume` is what makes this a *continuation* rather than a new agent wearing the same
+   * name: the spec is rebuilt from the row, so the model, the autonomy, the room, the role and the
+   * account all come back as they were, and `claude_session_id` carries the transcript. The agent is
+   * then told what happened to it — being silently restarted after an unexplained gap is how an agent
+   * repeats work it already did.
+   */
+  resumeSession(id: string, reason: string): boolean {
+    const row = this.stmts.session.get(id) as SessionRow | null;
+    if (row == null) throw new Error(`unknown session ${id}`);
+    if (row.state !== "paused") return false;
+    if (this.stopping) return false;
+
+    this.stmts.markResumed.run(id);
+    this.store.append(id, { type: "session_status", status: "starting", detail: reason });
+    this.startExecutor(id, specOf(row));
+    return true;
+  }
+
+  /** Every agent currently held, with what a resume has to decide from. */
+  pausedSessions(): { id: string; accountId: string | null; pausedAt: number | null; pausedUntil: number | null }[] {
+    return (this.stmts.pausedSessions.all() as (SessionRow & { paused_at: number | null; paused_until: number | null })[])
+      .map((r) => ({
+        id: r.id, accountId: r.account_id, pausedAt: r.paused_at, pausedUntil: r.paused_until,
+      }));
+  }
+
+  /**
+   * The live agents running on one account.
+   *
+   * Only sessions with an executor: a row marked active whose process is gone cannot be warned (there
+   * is nothing to inject a turn into) and pausing it would be recording a stop that never happened.
+   */
+  liveSessionsOnAccount(accountId: string): string[] {
+    return (this.stmts.activeOnAccount.all(accountId) as { id: string }[])
+      .map((r) => r.id)
+      .filter((id) => this.handles.has(id));
+  }
+
   async interrupt(id: string): Promise<void> { await this.handles.get(id)?.interrupt(); }
 
   /**
@@ -428,10 +817,17 @@ export class SessionManager {
    */
   async stopAll(timeoutMs = 5000): Promise<void> {
     this.stopping = true;
-    for (const id of this.handles.keys()) this.denyPendingApprovals(id);
+    for (const id of this.handles.keys()) {
+      this.denyPendingApprovals(id);
+      this.supersede(id);
+    }
     const handles = [...this.handles.values()];
     this.handles.clear();
     this.turnInFlight.clear();
+    // An armed pause belongs to a turn boundary that will never arrive now. The session stays
+    // 'active' and comes back on the next boot, where the scheduler will decide again from a fresh
+    // reading — writing 'paused' here would hold an agent for a limit that may have rolled overnight.
+    this.pausePending.clear();
     await Promise.allSettled(handles.map((h) => this.stopWithTimeout(h, timeoutMs)));
   }
 
@@ -470,7 +866,8 @@ export class SessionManager {
     return (rows as {
       id: string; state: SessionInfo["state"]; claude_session_id: string | null;
       autonomy: string; model: string | null; room_id: string | null; last_seq: number;
-      status: string | null; blocked: number; is_orchestrator: number;
+      status: string | null; blocked: number; is_orchestrator: number; account_id: string | null;
+      paused_until: number | null;
     }[]).map(r => ({
       id: r.id,
       state: r.state,
@@ -479,6 +876,8 @@ export class SessionManager {
       autonomy: asAutonomy(r.autonomy),
       model: r.model,
       roomId: r.room_id,
+      accountId: r.account_id,
+      pausedUntil: r.paused_until,
       status: asStatus(r.status),
       blocked: r.blocked === 1,
       isOrchestrator: r.is_orchestrator === 1,
@@ -491,7 +890,8 @@ export class SessionManager {
  * back exactly as it was. One list, used by every statement that reads a session row, so adding a
  * per-session property cannot be remembered in `resumeAll` and forgotten in `setModel`.
  */
-const SESSION_COLUMNS = "id, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator";
+const SESSION_COLUMNS =
+  "id, state, cwd, claude_session_id, autonomy, room_id, model, is_orchestrator, account_id";
 
 /**
  * The session listing, with a caller-chosen `WHERE`. The clause is a literal from the two call sites
@@ -501,7 +901,8 @@ function sessionListSql(where: string): string {
   return `
     SELECT s.id AS id, s.state AS state, s.claude_session_id AS claude_session_id,
            s.autonomy AS autonomy, s.model AS model, s.room_id AS room_id,
-           s.is_orchestrator AS is_orchestrator,
+           s.is_orchestrator AS is_orchestrator, s.account_id AS account_id,
+           s.paused_until AS paused_until,
            COALESCE(MAX(e.seq), 0) AS last_seq,
            -- latest session_status wins; NULL (no such event) folds to 'idle' in TS
            (SELECT json_extract(st.payload, '$.status')
@@ -527,6 +928,8 @@ function sessionListSql(where: string): string {
 interface SessionRow {
   id: string;
   cwd: string;
+  /** active | paused | done | error. The one column `pauseSession`/`resumeSession` branch on. */
+  state: string;
   claude_session_id: string | null;
   autonomy: string;
   /** NULL is "the CLI's own default", not a missing value. */
@@ -534,6 +937,8 @@ interface SessionRow {
   room_id: string | null;
   /** SQLite has no boolean: 1 is the factory's orchestrator, 0 is every other agent. */
   is_orchestrator: number;
+  /** NULL is "the ambient `~/.claude`", not a missing value. */
+  account_id: string | null;
 }
 
 /**

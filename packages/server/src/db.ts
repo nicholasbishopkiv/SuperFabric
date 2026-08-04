@@ -126,6 +126,83 @@ const MIGRATIONS: readonly Migration[] = [
   `,
   // 8 — M3b, the Chronicle: decisions, and one FTS5 index over them and over what was actually said.
   migrateChronicle,
+  // 9 — M2 accounts. An account is a `CLAUDE_CONFIG_DIR` on disk plus this row.
+  //
+  // **`config_dir` is UNIQUE, and that is a correctness constraint rather than tidiness.** The CLI
+  // rewrites its refresh token in place inside that directory, so two accounts pointing at one
+  // directory would each invalidate the other's session at unpredictable moments — the failure would
+  // look like random logouts, days later, with nothing in the log to explain them. `AccountManager`
+  // refuses a duplicate with a readable message *and* the schema refuses it, because this invariant
+  // is too expensive to lose to a future write path that forgets to ask.
+  //
+  // Deliberately **not** scoped to a project: one subscription serves every factory (see
+  // `AccountInfo`). The per-project choice is the *binding*, which is why the nullable `account_id`
+  // goes on `sessions` (the account an agent actually runs on) and on `rooms` (the default new agents
+  // there inherit). Both are nullable and default NULL, so every row written before this migration
+  // keeps running on the ambient `~/.claude` exactly as it did.
+  //
+  // No foreign keys, for the same reason nothing else here has them: `AccountManager.remove` is what
+  // enforces "not while an agent is running on it", and a session's history must survive the removal
+  // of the account it happened to run on.
+  `
+    CREATE TABLE IF NOT EXISTS accounts (
+      id TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      config_dir TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      last_used_at INTEGER
+    );
+    ALTER TABLE sessions ADD COLUMN account_id TEXT;
+    ALTER TABLE rooms ADD COLUMN account_id TEXT;
+    CREATE INDEX IF NOT EXISTS sessions_account ON sessions (account_id);
+  `,
+  // 10 — M2 the limit monitor. One row per reading, per account, forever: the meters must survive a
+  // restart (a blank meter after a reboot reads as "you have used nothing", which is the wrong
+  // direction to be wrong in) and the history is what makes "we were fine an hour ago" answerable.
+  //
+  // `windows` is JSON rather than a table of its own, and deliberately: the endpoint is
+  // **undocumented** and already reports windows we had never heard of (`weekly_scoped` scoped to a
+  // model, plus a dozen nullable code-named buckets). A normalised schema would need a migration
+  // every time Anthropic adds one, and the adapter exists precisely so that does not happen. The
+  // shape stored here is our own `UsageWindow[]`, which the parser has already made sense of.
+  //
+  // No foreign key to `accounts`, for the same reason nothing else here has one: a reading is a
+  // record of a moment and must outlive the account row it was taken from.
+  `
+    CREATE TABLE IF NOT EXISTS usage_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL,
+      read_at INTEGER NOT NULL,           -- unix seconds
+      source TEXT NOT NULL,               -- endpoint | estimate
+      approximate INTEGER NOT NULL,       -- SQLite has no boolean
+      windows TEXT NOT NULL,              -- JSON UsageWindow[]
+      note TEXT,
+      limited INTEGER NOT NULL DEFAULT 0,
+      limited_until TEXT                  -- ISO-8601, or NULL when nothing said when
+    );
+    -- "the newest reading for this account", which is the only query the UI path makes.
+    CREATE INDEX IF NOT EXISTS usage_snapshots_account ON usage_snapshots (account_id, read_at DESC);
+  `,
+  // 11 — M2 the scheduler: when an agent was paused for a limit, and when it is expected back.
+  //
+  // `sessions.state = 'paused'` already existed (it is in the M0 enum) and `resumeAll` already only
+  // starts `'active'` rows, so pausing needs no new state — what it needs is the two facts a
+  // countdown and an unattended resume are made of. Both NULL for every session that is not paused,
+  // which is all of them until a limit is reached.
+  //
+  // **`paused_until` NULL on a paused row is meaningful, not missing**: it is what a 429 with no
+  // known reset time leaves behind, and the scheduler reads it as "hold until a reading says
+  // otherwise" rather than as "resume now". `paused_at` is what makes a *stale* reading unable to
+  // resume anyone — only a reading taken after the pause can say the window has rolled.
+  // `usage_snapshots.limited_by` rides along because it is the other half of the same feature: the
+  // scheduler branches on *how* we know an account is spent (a reading, or the provider refusing a
+  // turn) and a restart that forgot which would show the operator the wrong reason for a stopped
+  // agent. NULL for every row written by migration 10, which is what "not limited" already meant.
+  `
+    ALTER TABLE sessions ADD COLUMN paused_at INTEGER;
+    ALTER TABLE sessions ADD COLUMN paused_until INTEGER;
+    ALTER TABLE usage_snapshots ADD COLUMN limited_by TEXT;
+  `,
 ];
 
 /**
