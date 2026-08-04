@@ -42,6 +42,15 @@ prior art / stack selection (web research).
   `seven_day_sonnet` with `utilization` (0–100) and `resets_at`. Same authoritative,
   cross-device data behind `/usage` in Claude Code. Risk: may change any time → adapter
   + fallback.
+
+  **Correction, measured 2026-08-04 — it already changed.** `five_hour` and `seven_day`
+  are as described, but `seven_day_opus` / `seven_day_sonnet` now come back **`null`**;
+  the per-model weekly figures moved into a `limits[]` array whose entries carry
+  `kind` (`session` | `weekly_all` | `weekly_scoped`), `percent`, `severity`,
+  `resets_at`, `is_active` and, for scoped ones, `scope.model.display_name`. The response
+  also carries `extra_usage` and `spend` blocks. Our parser reads both shapes and both are
+  recorded as fixtures. This is exactly the risk the adapter exists for, arriving within a
+  day of the research — treat any field list here as a snapshot, not a contract.
 - Estimating from local JSONL (ccusage, Claude-Code-Usage-Monitor) is inherently
   imprecise: limits are dynamic, cache tokens are weighted opaquely, other devices are
   invisible. Use only for cost analytics.
