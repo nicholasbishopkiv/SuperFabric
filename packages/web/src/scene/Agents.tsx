@@ -65,16 +65,21 @@ const SPIKE_GEOMETRY = new ConeGeometry(0.1, 0.24, 8);
  * white of the painted markings on the slab, which is deliberately not safety yellow and means
  * nothing anywhere else.
  *
- * It starts above where a bypass spike ends, so an ungated orchestrator wears both markers cleanly
- * rather than one growing through the other.
+ * It is *carried*, at the figure's side rather than floating over its head: a pole rising from hand
+ * height past the helmet, with the flag near its top. That keeps it attached to the body it belongs
+ * to (a marker with a gap under it reads as a separate object), widens the silhouette — which is
+ * what makes it legible at low zoom — and leaves the space directly above the head free, so a
+ * bypass spike and a standard never grow through each other.
  */
-const MAST_GEOMETRY = new BoxGeometry(0.045, 0.62, 0.045);
-const STANDARD_GEOMETRY = new BoxGeometry(0.34, 0.2, 0.03);
-/** The mast's foot clears the top of a bypass spike (`CROWN_Y + 0.28`) with a little air. */
-const MAST_FOOT_Y = CROWN_Y + 0.3;
-const MAST_CENTRE_Y = MAST_FOOT_Y + 0.31;
-/** The flag hangs from the top of the mast. */
-const STANDARD_Y = MAST_FOOT_Y + 0.5;
+const MAST_GEOMETRY = new BoxGeometry(0.05, 0.95, 0.05);
+const STANDARD_GEOMETRY = new BoxGeometry(0.34, 0.22, 0.03);
+/** Beside the right arm (`±0.27`), clear of the bypass spike, which stands at x = 0. */
+const MAST_X = 0.32;
+const MAST_FOOT_Y = LEG_HEIGHT + 0.5;
+const MAST_CENTRE_Y = MAST_FOOT_Y + 0.475;
+/** The flag flies from the top of the pole, hanging off it on one side. */
+const STANDARD_Y = MAST_FOOT_Y + 0.79;
+const STANDARD_X = MAST_X + 0.18;
 
 /** The vest, and the only place an agent's status appears on its body. */
 const VEST_MATERIALS: Record<FactoryStatus, MeshStandardMaterial> = {
@@ -99,9 +104,12 @@ const ORCHESTRATOR_HELMET_MATERIAL = new MeshStandardMaterial({
 });
 /** Unlit on purpose: the ungated marker must be equally obvious on a shaded side of the floor. */
 const BYPASS_MATERIAL = new MeshBasicMaterial({ color: BYPASS_COLOR });
-/** The mast: the same grey metal as the vents on a workshop roof. */
-const MAST_MATERIAL = new MeshStandardMaterial({ color: DETAIL.vent, roughness: 0.5, metalness: 0.4 });
-/** The standard itself, unlit for the same reason the bypass marker is. */
+/**
+ * The pole and the flag, both unlit for the same reason the bypass marker is: a marker that goes
+ * dark on the shaded side of a building is a marker you have to hunt for. The pole is the scene's
+ * grey plant metal, the flag the bone white of the painted markings on the slab.
+ */
+const MAST_MATERIAL = new MeshBasicMaterial({ color: DETAIL.vent });
 const STANDARD_MATERIAL = new MeshBasicMaterial({ color: FLOOR.paint });
 
 /** Steps per second while working. Slow — this is a figure at a workbench, not a sprinter. */
@@ -207,11 +215,15 @@ const AgentFigure = memo(function AgentFigure({
             to the camera rather than its edge. */}
         {orchestrator && (
           <>
-            <mesh geometry={MAST_GEOMETRY} material={MAST_MATERIAL} position-y={MAST_CENTRE_Y} />
+            <mesh
+              geometry={MAST_GEOMETRY}
+              material={MAST_MATERIAL}
+              position={[MAST_X, MAST_CENTRE_Y, 0]}
+            />
             <mesh
               geometry={STANDARD_GEOMETRY}
               material={STANDARD_MATERIAL}
-              position={[0.19, STANDARD_Y, 0]}
+              position={[STANDARD_X, STANDARD_Y, 0]}
             />
           </>
         )}
