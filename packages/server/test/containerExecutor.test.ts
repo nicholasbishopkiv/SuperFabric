@@ -373,6 +373,29 @@ describe("ContainerExecutor: a container that outlived the server", () => {
   });
 });
 
+describe("ContainerExecutor: cleaning up after a boot", () => {
+  it("removes containers no live session claims, and leaves the ones that are claimed", async () => {
+    const h = harness();
+    const mine = await startAndAttach(h, { sessionKey: "sess-live" });
+    await mine.handle.detach!();
+    const orphan = await startAndAttach(h, { sessionKey: "sess-gone" });
+    await orphan.handle.detach!();
+
+    const removed = await h.executor.reapOrphans(new Set(["sess-live"]));
+    expect(removed).toEqual([orphan.container.id]);
+    expect(orphan.container.removed).toBe(true);
+    // `RestartPolicy: unless-stopped` is what makes a container survive a machine reboot; without
+    // this reaper it is also what would make an abandoned one come back forever.
+    expect(mine.container.removed).toBe(false);
+  });
+
+  it("a daemon it cannot reach is not a reason to fail a boot", async () => {
+    const h = harness();
+    h.docker.listContainers = async () => { throw new Error("connect ENOENT /var/run/docker.sock"); };
+    await expect(h.executor.reapOrphans(new Set())).resolves.toEqual([]);
+  });
+});
+
 describe("ContainerExecutor: running and stopping", () => {
   it("does not emit the working/user_prompt pair — the runner does, in order", async () => {
     const h = harness();

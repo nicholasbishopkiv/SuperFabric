@@ -198,6 +198,14 @@ const resumed = mgr.resumeAll();
 if (resumed.length > 0) console.log(`resumed sessions: ${resumed.join(", ")}`);
 else console.log("no sessions to resume");
 
+// A contained agent's container outlives the server on purpose, and `RestartPolicy: unless-stopped`
+// brings it back after a machine reboot — so something has to remove the ones no live session claims
+// any more. Measured against *every* active session rather than the ones this boot started, because
+// a resume adopts its container asynchronously. Fire-and-forget: a factory with no Docker still boots.
+void containerExecutor.reapOrphans(new Set(mgr.activeSessionIds())).then((removed) => {
+  if (removed.length > 0) console.log(`removed ${removed.length} orphaned container(s)`);
+});
+
 // A message that was queued when the server went down is still queued now — that is the whole point
 // of persisting before delivering. Flush every room so a resumed agent gets its mail without the
 // operator having to prompt it first; delivery is idempotent, so a room with an empty queue costs

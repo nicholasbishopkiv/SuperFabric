@@ -1051,6 +1051,17 @@ export class SessionManager {
     return true;
   }
 
+  /**
+   * Every session marked active — the set an out-of-process executor's cleanup is measured against.
+   *
+   * `resumeAll` answers a narrower question ("what did *this* call start?"), which is the wrong one
+   * for a reaper: a container being adopted asynchronously by a resume that has already returned is
+   * still very much claimed, and treating it as garbage would kill a working agent at boot.
+   */
+  activeSessionIds(): string[] {
+    return (this.stmts.activeSessions.all() as SessionRow[]).map((r) => r.id);
+  }
+
   /** Every agent currently held, with what a resume has to decide from. */
   pausedSessions(): { id: string; accountId: string | null; pausedAt: number | null; pausedUntil: number | null }[] {
     return (this.stmts.pausedSessions.all() as (SessionRow & { paused_at: number | null; paused_until: number | null })[])

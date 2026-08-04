@@ -23,7 +23,8 @@ Status: **draft for review** (2026-08-03). Canonical decisions live in the desig
 │  └──────┬──────┘  └──────────────┘  └─────────────┘  └──────────────┘  └───────────┘ │
 └─────────┼─────────────────────────────────────────────────────────────────────────────┘
           │ M0–M3: host subprocesses (per-account CLAUDE_CONFIG_DIR)
-          │ M4: docker containers (agent-runner image, firewall, resource limits)
+          │ M4: per-room container runtime (agent-runner image, unix-socket transport,
+          │     egress firewall, CPU/memory/pid caps) — see §2.4
           ▼
    Claude Code sessions (one per agent) ──► project workspace (rooms = subfolders)
 ```
@@ -194,9 +195,10 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   (`attended` | `auto` | `bypass`, persisted in `sessions.autonomy` and re-applied on resume) that
   maps to the Agent SDK's `permissionMode` inside the executor. `auto` is the default: the CLI's
   classifier decides, and only escalated calls raise an approval card. `bypass` gates nothing and
-  is a deliberate per-agent opt-in — the M4 container sandbox (below) is the precondition for using
-  it routinely, since it is exactly the `--dangerously-skip-permissions` posture that only becomes
-  safe inside a sandboxed room.
+  is a deliberate per-agent opt-in. Since M4 the room's runtime (§2.4) is what decides whether that
+  is contained: an ungated agent on a host room is the operator, with their filesystem and their
+  credentials, and the UI labels it `ungated · uncontained`; in a container room the same agent
+  reaches one folder and one account, and the label drops the second word.
 
 ### 2.2 Web (`packages/web`)
 React 19 + Vite + **react-three-fiber (Three.js) + drei** (all MIT) + zustand.
@@ -272,15 +274,61 @@ and the slab are sized for the widest zoom, so the edge of the world is never th
 ### 2.3 Shared (`packages/shared`)
 Protocol types: WS envelopes, event payloads, bus message schema, task schema. Zod.
 
-### 2.4 Agent runtime placement
-- **M0–M3**: sessions run as host subprocesses under the server. Isolation = per-account
-  `CLAUDE_CONFIG_DIR` + per-room cwd + permission modes. Fast to build, easy to debug.
-- **M4**: `agent-runner` Docker image (Node + Agent SDK + claude), one container per room
-  (or per agent), driven by dockerode; account config dir mounted read-write (one
-  account's volume only), project workspace bind-mounted, default-deny egress firewall
-  from Anthropic's reference devcontainer (`init-firewall.sh`), `Memory/NanoCpus/
-  PidsLimit` caps, `--dangerously-skip-permissions` becomes safe inside the sandbox.
-  Runner speaks WS back to the server (same event protocol).
+### 2.4 Agent runtime placement (M4)
+
+A room chooses `host` or `container` (`rooms.runtime`, default `host`). The choice is a property of
+the *work*, not of one agent — a department whose folder is worth isolating is worth isolating for
+everyone who stands in it — and `SessionManager` picks the executor from it. Nothing downstream
+branches: the event log, approvals, the bus, limits and resume are written once, against the
+`Executor` interface that has existed since M0, and `test/containerEquivalence.test.ts` drives one
+scripted turn through both implementations and compares the logs.
+
+- **`host`** — sessions run as subprocesses of the server, as the operator. Isolation is per-account
+  `CLAUDE_CONFIG_DIR` + per-room cwd + permission modes. Fast, needs no Docker, and on a machine the
+  operator trusts it is a reasonable choice. It is what every room did before M4 and still the
+  default.
+- **`container`** — `ContainerExecutor` (dockerode) creates one container per agent from
+  `superfabric/agent-runner:<version>`, and `packages/agent-runner` inside it hosts the same SDK
+  `query()` and streams back the same `SessionEvent`s.
+  - **Mounts, and nothing else**: the room's folder (rw), that account's `CLAUDE_CONFIG_DIR` (rw —
+    the CLI rewrites its refresh token in place), the runner socket's directory (ro). Never the
+    operator's `~/.claude`, never another account's directory, never the docker socket. A contained
+    session with no account is **refused**, because the usual fallback would mean mounting the
+    operator's home into the sandbox.
+  - **Caps**: `Memory` 2 GiB, `NanoCpus` 2 cores, `PidsLimit` 512, read-only rootfs with tmpfs at
+    `/tmp` and `$HOME`, non-root (uid 1000), `NET_ADMIN`/`NET_RAW` for the firewall and four default
+    capabilities dropped.
+  - **Egress**: default-deny, adapted from Anthropic's reference devcontainer
+    (`init-firewall.sh`), allow-listing the API and auth hosts — including `platform.claude.com`,
+    which the reference omits and which is where OAuth *refresh* goes.
+
+**The transport is a unix socket** (`RUNNER_SOCKET_DIR`), bind-mounted read-only, `0600`; the
+*directory* is mounted rather than the socket file, so a container that outlived a server restart
+finds the new inode at the same path. Three reasons, in order: the bridge-gateway route the plan
+assumed is dropped outright by `ufw` on a default Debian/Ubuntu/Arch host and the fix is a rule only
+the machine's operator may add; a runner port would be a second network listener in a product that
+binds loopback on purpose; and with a socket the container needs no route back to the host at all,
+so the egress allow-list stays strict. A TCP fallback exists behind
+`SUPERFABRIC_RUNNER_TCP_PORT` for a daemon that does not share this filesystem.
+
+**Two gates, not one.** The socket's permissions stop another *user*; a per-container 256-bit token,
+generated by `ContainerExecutor` and compared timing-safely by `RunnerHub` on `hello`, stops another
+*container of the same user* claiming a session that is not its own. The WebSocket origin allow-list
+(`origin.ts`) deliberately admits header-less non-browser clients and therefore says nothing about a
+runner, which is why this is a new surface rather than an extension of an old one.
+
+**The container outlives the server, on purpose.** Shutdown calls `ExecutorHandle.detach()` rather
+than `stop()`, so a graceful restart — or a SIGKILL — leaves the agent working; the runner buffers
+its output and reconnects, and the next boot finds the container by its `superfabric.session` label,
+reads the token out of the container's own environment and re-attaches. **Docker is the store**:
+there is no second record that could disagree with it. A container configured for options the
+operator has since changed is replaced rather than adopted (a digest of the spec is a label), and
+`reapOrphans` at boot removes every container no live session claims — required because
+`RestartPolicy: unless-stopped` is what makes survival work across a machine reboot.
+
+**`bypass` is what all of this was for.** It is unchanged on host rooms — the operator's machine,
+their choice — but the UI now distinguishes the two: `ungated · uncontained` on the host,
+`ungated` in a container, each with a tooltip naming the actual blast radius.
 
 ### 2.5 Projects, room folders and attachments (M1b)
 

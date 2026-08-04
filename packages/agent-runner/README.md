@@ -85,7 +85,7 @@ Allowed, by default, and nothing else:
 | `claude.ai` | claude.ai account authentication |
 | `claude.com` | sign-in starts here and redirects to claude.ai |
 | `platform.claude.com` | OAuth token exchange, **refresh** and revocation |
-| the bridge gateway | the SuperFabric server, and nothing else on the host's LAN |
+| the bridge gateway | only the TCP fallback needs it; the default transport is a unix socket (below) |
 | DNS (53), loopback | — |
 
 Telemetry hosts are *disabled* rather than allow-listed
@@ -121,16 +121,25 @@ $ docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW superfabric/agent-runner
   case where the reference script's `ipset add` exits 1
   ([#15611](https://github.com/anthropics/claude-code/issues/15611)); `-exist` here handles it.
 
-### Not yet true: the runner cannot reach the host on this machine
+### How the runner reaches the server: a unix socket, not the bridge
 
-The container reaches the bridge gateway *through our firewall* — but the **host's own `ufw` drops
-traffic from `docker0`**, so `http://host.docker.internal:<port>` times out even with
-`SUPERFABRIC_FIREWALL=0`. That is the container→host leg `ContainerExecutor` needs, and it is Task
-3's to solve; recording it here so it is not rediscovered as a runner bug. The operator-side fix is
-one rule, e.g.
+The container *can* reach the bridge gateway through our own firewall — but the **host's `ufw` drops
+traffic from `docker0`**, which is the default on Debian, Ubuntu and Arch, so
+`http://host.docker.internal:<port>` times out even with `SUPERFABRIC_FIREWALL=0`. The fix for that
+would be one rule the machine's operator has to add:
 
 ```bash
-sudo ufw allow in on docker0 from 172.17.0.0/16 to any port 4620 proto tcp
+sudo ufw allow in on docker0 from 172.17.0.0/16 to any port <runner port> proto tcp
 ```
 
-which is the operator's firewall to change, not ours.
+**So the server does not ask for it.** `ContainerExecutor` bind-mounts the directory holding a unix
+socket into the container (read-only) and hands the runner `ws+unix:///superfabric/runner.sock:/runner`
+in `SUPERFABRIC_SERVER_URL`. Bun's `WebSocket` client understands that form, which is why nothing in
+this package needed changing for it: **the transport is entirely a property of the URL**. Verified on
+this machine, 2026-08-04, with the firewall up, a read-only rootfs and the non-root user: the
+connection opens and round-trips.
+
+The gateway rule in `init-firewall.sh` (`host reachable at the gateway only`) therefore has nothing
+to carry by default. It stays because the TCP fallback (`SUPERFABRIC_RUNNER_TCP_PORT` on the server)
+still needs it — a Docker daemon that does not share this filesystem cannot use the socket — and
+because it is narrower than the reference script's whole-/24 rule either way.

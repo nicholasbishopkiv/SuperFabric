@@ -150,7 +150,11 @@ export class ContainerExecutor implements Executor {
 
   start(opts: ExecutorStartOptions, ev: ExecutorEvents): ExecutorHandle {
     const log = this.opts.log ?? (() => {});
-    ev.onEvent({ type: "session_status", status: "starting", detail: "starting a container" });
+    // Deliberately not "starting a container": at this point we do not yet know whether we will
+    // create one or re-attach to the one this agent was already working in, and a log that said
+    // "starting a container" and then "re-attaching" would have described something that did not
+    // happen. The next line, once the answer is known, says which.
+    ev.onEvent({ type: "session_status", status: "starting", detail: "bringing up the sandbox" });
 
     let resolveProviderSession!: (id: string) => void;
     // Never rejected, exactly as the local executor's is: `SessionManager` consumes it with a bare
@@ -292,6 +296,45 @@ export class ContainerExecutor implements Executor {
         log(`left container ${container === null ? "(none)" : short(container.id)} running`);
       },
     };
+  }
+
+  /**
+   * Remove every container of ours that no live session claims — called once at boot.
+   *
+   * The counterpart of `RestartPolicy: unless-stopped`, and required by it. That policy is what
+   * makes "the container survives" true across a machine reboot, but it cuts both ways: a container
+   * whose session has since been paused, errored or finished while the server was down would
+   * otherwise keep running, and come back on every boot, holding two gigabytes and an account's
+   * credentials for an agent nobody is watching. Docker is the store, so Docker is also where the
+   * garbage is.
+   *
+   * `keep` is **every active session id**, not the ids this boot happened to start: adoption is
+   * asynchronous, and reaping a container that `resumeAll` is in the middle of re-attaching to would
+   * be the one bug this method could plausibly introduce.
+   */
+  async reapOrphans(keep: ReadonlySet<string>): Promise<string[]> {
+    const log = this.opts.log ?? (() => {});
+    let found: ContainerSummaryLike[];
+    try {
+      found = await this.opts.docker.listContainers({
+        all: true,
+        filters: JSON.stringify({ label: [`${LABEL_RUNNER}=1`] }),
+      });
+    } catch (err) {
+      // No daemon, or no permission to talk to it. A factory with no container rooms is a perfectly
+      // ordinary factory and must still boot.
+      log(`could not look for orphaned containers: ${String(err)}`);
+      return [];
+    }
+    const removed: string[] = [];
+    for (const summary of found) {
+      const session = summary.Labels?.[LABEL_SESSION];
+      if (session !== undefined && keep.has(session)) continue;
+      await this.destroy(this.opts.docker.getContainer(summary.Id)).catch(() => {});
+      removed.push(summary.Id);
+      log(`removed orphaned container ${short(summary.Id)} (session ${session ?? "unknown"})`);
+    }
+    return removed;
   }
 
   // ---- creating the container ---------------------------------------------

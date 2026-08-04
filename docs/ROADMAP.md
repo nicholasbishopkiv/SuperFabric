@@ -353,12 +353,109 @@ the orchestrator switched to `attended`, `factory_search_history` executed with 
 `Write` in the same turn raised one. 760 tests green (shared 53, server 463 + 1 skipped live-quota
 test, web 244).
 
-## M4 — Containerization
+## M4 — A sandbox per room ✅ **complete** (2026-08-04)
 
-- `agent-runner` image (Node + SDK + claude), dockerode management.
-- One container per room; account profile and workspace mounts; egress firewall per
-  Anthropic's reference; resource limits.
-- `--dangerously-skip-permissions` inside the sandbox + per-room auto-approval rules.
+A room chooses `host` (the default, and what every room did before) or `container`. A contained
+agent sees one folder, one account's credentials, two CPUs and Anthropic — and produces an event
+log `SessionManager` cannot tell from a host session's, because it is the second implementation of
+the `Executor` interface that has existed since M0 rather than a parallel runtime.
+
+**Delivered**
+
+- `packages/agent-runner` — the program inside the container: one SDK `query()`, the same
+  `SessionEvent` vocabulary (`@superfabric/shared`, never re-declared), a numbered outbox that
+  survives the socket going away, approvals as a request/answer pair re-asked rather than timed out.
+- `superfabric/agent-runner:0.0.1` — `oven/bun` + git + ripgrep + the SDK, non-root, and
+  `init-firewall.sh` adapted from Anthropic's reference devcontainer. The allow-list is **not**
+  theirs: the reference has drifted from Anthropic's own network-access docs, and it omits
+  `platform.claude.com`, which is where OAuth *refresh* goes — shipping that would have broken every
+  contained session a few days after its token was last refreshed.
+- `ContainerExecutor` + `RunnerHub` + `runnerListener` — three mounts and no more, `Memory` /
+  `NanoCpus` / `PidsLimit`, a read-only rootfs, per-container tokens, and a failed start that is a
+  `session_error` naming what to do about it.
+- `rooms.runtime` (migration 14), the picker on the room panel, a shield on the room row, the word
+  `sandboxed` on the building's label, and `SessionInfo.runtime` so every agent says which runtime
+  it is *actually* in rather than which one its room now prefers.
+
+**The transport is a unix socket, and that was the interesting decision.** The plan assumed
+container→host over the bridge gateway. This machine — like any default Debian/Ubuntu/Arch host —
+runs `ufw`, which drops `docker0`, so the gateway is unreachable and the fix is a rule only the
+machine's operator may add. Probing first found that Bun's `WebSocket` dials `ws+unix://<path>:<p>`,
+that `ws` serves it off a bare `node:http` server, and that a non-root container with a read-only
+rootfs and the firewall up connects through a read-only bind mount of the socket's *directory*. So
+the socket is the transport: no `ufw` rule, no new network listener in a product that binds loopback
+on purpose, and no hole in the container's egress allow-list back to the host. TCP stays as an
+opt-in fallback (`SUPERFABRIC_RUNNER_TCP_PORT`) whose failure message names the rule it needs.
+
+**Acceptance, run on 2026-08-04** (throwaway server on 4711, throwaway data dir, Vite on 5199; the
+operator's own 4620/5173 untouched):
+
+- **A container room and a host room side by side.** `sandboxed` (container) and `onhost` (host),
+  both bound to the same account, plus `sealed` (container) bound to a second account.
+- **One live turn in the container room.** "Write a file called hello.txt … containing exactly the
+  line: contained agent was here." → `hello.txt` appeared in the room's folder *on the host*, owned
+  by the operator, containing exactly that line. The log was `session_status starting` ×3 (two of
+  them the factory narrating the container) → `working` → `user_prompt` → `tool_use Write` →
+  `tool_result` → `agent_text` → `turn_complete $0.198` → `idle`. The host room's turn produced the
+  same shape.
+- **An approval card round-trips.** An `attended` contained agent asked to write a file raised
+  `approval_request Write {file_path: "/workspace/approved.txt"}`; allowing it produced
+  `approval_resolved allow`, the tool ran *inside* the container, and `approved.txt` appeared on the
+  host. (`id -un && pwd` inside the container answers `bun` / `/workspace` — non-root, in the mount.)
+- **The server was killed mid-session and restarted.** `kill -9`, no graceful shutdown at all. The
+  container stayed up; its runner logged six reconnect attempts into the void; the new server logged
+  `resumed sessions: …` and `re-attaching to the container this agent was already running in
+  (9bd9f0dc44d0)` — the *same* container id, and `docker ps -a` shows exactly one was ever created
+  for that session. A **graceful** SIGTERM does the same thing by a different route (`detach`):
+  `container: left container d88562519d52 running`, and the socket file is cleaned up.
+- **Isolation, proved from inside the live container the product created:**
+  - the host home directory: `ls /home/nikolos1999` → `No such file or directory`; a marker file
+    planted there is unreadable.
+  - another account's config dir: the container is bound to the "Other" account, `/config` holds
+    that account's directory and nothing else; the "Work" account's directory
+    (`/home/nikolos1999/.claude`) does not exist inside.
+  - the other rooms' workspaces: `/workspace` holds only the sealed room's folder.
+  - the docker socket: `/var/run/docker.sock` → `No such file or directory`.
+  - egress: `example.com` refused in 6 ms, `pypi.org` in 2 ms, `github.com` in 5 ms (the REJECT, not
+    a timeout); `POST https://api.anthropic.com/v1/messages` returned a real `401`; the host over
+    the bridge (`172.17.0.1:4711`) timed out — the container has no route to us and needs none.
+  - caps, as the daemon reports them: `2147483648 bytes / 2000000000 nanocpus / 512 pids /
+    readonly=true / caps+=[NET_ADMIN NET_RAW] caps-=[MKNOD AUDIT_WRITE NET_BIND_SERVICE SYS_CHROOT]`,
+    and from inside, `memory.max` 2147483648, `cpu.max` 200000/100000, `pids.max` 512.
+  - the rootfs: `touch /usr/local/bin/evil` and `touch /app/evil` both refused; `/workspace`
+    writable, as it must be; `rm /superfabric/runner.sock` refused (the mount is read-only, and a
+    socket needs write permission on the *socket*, not on the directory).
+  - the token: restarting an agent released its old attachment, and the outgoing container's runner
+    reconnecting was refused live — `runner: refusing a runner: this server is not expecting that
+    runner`.
+- **Pause and resume are unchanged.** Mid-acceptance the account crossed 100 % of a weekly window
+  and the M2 scheduler armed a pause on a contained agent at its turn boundary, applied it after
+  `turn_complete`, and removed the container — the same sequence a host agent gets, from code that
+  knows nothing about containers.
+
+**Not run:** nothing was skipped, but the live turns were spent frugally — the operator's only
+logged-in subscription was already at its weekly limit, so the acceptance used it for exactly three
+turns and did the structural work (container lifecycle, restart survival, isolation) on a second
+account with no inference at all.
+
+**Deliberate deviations from the plan**
+
+- **Transport**: unix socket rather than the bridge gateway (above). The per-container token is kept
+  regardless, and a wrong one is refused — tested at the protocol level and observed live.
+- **`ExecutorHandle.detach?()`** was added. `stop()` could not distinguish "this agent is done for
+  now" from "the *server* is going away", which was fine for as long as every agent was a subprocess
+  that died with us. Only `stopAll` calls it; only `ContainerExecutor` has one.
+- **`ExecutorStartOptions.sessionKey`** was added: the one thing an out-of-process executor needs
+  (to find its container again) and a local one ignores.
+- **`SessionInfo.runtime`** was added. The plan asked for the floor to show which rooms are
+  sandboxed; a room's runtime is a default for the *next* start, so a room switched to `container`
+  while agents are working would have had the floor claiming an isolation not in force. Every agent
+  now reports the runtime it is actually in.
+- **`reapOrphans` at boot**, required by `RestartPolicy: unless-stopped` — the policy that makes a
+  container survive a machine reboot is also what would resurrect an abandoned one forever.
+
+1092 → **1158 tests green** (shared 82, server 761 + 1 skipped live-quota test, web 285,
+agent-runner 30).
 
 ## M5 — Polish and the "living factory"
 
