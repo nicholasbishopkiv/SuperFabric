@@ -6,6 +6,7 @@ import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { cn } from "../ui/utils";
 import { createProject, openProject } from "../wsClient";
+import { FactoryTransfer } from "./FactoryTransfer";
 
 /**
  * The project switcher: which factory this tab is looking at, and how to look at another.
@@ -135,6 +136,9 @@ export function ProjectSwitcher() {
             path yet, so there is no folder picker. The folder must already exist.
           </FieldNote>
         </form>
+
+        {/* Moving a factory belongs with "which factory": an export *is* one, and an import makes one. */}
+        <FactoryTransfer />
       </PopoverContent>
     </Popover>
   );

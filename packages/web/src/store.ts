@@ -5,6 +5,8 @@ import type {
   AccountUsage,
   ChronicleHit,
   CostRollups,
+  FactoryExport,
+  FactoryImportResult,
   FactoryMetrics,
   MessageInfo,
   MessageKind,
@@ -241,6 +243,21 @@ export interface FabricState {
    */
   metrics: FactoryMetrics | null;
   /**
+   * The factory the server last handed over for export, or null.
+   *
+   * Held in the store rather than turned into a download inside the socket handler, because writing a
+   * file is a DOM side effect and the store is a reducer. `FactoryTransfer` watches this, saves it and
+   * calls `clearFactoryExport` — so the download happens exactly once per export, in a component.
+   */
+  factoryExport: FactoryExport | null;
+  /**
+   * What the last import did and did not do, or null.
+   *
+   * Kept until the operator dismisses it, deliberately: the `problems` list is the half that matters
+   * and it must not vanish with the next broadcast. Not an error — a reported collision is an outcome.
+   */
+  factoryImport: FactoryImportResult | null;
+  /**
    * The role library, in the server's order (by id).
    *
    * Machine-wide like `accounts`, and left alone by a factory switch for the same reason: a role is a
@@ -408,6 +425,10 @@ export interface FabricState {
   setError(message: string): void;
   /** Forget the last notice, so a stale "saved to …" does not sit under the next thing. */
   clearNotice(): void;
+  /** The export has been saved to a file; drop it so the next one downloads instead of being ignored. */
+  clearFactoryExport(): void;
+  /** Dismiss the last import's report. The operator has read the problems. */
+  clearFactoryImport(): void;
   setUploading(uploading: boolean): void;
   /**
    * Add what an upload just wrote to the composer. Idempotent by path: a double-fired drop event
@@ -527,6 +548,8 @@ export const initialFabricState = {
   accounts: [] as AccountInfo[],
   usage: [] as AccountUsage[],
   metrics: null as FactoryMetrics | null,
+  factoryExport: null as FactoryExport | null,
+  factoryImport: null as FactoryImportResult | null,
   roles: [] as RoleSpec[],
   roleProblems: [] as RoleProblem[],
   activeProjectId: null as string | null,
@@ -1046,6 +1069,10 @@ export const useFabric = create<FabricState>((set, get) => ({
       // nothing to merge. It arrives on a poll and on every turn boundary, so identity is preserved
       // where nothing moved — otherwise a popover repaints three accounts because a fourth spent a cent.
       if (msg.kind === "metrics") return applyMetrics(s, msg.metrics);
+      // Both of these are answers to something the operator just did, so they replace whatever was
+      // there. The export is consumed (and cleared) by whoever saves the file.
+      if (msg.kind === "factory_export") return { factoryExport: msg.factory };
+      if (msg.kind === "factory_import") return { factoryImport: msg.result };
       // Answered once per connect and only changed by the operator editing a file, so there is
       // nothing here to coalesce or to preserve identity through — the whole list is the answer.
       if (msg.kind === "roles") return { roles: msg.roles, roleProblems: msg.problems };
@@ -1128,6 +1155,10 @@ export const useFabric = create<FabricState>((set, get) => ({
   setError: (message) => set((s) => (s.lastError === message ? s : { lastError: message })),
 
   clearNotice: () => set((s) => (s.lastNotice === null ? s : { lastNotice: null })),
+
+  clearFactoryExport: () => set((s) => (s.factoryExport === null ? s : { factoryExport: null })),
+
+  clearFactoryImport: () => set((s) => (s.factoryImport === null ? s : { factoryImport: null })),
 
   setUploading: (uploading) => set((s) => (s.uploading === uploading ? s : { uploading })),
 
