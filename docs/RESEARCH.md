@@ -5,6 +5,12 @@
 Condensed digest of two research passes: Claude Code mechanics (official docs) and
 prior art / stack selection (web research).
 
+**This is a dated research snapshot, not a description of the product** — it records what was
+known on 2026-08-03, which is what the design was made against. Three of its conclusions were
+superseded by measurement and are marked **[superseded]** below; the rest still holds. `§2`
+already carries one dated correction, made when the usage endpoint changed under us within a
+day. Treat every field list here as a snapshot rather than a contract.
+
 ## 1. Claude Code mechanics we build on
 
 - **Programmatic control**: `claude -p` is one-shot; interactive multi-turn steering
@@ -16,9 +22,14 @@ prior art / stack selection (web research).
 - **Account isolation**: `CLAUDE_CONFIG_DIR` relocates the whole `~/.claude`
   (credentials + sessions). Linux: tokens in `.credentials.json` (0600). One directory =
   one account; never share across accounts (refresh tokens rewrite in place).
-- **Login**: browser OAuth **cannot complete in a headless container** — log in on the
-  host (hidden-PTY, the AgentsRoom/Maestro pattern) or use `claude setup-token`
-  (~1-year `CLAUDE_CODE_OAUTH_TOKEN`, Pro/Max).
+- **Login**: browser OAuth **cannot complete in a headless container** — log in on the host.
+  **[superseded, 2026-08-04]** Neither of the two host-side mechanisms this line recommended
+  is what shipped. `claude auth login` needs **no TTY at all**: over plain pipes it prints its
+  OAuth URL as text and reads the code from stdin, so there is no hidden PTY, no `node-pty`
+  and no xterm.js in the product. `claude setup-token` was rejected outright — it *does* need
+  a TTY and it issues a `user:inference`-only token that cannot read the usage endpoint the
+  limit monitor depends on. Transcripts and both rejections:
+  `decisions/0004-account-login-over-a-pipe.md`.
 - **Sessions**: JSONL at `<config-dir>/projects/<encoded-cwd>/<session-id>.jsonl`;
   `--resume <id>` / SDK `resume` work after a process/container restart as long as the
   file survives. Forking: `forkSession: true`.
@@ -80,8 +91,9 @@ niche is ours: self-hosted, multi-account, spatial UI.
 ## 4. Stack decisions
 
 - **Canvas: react-three-fiber + drei (Three.js)** — by explicit product decision the UI
-  must be a real 3D factory (workshop buildings, conveyors with package-messages, later
-  animated agent characters), with 2D panels (task panel, limit meters, approvals) as a
+  must be a real 3D factory (workshop buildings, conveyors with package-messages, and agent
+  figures that move — shipped as procedural motion driven by the event log rather than the
+  glTF characters this line imagined), with 2D panels (task panel, limit meters, approvals) as a
   DOM layer above the WebGL canvas. All MIT. Research originally recommended
   @xyflow/react v12 (MIT, graph model) — superseded by the 3D directive; tldraw
   rejected (proprietary license, watermark).
@@ -89,6 +101,8 @@ niche is ours: self-hosted, multi-account, spatial UI.
   N sessions multiplexed in one socket). The SQLite event log is the source of truth,
   the socket is a lossy tail.
 - **Storage: better-sqlite3 (WAL)** — the unanimous choice of self-hosted prior art.
+  **[superseded]** The server runs on Bun and uses **`bun:sqlite`** (still WAL), which removes
+  the native-module build step entirely: `decisions/0001-bun-runtime-keep-vite.md`.
 - **Docker: dockerode** + Anthropic's reference firewall (milestone M4).
 
 ## 5. Risks / ToS
@@ -100,4 +114,6 @@ niche is ours: self-hosted, multi-account, spatial UI.
 - The 429/limit error format in headless mode is undocumented — capture empirically
   in M0.
 - Concurrent token-refresh behavior with several sessions on one account is
-  undocumented — serialize refresh, monitor for invalidation.
+  undocumented — serialize refresh, monitor for invalidation. **[not done]** This stayed a
+  recommendation: one config directory per account is enforced, but nothing serialises the
+  refreshes of several sessions *within* one account. See `ARCHITECTURE.md` §6.

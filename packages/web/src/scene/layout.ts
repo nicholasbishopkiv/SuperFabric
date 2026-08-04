@@ -383,6 +383,58 @@ export function loadingBays(kind: RoomInfo["kind"], directions: readonly number[
 }
 
 /**
+ * Which bay a belt arriving from direction `(dx, dz)` actually ends at — the one an agent has to walk
+ * to when a crate comes down that belt.
+ *
+ * It is not simply "the i-th bay": `loadingBays` **collapses** openings closer together than one bay
+ * width, so the project block joined to six workshops has fewer doors than belts and several belts
+ * share one. Answering this by index would send an agent to a door that is not drawn.
+ *
+ * `undefined` for a direction of zero (a room on top of another) and for a room with no bays at all.
+ */
+export function bayForDirection(
+  kind: RoomInfo["kind"],
+  directions: readonly number[],
+  dx: number,
+  dz: number,
+): LoadingBay | undefined {
+  const longest = Math.max(Math.abs(dx), Math.abs(dz));
+  if (longest === 0) return undefined;
+  const half = buildingSize(kind).width / 2;
+  const t = half / longest;
+  const x = round3(dx * t);
+  const z = round3(dz * t);
+  // The same test `loadingBays` collapses with, so the answer is always a door that exists: the
+  // first bay within one bay width of where this belt crosses the wall, else the exact one.
+  const bays = loadingBays(kind, directions);
+  return bays.find((b) => Math.hypot(b.x - x, b.z - z) < BAY_WIDTH);
+}
+
+// ---- roof plant ---------------------------------------------------------------------------------
+
+/**
+ * Where a workshop's extract vents stand on its roof, in the building's local frame, and how high
+ * their mouths are above the roof slab. Declared here rather than inline in `Building` because the
+ * chimney plume has to come out of the *same* pipe the roof draws — two independent sets of
+ * coordinates would put the smoke beside the vent.
+ *
+ * The project block has none: it has a pitched roof with a finial rather than plant, so it makes no
+ * smoke. Its beacon still says it is working.
+ */
+export const ROOF_VENT_X: readonly number[] = [-0.95, 0.55];
+export const ROOF_VENT_Z = -0.9;
+/** From the roof slab's top face to the lip of the cowl. */
+export const ROOF_VENT_HEIGHT = 0.47;
+
+/** The mouth of every vent on this building's roof, in its local frame. Empty for the project block. */
+export function ventMouths(kind: RoomInfo["kind"]): [x: number, y: number, z: number][] {
+  if (kind === "project") return [];
+  const { height } = buildingSize(kind);
+  const y = height + ROOM_ROOF_THICKNESS + ROOF_VENT_HEIGHT;
+  return ROOF_VENT_X.map((x) => [x, y, ROOF_VENT_Z]);
+}
+
+/**
  * Where each of a room's agents stands: on a short arc in *front* of the building, meaning the
  * +x/+z corner, which is the one the fixed isometric camera looks at. One agent stands in the
  * middle; more fan out around it, and the arc widens with the crowd so eight agents still read as

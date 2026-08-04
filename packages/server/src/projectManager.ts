@@ -97,6 +97,19 @@ export class ProjectManager {
     return row == null ? undefined : toProjectInfo(row);
   }
 
+  /**
+   * The project registered for a folder, or `undefined` when none is.
+   *
+   * One folder is one factory (`projects.root` is UNIQUE), so this is how a caller holding a path
+   * rather than an id — importing a factory into a root the operator typed — finds out whether it is
+   * adopting an existing floor or creating one. The path is resolved first, so `/a/b`, `/a/b/` and
+   * `/a/./b` are the one folder they are.
+   */
+  byRoot(root: string): ProjectInfo | undefined {
+    const row = this.stmts.byRoot.get(path.resolve(root.trim())) as ProjectRow | null;
+    return row == null ? undefined : toProjectInfo(row);
+  }
+
   /** The same, as an assertion: callers that must have a project say so once, here. */
   require(id: string): ProjectInfo {
     const project = this.get(id);

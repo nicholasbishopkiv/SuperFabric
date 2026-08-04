@@ -7,10 +7,18 @@ and a subscription limit monitor with auto-pause/resume.
 
 ## Read before any work
 
-1. `docs/superpowers/specs/2026-08-03-fabrica-design.md` — canonical design spec.
-2. `docs/ARCHITECTURE.md` — components and flows.
-3. `docs/ROADMAP.md` — which milestone (M0–M5) we are on.
-4. `docs/RESEARCH.md` — facts about Claude Code / limits / prior art; don't rediscover.
+1. **This file** — the invariants below are the ones that must not be broken.
+2. `docs/ARCHITECTURE.md` — components and flows, read against the code at the end of M5.
+3. `docs/ROADMAP.md` — what each milestone actually delivered, with the acceptance evidence,
+   and **`## What is not built`** at the bottom. Read that section before assuming a feature
+   exists.
+4. `docs/RESEARCH.md` — facts about Claude Code / limits / prior art; don't rediscover. A
+   **dated snapshot** with three conclusions marked `[superseded]`.
+5. `docs/superpowers/specs/2026-08-03-fabrica-design.md` — the spec the product started from.
+   **Historical**: it is where the shape came from, and where it and this file disagree, this
+   file and `ARCHITECTURE.md` are right.
+6. `packages/server/notes/agent-sdk-api.md` — verified Agent SDK API reference. Trust it over
+   memory; it records what was measured, including two things whose obvious reading is wrong.
 
 ## Invariants (do not violate)
 
@@ -168,6 +176,37 @@ and a subscription limit monitor with auto-pause/resume.
   runs on). A per-project account table would have meant re-creating and re-logging-in the same
   account on every floor, which puts two rows on one directory: the invariant above, broken from the
   other side.
+- **A projection with too little behind it says "unknown".** The burn rate (`metricsStore.ts`) is
+  the least-squares slope of `usage_snapshots` taken to `LIMIT_PAUSE_PERCENT` — a *measurement*, from
+  the same readings the meters draw — and it refuses to produce a figure from fewer than two
+  readings, from a series spanning under `MIN_BURN_SPAN_SECONDS`, or from a window that is not
+  filling. The reason travels in words to the place the number would have been. "At this rate you
+  have about two hours" is the only output an operator acts on, so a guess there would be worse than
+  a blank: they would plan an afternoon around it. A window that *rolled* restarts the series rather
+  than flattening it — 96 % to 3 % is a new window, not a rate of minus ninety-three points an hour.
+- **There is no pricing table anywhere in this product, and there must not be one.** Cost comes from
+  `turn_complete.costUsd`, which is the CLI's own figure. Tokens are never multiplied by a rate we
+  wrote down: such a table would be wrong within weeks and nothing would say so. The figure is
+  marked approximate everywhere it appears, for three separate reasons named on `CostRollup` — it is
+  a cost-*equivalent* (a subscription bills nothing per turn), a turn whose result carried no cost is
+  not counted, and it is **reconstructed**: `total_cost_usd` accumulates **per `query()`**, not per
+  turn (see `notes/agent-sdk-api.md`, "What `total_cost_usd` counts"), so a turn's cost is a delta
+  and a counter that goes backwards is a restarted executor rather than a refund. Summing the field
+  would over-count a long session several times over.
+- **An exported factory contains no credentials, and that is a test rather than a sentence.** The
+  export refers to an account only by the **label** the operator typed, carries nothing read from any
+  `CLAUDE_CONFIG_DIR`, no account id, and **no absolute path at all** — a room's folder is described
+  relative to the project root, which is both what makes the file portable and what keeps someone's
+  home directory out of a factory they shared. `test/factoryPortability.test.ts` serialises a
+  populated export and greps the bytes for the token shapes, for every configured config directory,
+  for every account id and for the project root, and fails on a hit. **Import goes through the
+  ordinary `RoomManager.createRoom`** so every invariant it already has still applies, and it
+  **reports what it could not do** — a colliding room, a label this machine lacks, an ADR the
+  repository does not hold, the agents it described rather than started. A partial import that
+  claimed to be complete is worse than a refused one. Two deliberate refusals: an import never starts
+  an agent (a conversation does not travel with a file, and spawning a CLI per described agent when
+  someone opens one is not a thing they asked for), and `Chronicle.indexImported` writes an index row
+  **only when the ADR file is actually present** — the decision is the file, still.
 
 ## Autonomy (per-agent permission mode)
 
@@ -330,16 +369,25 @@ out in the README so users know what they're installing.
 
 ## Status
 
-Design approved 2026-08-03. **M0 (core session runner)**, **M1a (rooms as folders and the 3D
-floor)**, **M1b (several projects in one server, settable room folders, attachments, and the HUD
-rebuilt on Tailwind v4 + Radix — `docs/decisions/0003-ui-library.md`)**, **M2 (multi-account, the
-in-app login, the limit monitor and the pause/resume scheduler)**, **M3a (the factory bus, tasks, and
-packages that ride real messages)**, **M3b (the orchestrator, task auto-routing and the
-Chronicle)**, **M1c (the roles library and the onboarding agent)** and **M4 (a sandbox per room: the
-`agent-runner` image, `ContainerExecutor`, and `rooms.runtime`)** are complete — see
-`docs/ROADMAP.md` for the acceptance evidence of each, including the live onboarding transcript and
-M4's isolation proofs from inside a running container. Next: M5 (glTF agent characters, burn-rate
-metrics, factory export/import).
+Design approved 2026-08-03. **Every milestone is complete as of 2026-08-04**: **M0** (core session
+runner), **M1a** (rooms as folders and the 3D floor), **M1b** (several projects in one server,
+settable room folders, attachments, and the HUD rebuilt on Tailwind v4 + Radix —
+`docs/decisions/0003-ui-library.md`), **M1c** (the roles library and the onboarding agent), **M2**
+(multi-account, the in-app login, the limit monitor and the pause/resume scheduler), **M3a** (the
+factory bus, tasks, and packages that ride real messages), **M3b** (the orchestrator, task
+auto-routing and the Chronicle), **M4** (a sandbox per room: the `agent-runner` image,
+`ContainerExecutor`, and `rooms.runtime`) and **M5** (agents that fetch packages, an inhabited
+factory, burn-rate metrics and factory export/import — **not** the glTF characters the roadmap
+originally sketched; that was consciously changed and the reason is recorded in M5's section).
+See `docs/ROADMAP.md` for the acceptance evidence of each, including the live onboarding
+transcript and M4's isolation proofs from inside a running container.
+
+**1344 tests green** (shared 88, server 807 + 1 skipped live-quota test, web 419, agent-runner 30).
+
+**What is *not* built is listed at the end of `docs/ROADMAP.md`** and is worth reading before you
+add a doc sentence that implies otherwise — there are no notifications off the browser tab, eleven
+role presets rather than fifty, one provider behind the `Executor` seam, no folder picker, no
+per-turn token counts, and no serialised OAuth refresh within a single account.
 
 ## Running it
 
@@ -426,12 +474,18 @@ README names).
   the card only when it answers) · `chronicle.ts` (ADR files in the project's own
   `docs/decisions/`, plus one FTS5 query spanning decisions **and** the event log; the triggers in
   `db.ts` keep the index in step, not this class) ·
+  `metricsStore.ts` (M5: the burn rate as the least-squares slope of `usage_snapshots`, and
+  cost reconstructed from a **cumulative** `costUsd` — no pricing table anywhere, and "unknown"
+  rather than a guess when there is too little history) ·
+  `factoryPortability.ts` (M5: a factory as one portable file with no credential and no absolute
+  path in it, and an import that goes through `createRoom` and reports what it could not do) ·
   `taskStore.ts` (the task board; announces its own changes) ·
   `attachmentStore.ts` (files in, paths out: filename sanitising, MIME→extension, containment
   against whichever root the file is going into, and never overwriting) ·
   `attachmentRoutes.ts` (`POST /attachments`, multipart, behind the **same** origin allow-list as
   the WebSocket handshake) · `wsHub.ts` (replay-then-tail plus
-  debounced `sessions`/`rooms`/`tasks`/`messages` broadcasts, and `notice` for "it worked") ·
+  debounced `sessions`/`rooms`/`tasks`/`messages`/`accounts`/`usage`/`metrics`/`onboarding`
+  broadcasts, and `notice` for "it worked") ·
   `index.ts` (wiring only) ·
   `notes/agent-sdk-api.md` (verified SDK API reference — trust it over memory).
   Its tests run under `bun test` (`test/_waitFor.ts` replaces `vi.waitFor`); `packages/shared`
@@ -440,10 +494,27 @@ README names).
   packages and waiting crates) · `wsClient.ts` (reconnect + resubscribe from `lastSeq`) ·
   `attachments.ts` (upload over HTTP, stage the returned paths, and `composeTurn` — the pure
   function that decides what an agent is actually told about a file) ·
-  `App.tsx` (the 3D floor plus three HUD edges) · `scene/*` (the floor) · `hud/*` (room panel,
+  `gist.ts` (one line about a tool call — **one** summariser, shared by the console's transcript
+  and the thought bubble over a figure's head, so the same `Bash` call cannot read two ways) ·
+  `App.tsx` (the 3D floor plus three HUD edges) ·
+  `scene/*` (the floor: `Building`/`Buildings`, `Conveyor` + `conveyorPath.ts`, `Packages`,
+  `StatusBeacon`, `Agents`, `Floor`, `lighting`, `CameraFraming`, `RoomDrag`, `palette.ts`,
+  `layout.ts` — plus M5's `errands.ts` (which agent fetches a crate, where the path runs, and what
+  happens when nobody is free — pure, so it is tested without a canvas), `BayPile.tsx` (the crates a
+  room with nobody home visibly stacks), `Chimney.tsx` + `atmosphere.ts` (a plume while a room
+  works, fading after it stops), `props.ts`/`Props.tsx` (per-room props that reflect the work),
+  `roleLook.ts` (a distinct figure per role) and `bubble.ts` (what an agent is doing, over its
+  head)) ·
+  `hud/*` (room panel,
   console drawer, task board, the chronicle popover, the account switcher and its login flow
   (`TopLeftBar` places it beside the project switcher), the per-account limit meters inside that
-  popover (`UsageMeters.tsx` — hatched bars and a `≈` wherever a figure is a guess),
+  popover (`UsageMeters.tsx` — hatched bars and a `≈` wherever a figure is a guess) and the
+  burn rate and cost-equivalent under them plus this factory's spend by room (`BurnRate.tsx` —
+  a duration at a resolution the readings support, and "Time left: unknown" with the server's
+  reason in the place the figure would have been),
+  export/import in the project switcher (`FactoryTransfer.tsx` — the import's *problems* list is
+  the point of the surface and stays up until dismissed; the download happens in an effect,
+  because writing a file is a DOM side effect and the store is a reducer),
   window-wide paste/drop target, the one `NoticeBar`, and `Panel.tsx`
   — the shared collapsible edge-panel chrome all three edges are built from) ·
   the role picker (`RoleSelect.tsx` — name plus its one-line summary, on the room panel's

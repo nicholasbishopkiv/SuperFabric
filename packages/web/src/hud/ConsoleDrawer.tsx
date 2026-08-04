@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { composeTurn, uploadIntoComposer } from "../attachments";
+import { toolGist, truncate } from "../gist";
 import type { EventRow } from "../store";
 import { useFabric, useStagedAttachments } from "../store";
 import { Badge } from "../ui/badge";
@@ -441,7 +442,7 @@ function Entry({
       return (
         <p className="my-0.5 font-mono text-2xs text-fg-muted">
           <span className="text-fg-faint">⚙ </span>
-          {event.toolName} <span className="text-fg-faint">{summarize(event.input)}</span>
+          {event.toolName} <span className="text-fg-faint">{toolGist(event.input)}</span>
         </p>
       );
     case "tool_result":
@@ -522,18 +523,3 @@ function ApprovalCard({
   );
 }
 
-/** One-line gist of a tool input, so the transcript stays readable instead of a JSON dump. */
-function summarize(input: unknown): string {
-  if (input === null || typeof input !== "object") return "";
-  const o = input as Record<string, unknown>;
-  for (const key of ["command", "file_path", "path", "pattern", "url", "description"]) {
-    const v = o[key];
-    if (typeof v === "string" && v !== "") return truncate(v, 120);
-  }
-  return truncate(JSON.stringify(o), 120);
-}
-
-function truncate(s: string, max: number): string {
-  const flat = s.replace(/\s+/g, " ").trim();
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
-}

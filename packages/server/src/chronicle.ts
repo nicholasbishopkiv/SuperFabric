@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { ChronicleHit } from "@superfabric/shared";
 import type { Db } from "./db.js";
@@ -168,6 +168,60 @@ export class Chronicle {
 
     const written = this.writeAdr(dir, this.nextNumber(opts.projectId, dir), draft);
     const record: DecisionRecord = { ...draft, number: written.number, path: written.path };
+    this.stmts.insert.run(
+      record.id, record.projectId, record.roomId, record.agentId, record.taskId,
+      record.number, record.path, record.title, record.context, record.decision,
+      record.alternatives, record.links.join("\n"), record.createdAt,
+    );
+    return record;
+  }
+
+  /**
+   * Index an ADR that is **already in the repository** — the import path, and nothing else.
+   *
+   * `record` writes the file and then the row, because the file is the artefact. Importing a factory
+   * inverts that: the ADR arrived with the repository (it is a committed file), and what is missing is
+   * the index entry over it. So this is the one write path that does not create a file — and it
+   * **refuses** when the file is not there, which is what keeps the invariant intact rather than
+   * quietly making the Chronicle claim reasoning that does not exist.
+   *
+   * The body is read off disk rather than carried in the export, so the FTS index is built from the
+   * real ADR and there is never a second copy of a decision's text to go stale. A file we cannot read
+   * is refused for the same reason a missing one is.
+   */
+  indexImported(opts: {
+    projectId: string;
+    roomId: string | null;
+    number: number;
+    /** Absolute path of the ADR file, which must exist. */
+    file: string;
+    title: string;
+    createdAt: number;
+  }): DecisionRecord {
+    let body: string;
+    try { body = readFileSync(opts.file, "utf8"); }
+    catch (err) { throw new Error(`the ADR file could not be read: ${String(err)}`); }
+
+    const record: DecisionRecord = {
+      id: randomUUID(),
+      projectId: opts.projectId,
+      roomId: opts.roomId,
+      // Deliberately null: the agent and task that produced this decision were on another machine, and
+      // an id from there resolves to nothing here. A wrong reference is worse than an absent one.
+      agentId: null,
+      taskId: null,
+      number: opts.number,
+      path: opts.file,
+      title: opts.title,
+      // The whole ADR as its own context, so a search finds every word the file actually contains.
+      // `decision` may not be empty (the column is NOT NULL and the shape means something), and the
+      // markdown is the most honest thing to put there: it *is* the decision, as written.
+      context: "",
+      decision: body,
+      alternatives: "",
+      links: [],
+      createdAt: opts.createdAt,
+    };
     this.stmts.insert.run(
       record.id, record.projectId, record.roomId, record.agentId, record.taskId,
       record.number, record.path, record.title, record.context, record.decision,

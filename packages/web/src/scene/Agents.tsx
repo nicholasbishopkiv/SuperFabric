@@ -1,19 +1,45 @@
 import type { RoomInfo } from "@superfabric/shared";
-import { useFrame } from "@react-three/fiber";
+import { Html } from "@react-three/drei";
+import { useFrame, useThree } from "@react-three/fiber";
 import { memo, useEffect, useMemo, useRef } from "react";
 import type { Group } from "three";
 import {
   BoxGeometry,
   ConeGeometry,
+  CylinderGeometry,
   MeshBasicMaterial,
   MeshStandardMaterial,
   RingGeometry,
   SphereGeometry,
+  TorusGeometry,
 } from "three";
-import type { FactoryStatus } from "../store";
-import { agentStatus, useRoomAgents } from "../store";
-import { agentFacing, agentSlots } from "./layout";
-import { BYPASS_COLOR, DETAIL, FLOOR, PROJECT, STATUS_COLOR } from "./palette";
+import type { Errand, FactoryStatus } from "../store";
+import {
+  agentStatus,
+  showsBubble,
+  useAgentBubble,
+  useBeltDirections,
+  useIsSelected,
+  useRoomAgents,
+  useRoomErrandDirections,
+  useRoomErrands,
+} from "../store";
+import { subscribe } from "../wsClient";
+import type { Bubble } from "./bubble";
+import { errandAt, fetchPath, pathLength, walkAt, type WalkPath } from "./errands";
+import { agentFacing, agentSlots, bayForDirection } from "./layout";
+import {
+  BYPASS_COLOR,
+  CARRIED,
+  DETAIL,
+  FLOOR,
+  PACKAGE_COLORS,
+  packageToneIndex,
+  PROJECT,
+  ROLE_HAT,
+  STATUS_COLOR,
+} from "./palette";
+import { type CarryKind, type HatShape, roleLook } from "./roleLook";
 
 /**
  * A worker, in seven boxes and two spheres.
@@ -28,6 +54,11 @@ import { BYPASS_COLOR, DETAIL, FLOOR, PROJECT, STATUS_COLOR } from "./palette";
  * for "this is what this person's state is", and it keeps the loudest colour on the biggest facing
  * surface, where it is legible at low zoom. Trousers, arms, head and helmet are neutral, so the
  * figure still reads as a figure rather than as a coloured pill.
+ *
+ * **The role is the hat and the hand, never the vest.** A role that read as a status would make the
+ * whole floor lie, so it is carried by silhouette (one hat shape and one carried tool per work
+ * family) and by value (five neutral hat colours under 15% saturation), with not one new hue on the
+ * floor. `roleLook.ts` holds the table and the argument for it.
  *
  * Every geometry and every material is created **once for the whole factory**: eight agents in a room
  * must cost eight groups of draw calls, not eight geometry allocations, and every figure of the same
@@ -50,6 +81,18 @@ const HEAD_GEOMETRY = new SphereGeometry(HEAD_RADIUS, 12, 10);
 /** A hard hat: the top half of a sphere, plus a brim, which is a helmet in two primitives. */
 const HELMET_GEOMETRY = new SphereGeometry(0.175, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2);
 const BRIM_GEOMETRY = new BoxGeometry(0.36, 0.045, 0.34);
+/**
+ * The other four hats. See `roleLook.ts` for what each says; here they are three primitives at most,
+ * because the whole point of carrying the role on a *shape* is that the shape has to survive being
+ * twelve pixels across.
+ */
+/** A flat-topped bump cap, and the wider brim that goes with it. */
+const FLAT_CROWN_GEOMETRY = new CylinderGeometry(0.172, 0.178, 0.11, 12);
+const WIDE_BRIM_GEOMETRY = new BoxGeometry(0.44, 0.04, 0.42);
+/** A peak at the front only, which is what turns a dome into a cap rather than a helmet. */
+const PEAK_GEOMETRY = new BoxGeometry(0.28, 0.038, 0.2);
+/** An ear defender. Two of these are the widest hat on the floor, and read as plant from far away. */
+const MUFF_GEOMETRY = new BoxGeometry(0.075, 0.14, 0.13);
 /** The bypass marker: a ring at the feet and a spike over the head. */
 const RING_GEOMETRY = new RingGeometry(0.3, 0.42, 20);
 const SPIKE_GEOMETRY = new ConeGeometry(0.1, 0.24, 8);
@@ -93,16 +136,62 @@ const VEST_MATERIALS: Record<FactoryStatus, MeshStandardMaterial> = {
 const TROUSER_MATERIAL = new MeshStandardMaterial({ color: "#3d4550", roughness: 0.85 });
 const SLEEVE_MATERIAL = new MeshStandardMaterial({ color: "#4b5460", roughness: 0.8 });
 const SKIN_MATERIAL = new MeshStandardMaterial({ color: "#e3c6a8", roughness: 0.85 });
-const HELMET_MATERIAL = new MeshStandardMaterial({ color: "#eef0ee", roughness: 0.45 });
+/**
+ * One material per hat colour, for the whole factory — the five role neutrals plus the
+ * orchestrator's. Keyed by the hex so `roleLook` can hand back a colour rather than a material and
+ * still cost no allocation: eleven role looks across N agents must be N groups of draw calls, not N
+ * materials, and every figure wearing the same hat batches with the others.
+ */
+const HAT_MATERIALS: Record<string, MeshStandardMaterial> = Object.fromEntries(
+  [...new Set([...Object.values(ROLE_HAT), PROJECT.ridge])].map((hex) => [
+    hex,
+    new MeshStandardMaterial({ color: hex, roughness: 0.45 }),
+  ]),
+);
+/** The hat every figure wore before roles existed, and what an unknown role still gets. */
+const HELMET_MATERIAL = HAT_MATERIALS[ROLE_HAT.white];
 /**
  * The orchestrator's hat, in the project block's own eaves colour: it works in the central building
  * and wears headquarters' slate rather than a workshop's white. A second, quieter cue than the
  * standard — legible up close, where the standard is legible from across the floor.
+ *
+ * It **outranks the role's own hat value**, and keeps the role's *shape*: which agent is senior is a
+ * fact about the whole factory, and the shape still says what kind of work it does.
  */
-const ORCHESTRATOR_HELMET_MATERIAL = new MeshStandardMaterial({
-  color: PROJECT.ridge,
-  roughness: 0.45,
-});
+const ORCHESTRATOR_HELMET_MATERIAL = HAT_MATERIALS[PROJECT.ridge];
+
+// ---- what a role carries ------------------------------------------------------------------------
+//
+// Five tools, one per work family, all in neutrals the floor already owns (`CARRIED`): the tool's job
+// is to change a silhouette, and one that also introduced a colour would be paying twice over for a
+// single reading. Every geometry and material here is created once for the factory.
+
+const TOOL_METAL = new MeshStandardMaterial({ color: CARRIED.metal, roughness: 0.45, metalness: 0.5 });
+const TOOL_PALE = new MeshStandardMaterial({ color: CARRIED.pale, roughness: 0.8 });
+const TOOL_DARK = new MeshStandardMaterial({ color: CARRIED.dark, roughness: 0.7 });
+
+/** A rolled drawing, tucked under the arm: the planner's tool. */
+const ROLL_GEOMETRY = new CylinderGeometry(0.045, 0.045, 0.52, 8);
+/** A spanner: a shaft and a head. The builder's. */
+const SPANNER_SHAFT_GEOMETRY = new BoxGeometry(0.055, 0.32, 0.045);
+const SPANNER_HEAD_GEOMETRY = new BoxGeometry(0.13, 0.085, 0.055);
+/** A magnifier: a ring on a handle. The checker's. */
+const LENS_RING_GEOMETRY = new TorusGeometry(0.085, 0.019, 6, 14);
+const LENS_HANDLE_GEOMETRY = new BoxGeometry(0.035, 0.16, 0.035);
+/** A clipboard and its clip. The writer's. */
+const CLIPBOARD_GEOMETRY = new BoxGeometry(0.24, 0.32, 0.025);
+const CLIP_GEOMETRY = new BoxGeometry(0.17, 0.045, 0.04);
+/** A valve handwheel. The operator's, and the roundest thing on any figure. */
+const VALVE_GEOMETRY = new TorusGeometry(0.105, 0.026, 6, 16);
+
+/**
+ * Where a tool is carried: at the **left** side, at hip height.
+ *
+ * Not the right, and that is a collision rather than a preference — the right hand holds the crate on
+ * an errand (`CARRIED_POSITION`) and the orchestrator's mast stands at `MAST_X`. On the body rather
+ * than on the arm group, like the crate, so a swinging arm never swings a spanner through a torso.
+ */
+const TOOL_POSITION: readonly [number, number, number] = [-0.36, LEG_HEIGHT + 0.24, 0.06];
 /** Unlit on purpose: the ungated marker must be equally obvious on a shaded side of the floor. */
 const BYPASS_MATERIAL = new MeshBasicMaterial({ color: BYPASS_COLOR });
 /**
@@ -121,6 +210,38 @@ const SHUFFLE = 0.3;
 /** How far the arms swing while working, in radians. */
 const ARM_SWING = 0.5;
 
+/**
+ * How far the figure travels per step while walking a path, in world units.
+ *
+ * This is what makes a walk a walk rather than a slide: the bob and the arm swing are driven by
+ * **distance covered**, not by the wall clock, so the feet keep up with the ground however long or
+ * short the route is. A fixed-frequency bob over a variable-length path is exactly the moonwalk this
+ * avoids.
+ */
+const STRIDE = 0.62;
+
+/**
+ * The yaw at which a figure faces the operator: the default camera stands on the `+x/+z` diagonal, and
+ * a figure's front is its local `+z`, so this is `atan2(1, 1)`.
+ *
+ * Used for `blocked` and nothing else. A blocked agent has to read as *waiting on you* rather than as
+ * quiet, and the cue is deliberately not a colour (it already has amber) or a motion (it is stopped):
+ * it turns to face the camera and holds its hands out, which no other state does. It works from the
+ * default view, which is the one an operator reads a stuck factory from.
+ */
+const CAMERA_FACING_YAW = Math.PI / 4;
+
+/**
+ * How far a blocked figure holds its arms **out from its sides**, in radians.
+ *
+ * Sideways rather than forward, and that is a measurement rather than a preference: swung forward,
+ * the arms project straight onto the torso from a camera 32° above the horizon and the pose is
+ * invisible at any zoom the operator actually uses. Held out, they *widen the silhouette*, which is
+ * the one thing that survives a figure being forty pixels tall — the same reason the orchestrator's
+ * standard is carried at its side rather than floated over its head.
+ */
+const WAITING_ARMS = 0.5;
+
 /** A stable per-agent phase offset, so a room full of working agents does not bob in lockstep. */
 function phaseOf(id: string): number {
   let hash = 0;
@@ -129,41 +250,288 @@ function phaseOf(id: string): number {
 }
 
 /**
- * One agent. Animates **only** while working, for the same reason the beacon does: `frameloop="demand"`
- * renders no frames otherwise, so an idle figure has to be genuinely still rather than nominally
- * animated. Its colour is its *own* status, not its room's — the whole point of a figure each is that
- * you can see which one of them is the one that is stuck.
+ * The crate an agent carries home from the bay. Deliberately the **same** cardboard as the box that
+ * rode the belt (and one material per tone, so the four share draw calls), a little smaller so it
+ * reads as being held rather than as standing on the figure.
+ */
+const CARRIED_GEOMETRY = new BoxGeometry(0.4, 0.4, 0.4);
+const CARRIED_MATERIALS = PACKAGE_COLORS.map(
+  (hex) => new MeshStandardMaterial({ color: hex, roughness: 0.7 }),
+);
+/** At the right hand, hanging just clear of the hip and slightly in front of the body. */
+const CARRIED_POSITION: readonly [number, number, number] = [0.36, LEG_HEIGHT + 0.22, 0.08];
+/** The arm that holds it stays down and a little back, so the crate looks gripped, not balanced. */
+const CARRY_ARM = 0.22;
+
+/**
+ * The hat, in one of five silhouettes. Sits at the same height whatever the shape, so a room of
+ * different roles reads as a row of people and not as a row of different-sized people.
+ */
+function Hat({ shape, material }: { shape: HatShape; material: MeshStandardMaterial }) {
+  const y = HEAD_Y - 0.02;
+  switch (shape) {
+    case "hard":
+      return (
+        <>
+          <mesh geometry={HELMET_GEOMETRY} material={material} position-y={y} />
+          <mesh geometry={BRIM_GEOMETRY} material={material} position-y={y} />
+        </>
+      );
+    case "flat":
+      return (
+        <>
+          <mesh geometry={FLAT_CROWN_GEOMETRY} material={material} position-y={y + 0.075} />
+          <mesh geometry={WIDE_BRIM_GEOMETRY} material={material} position-y={y + 0.01} />
+        </>
+      );
+    case "visor":
+      return (
+        <>
+          <mesh geometry={HELMET_GEOMETRY} material={material} position-y={y} scale-y={0.86} />
+          {/* Front only: a peak all the way round would be the hard hat again. */}
+          <mesh geometry={PEAK_GEOMETRY} material={material} position={[0, y + 0.01, 0.17]} />
+        </>
+      );
+    case "soft":
+      // The same dome, squashed and a little wider than the head it sits on: a soft cap has no brim
+      // and sits low, which is most of what tells it from a helmet — but without the overhang it
+      // reads as a bare head at working zoom, which was visible in the first screenshot of it.
+      return <mesh geometry={HELMET_GEOMETRY} material={material} position-y={y} scale={[1.14, 0.68, 1.14]} />;
+    case "muffs":
+      return (
+        <>
+          <mesh geometry={HELMET_GEOMETRY} material={material} position-y={y} />
+          <mesh geometry={BRIM_GEOMETRY} material={material} position-y={y} />
+          {/* The defenders themselves are plant metal, not hat: they are equipment, and the contrast
+              is what makes the widened silhouette read as two objects rather than as a fat head. */}
+          <mesh geometry={MUFF_GEOMETRY} material={TOOL_METAL} position={[-0.175, y - 0.05, 0]} />
+          <mesh geometry={MUFF_GEOMETRY} material={TOOL_METAL} position={[0.175, y - 0.05, 0]} />
+        </>
+      );
+  }
+}
+
+/** What the figure carries at its left side. `none` draws nothing at all — see `CarryKind`. */
+function CarriedTool({ carry }: { carry: CarryKind }) {
+  if (carry === "none") return null;
+  return (
+    <group position={TOOL_POSITION}>
+      {carry === "roll" && (
+        // Tilted, so it reads as tucked under an arm rather than as a pipe standing beside a leg.
+        <mesh geometry={ROLL_GEOMETRY} material={TOOL_PALE} rotation={[0.24, 0, 0.42]} />
+      )}
+      {carry === "spanner" && (
+        <>
+          <mesh geometry={SPANNER_SHAFT_GEOMETRY} material={TOOL_METAL} />
+          <mesh geometry={SPANNER_HEAD_GEOMETRY} material={TOOL_METAL} position-y={0.17} />
+        </>
+      )}
+      {carry === "lens" && (
+        <>
+          <mesh geometry={LENS_RING_GEOMETRY} material={TOOL_METAL} position-y={0.13} />
+          <mesh geometry={LENS_HANDLE_GEOMETRY} material={TOOL_DARK} />
+        </>
+      )}
+      {carry === "clipboard" && (
+        <>
+          {/* Turned a few degrees out of the body, so the board has a face from the camera's side. */}
+          <mesh geometry={CLIPBOARD_GEOMETRY} material={TOOL_PALE} rotation-y={-0.5} />
+          <mesh geometry={CLIP_GEOMETRY} material={TOOL_METAL} position-y={0.15} rotation-y={-0.5} />
+        </>
+      )}
+      {carry === "valve" && (
+        <mesh geometry={VALVE_GEOMETRY} material={TOOL_METAL} rotation={[0, Math.PI / 2, 0.2]} />
+      )}
+    </group>
+  );
+}
+
+/**
+ * Where a bubble floats: clear of the crown, and above the bypass spike so an ungated agent's marker
+ * and its bubble never grow through each other.
+ */
+const BUBBLE_Y = CROWN_Y + 0.95;
+
+/**
+ * How the `n`-th agent's bubble is lifted clear of its neighbour's, **in screen pixels**.
+ *
+ * Neighbours on the arc stand about 1.3 units apart and a bubble is far wider than that on screen, so
+ * without this a selected room's bubbles sit on top of each other — measured, in the first screenshot
+ * of two working agents, where one covered the other's text. Three levels, so two bubbles at the same
+ * height are three posts apart, which is enough room to be two bubbles.
+ *
+ * Pixels rather than world units, and that is the whole point of the second attempt: the bubble is a
+ * constant *screen* size at every zoom (it has no `distanceFactor`), so a stagger measured in world
+ * units is exactly the wrong unit — half a world unit separated them at close range and became seven
+ * pixels at the reading distance, which is where the collision actually happens.
+ */
+const BUBBLE_LEVELS = 3;
+const BUBBLE_LEVEL_RISE_PX = 19;
+
+/**
+ * A line over an agent's head saying what it is doing right now.
+ *
+ * **Drawn as DOM (`<Html>`), and therefore not animated at all.** It has no `distanceFactor` — on an
+ * orthographic camera drei multiplies that by `camera.zoom`, which once filled the screen with a
+ * single label — so it is a constant screen size at every zoom, which is also what a plan view wants.
+ * Nothing here moves under its own clock, so `hasMotion` is untouched by this whole feature; the one
+ * frame it *does* need is the one that repositions it after its text changes, which `frameloop="demand"`
+ * would otherwise never render, so it asks for that itself.
+ *
+ * No `occlude`, unlike the building labels — deliberately. A label is architecture and may hide behind
+ * a roof; a bubble is the factory saying something, and an approval request that disappeared because
+ * the operator orbited the camera would be the one message this floor must never lose.
+ *
+ * The stripe on the left is the agent's own status colour, from the one palette: the bubble and the
+ * vest under it are the same fact, and the chrome around it is the same white chip the building labels
+ * use so the floor has one voice for text.
+ */
+function ThoughtBubble({ bubble, level }: { bubble: Bubble; level: number }) {
+  const invalidate = useThree((s) => s.invalidate);
+  // drei positions `<Html>` inside the render loop, so a bubble whose words just changed needs one
+  // frame to be drawn — and on a demand loop nothing else will ask for it.
+  useEffect(() => {
+    invalidate();
+  }, [invalidate, bubble.text]);
+
+  return (
+    <Html position={[0, BUBBLE_Y, 0]} center>
+      <div
+        style={{
+          position: "relative",
+          // The stagger. On the inner element, so drei's own centring transform on the wrapper is
+          // left alone.
+          transform: `translateY(${-level * BUBBLE_LEVEL_RISE_PX}px)`,
+          font: "500 11px system-ui, sans-serif",
+          color: "#1c1c1c",
+          background: "rgba(255,255,255,0.92)",
+          borderTop: "1px solid #c3c9ce",
+          borderRight: "1px solid #c3c9ce",
+          borderBottom: "1px solid #c3c9ce",
+          borderLeft: `3px solid ${STATUS_COLOR[bubble.status]}`,
+          borderRadius: 9,
+          padding: "2px 7px",
+          whiteSpace: "nowrap",
+          // The figure owns every pointer event around it: a bubble that swallowed a click would make
+          // the building under it unselectable from exactly where the operator is looking.
+          pointerEvents: "none",
+          userSelect: "none",
+        }}
+      >
+        {bubble.text}
+        {/* The tail. Without it this is a second building label floating at head height; with it, it
+            belongs to the figure underneath. */}
+        <span
+          style={{
+            position: "absolute",
+            left: 9,
+            bottom: -5,
+            width: 0,
+            height: 0,
+            borderLeft: "4px solid transparent",
+            borderRight: "4px solid transparent",
+            borderTop: "5px solid rgba(255,255,255,0.92)",
+          }}
+        />
+      </div>
+    </Html>
+  );
+}
+
+/** One agent's walk to a bay and back: the clock the store fixed, and the route it implies. */
+interface Fetch {
+  errand: Errand;
+  path: WalkPath;
+}
+
+/**
+ * One agent, doing one of four things.
+ *
+ * - **Fetching** (`fetch` is set) — walking a path from its post to the loading bay a belt arrives at,
+ *   facing the direction of travel, and carrying the crate home at its side. The bob and the arm swing
+ *   are the same two lines as the working shuffle, driven along the path (see `STRIDE`).
+ * - **Working** — the shuffle and swing in place at its post.
+ * - **Blocked** — turned to the operator, hands out, and completely still.
+ * - **Anything else** — on its mark, facing out of its building, still.
+ *
+ * Animation happens **only** in the first two, for the same reason the beacon's does:
+ * `frameloop="demand"` renders no frames otherwise, so an idle figure has to be genuinely still rather
+ * than nominally animated. Its colour is its *own* status, not its room's — the whole point of a
+ * figure each is that you can see which one of them is the one that is stuck.
  */
 const AgentFigure = memo(function AgentFigure({
   id,
   status,
+  roleId,
   bypass,
   orchestrator,
+  bubbles,
+  bubbleLevel,
   x,
   z,
+  fetch,
 }: {
   id: string;
   status: FactoryStatus;
+  /**
+   * What this agent arrived as, or `null` for a plain one. Carried on the hat and in the hand and
+   * **never on the vest** — see `roleLook.ts` for why a role is a shape rather than a colour.
+   */
+  roleId: string | null;
   bypass: boolean;
   /** This is the factory's senior agent. See `MAST_GEOMETRY` for why it is a shape and not a hue. */
   orchestrator: boolean;
+  /** Whether this figure should say what it is doing. See `showsBubble` for who does and who does not. */
+  bubbles: boolean;
+  /** Which of `BUBBLE_LEVELS` heights this figure's bubble hangs at, so a room's bubbles do not stack. */
+  bubbleLevel: number;
   x: number;
   z: number;
+  /** This agent has been sent to a bay to meet a crate, or `undefined` if it is at its post. */
+  fetch?: Fetch;
 }) {
   const ref = useRef<Group>(null);
+  const body = useRef<Group>(null);
   const leftArm = useRef<Group>(null);
   const rightArm = useRef<Group>(null);
+  const crate = useRef<Group>(null);
   const working = status === "working";
+  const blocked = status === "blocked";
   const phase = useMemo(() => phaseOf(id), [id]);
   // Shuffle along the arc's tangent, which for a point on a circle centred on the building is the
   // perpendicular to its own radius — so the figure paces across the front rather than into the wall.
   const radius = Math.hypot(x, z) || 1;
   const tangentX = -z / radius;
   const tangentZ = x / radius;
+  const walkLength = useMemo(() => (fetch === undefined ? 0 : pathLength(fetch.path)), [fetch]);
+  // Where the figure stands and which way it looks when nothing is animating it.
+  const restYaw = blocked ? CAMERA_FACING_YAW : agentFacing(x, z);
 
   useFrame(({ clock }) => {
     const group = ref.current;
-    if (group === null || !working) return;
+    if (group === null) return;
+
+    if (fetch !== undefined) {
+      // Wall clock, not accumulated frame deltas: the errand's whole schedule is absolute, so a walk
+      // is exactly where it should be even after the tab rendered no frames at all.
+      const { phase: leg, t, carrying } = errandAt(fetch.errand, Date.now());
+      const step = walkAt(fetch.path, t);
+      // A step cycle per `STRIDE` of ground covered, so the feet match the distance.
+      const walked = t * walkLength;
+      const cycle = leg === "out" || leg === "back" ? (walked / STRIDE) * Math.PI : 0;
+      group.position.set(step.x, Math.abs(Math.sin(cycle)) * BOB_HEIGHT, step.z);
+      // Facing the way it is going — and, once it has stopped at the bay, still facing the bay,
+      // because that is the direction the last segment of the walk pointed in.
+      if (body.current !== null) body.current.rotation.y = step.yaw;
+      const swing = Math.sin(cycle) * ARM_SWING;
+      if (leftArm.current !== null) leftArm.current.rotation.set(swing, 0, 0);
+      // The carrying arm stays down: one hand holds the crate, the other still swings.
+      if (rightArm.current !== null) rightArm.current.rotation.set(carrying ? CARRY_ARM : -swing, 0, 0);
+      if (crate.current !== null) crate.current.visible = carrying;
+      return;
+    }
+
+    if (!working) return;
     const t = clock.elapsedTime * BOB_HZ * Math.PI + phase;
     group.position.y = Math.abs(Math.sin(t)) * BOB_HEIGHT;
     const along = Math.sin(t * 0.22) * SHUFFLE;
@@ -176,23 +544,35 @@ const AgentFigure = memo(function AgentFigure({
     if (rightArm.current !== null) rightArm.current.rotation.x = -swing;
   });
 
-  // Stopping work can happen on a frame that is never followed by another one, so the figure has to be
-  // put back on its mark explicitly rather than drifting to a halt wherever the last frame left it.
+  // Stopping work — or finishing an errand — can happen on a frame that is never followed by another
+  // one, so the figure has to be put back on its mark explicitly rather than drifting to a halt
+  // wherever the last frame left it. The yaw is restored here too: `rotation-y` is a declarative prop
+  // that React will not rewrite unless its value changed, and the frame loop has been mutating it.
   useEffect(() => {
-    if (working) return;
+    if (working || fetch !== undefined) return;
     ref.current?.position.set(x, 0, z);
-    if (leftArm.current !== null) leftArm.current.rotation.x = 0;
-    if (rightArm.current !== null) rightArm.current.rotation.x = 0;
-  }, [working, x, z]);
+    if (body.current !== null) body.current.rotation.y = restYaw;
+    const splay = blocked ? WAITING_ARMS : 0;
+    if (leftArm.current !== null) leftArm.current.rotation.set(0, 0, splay);
+    if (rightArm.current !== null) rightArm.current.rotation.set(0, 0, -splay);
+    if (crate.current !== null) crate.current.visible = false;
+  }, [working, blocked, fetch, x, z, restYaw]);
 
+  const bubble = useAgentBubble(id, bubbles);
   const vest = VEST_MATERIALS[status];
-  const helmet = orchestrator ? ORCHESTRATOR_HELMET_MATERIAL : HELMET_MATERIAL;
+  const look = roleLook(roleId);
+  // The role decides the hat's shape; seniority overrules its colour and nothing else.
+  const helmet = orchestrator
+    ? ORCHESTRATOR_HELMET_MATERIAL
+    : (HAT_MATERIALS[look.color] ?? HELMET_MATERIAL);
+  const splay = blocked ? WAITING_ARMS : 0;
 
   return (
     <group ref={ref} position={[x, 0, z]}>
       {/* Faced outward from the building, so nobody has their back to the camera or their nose in
-          the wall. The whole body turns, which is why this wraps everything below it. */}
-      <group rotation-y={agentFacing(x, z)}>
+          the wall — except a blocked figure, which turns to the operator. The whole body turns, which
+          is why this wraps everything below it. */}
+      <group ref={body} rotation-y={restYaw}>
         {/* No castShadow anywhere on a figure: a 1.5-unit body inside a 120-unit shadow frustum
             contributes a couple of pixels, and N figures re-rendering the shadow map every frame is
             a real cost for it. */}
@@ -201,16 +581,32 @@ const AgentFigure = memo(function AgentFigure({
         <mesh geometry={SHOULDER_GEOMETRY} material={vest} position-y={TORSO_TOP - 0.02} />
 
         {/* Arms pivot at the shoulder, which is why each is a group with the mesh hung below it. */}
-        <group ref={leftArm} position={[-0.27, TORSO_TOP - 0.06, 0]}>
+        <group ref={leftArm} position={[-0.27, TORSO_TOP - 0.06, 0]} rotation-z={splay}>
           <mesh geometry={ARM_GEOMETRY} material={SLEEVE_MATERIAL} position-y={-0.21} />
         </group>
-        <group ref={rightArm} position={[0.27, TORSO_TOP - 0.06, 0]}>
+        <group ref={rightArm} position={[0.27, TORSO_TOP - 0.06, 0]} rotation-z={-splay}>
           <mesh geometry={ARM_GEOMETRY} material={SLEEVE_MATERIAL} position-y={-0.21} />
         </group>
 
+        {/* The crate, on the return leg only — mounted for the whole errand and made visible when the
+            box is actually in hand, so no mesh is created or destroyed mid-walk. */}
+        {fetch !== undefined && (
+          <group ref={crate} visible={false} position={CARRIED_POSITION}>
+            <mesh
+              geometry={CARRIED_GEOMETRY}
+              material={CARRIED_MATERIALS[packageToneIndex(fetch.errand.crateId)]}
+            />
+          </group>
+        )}
+
+        {/* The role, in the hand: five tools, one per work family, and the same vocabulary the room's
+            props are drawn from. Inside the facing group so it turns with the body. */}
+        <CarriedTool carry={look.carry} />
+
         <mesh geometry={HEAD_GEOMETRY} material={SKIN_MATERIAL} position-y={HEAD_Y} />
-        <mesh geometry={HELMET_GEOMETRY} material={helmet} position-y={HEAD_Y - 0.02} />
-        <mesh geometry={BRIM_GEOMETRY} material={helmet} position-y={HEAD_Y - 0.02} />
+        {/* The role, on the head: a silhouette per work family in one of five neutral values. It is
+            emphatically **not** a status — see `ROLE_HAT` for why there is no hue left to spend. */}
+        <Hat shape={look.shape} material={helmet} />
 
         {/* The standard is inside the facing group, so it turns with the figure and shows its face
             to the camera rather than its edge. */}
@@ -230,6 +626,11 @@ const AgentFigure = memo(function AgentFigure({
         )}
       </group>
 
+      {/* Outside the facing group, so it never turns edge-on with the body, and outside the arms so a
+          swinging arm cannot move it. It rides the group that bobs and walks, which is what keeps it
+          attached to the figure it is speaking for. */}
+      {bubble !== null && <ThoughtBubble bubble={bubble} level={bubbleLevel} />}
+
       {bypass && (
         <>
           <mesh
@@ -248,6 +649,11 @@ const AgentFigure = memo(function AgentFigure({
 /**
  * The agents standing in front of one building, on the arc `agentSlots` lays out. Subscribes to the
  * room's own sessions, so a status tick moves these figures and not the building behind them.
+ *
+ * It also resolves this room's errands into routes. **Which** agent goes and **when** it leaves are
+ * the store's (`scheduleErrands`, so a re-render cannot swap two agents mid-walk); the *route* is
+ * derived here from the same three pure functions the store used, so the two can never disagree about
+ * where the walk goes.
  */
 export const Agents = memo(function Agents({
   roomId,
@@ -257,7 +663,46 @@ export const Agents = memo(function Agents({
   kind: RoomInfo["kind"];
 }) {
   const agents = useRoomAgents(roomId);
+  // Selecting a building is what asks its agents to say what they are doing — see `showsBubble`.
+  const selected = useIsSelected(roomId);
+  const errands = useRoomErrands(roomId);
+  // Which way each errand's crate came from, and which way this room's belts leave: between them they
+  // say which of the drawn doors the agent is walking to. Flat numbers — see `useBeltDirections`.
+  const errandDirections = useRoomErrandDirections(roomId);
+  const beltDirections = useBeltDirections(roomId);
   const slots = useMemo(() => agentSlots(agents.length, kind), [agents.length, kind]);
+
+  const fetches = useMemo(() => {
+    const byAgent = new Map<string, Fetch>();
+    for (const [i, errand] of errands.entries()) {
+      const index = agents.findIndex((a) => a.id === errand.agentId);
+      const post = slots[index];
+      // An errand whose agent has since left the room has nobody to walk it; `reapErrands` drops it
+      // when its clock runs out, and until then nothing is drawn.
+      if (post === undefined) continue;
+      const bay = bayForDirection(
+        kind,
+        beltDirections,
+        errandDirections[i * 2] ?? 0,
+        errandDirections[i * 2 + 1] ?? 0,
+      );
+      if (bay === undefined) continue;
+      byAgent.set(errand.agentId, { errand, path: fetchPath(kind, post, bay) });
+    }
+    return byAgent;
+  }, [errands, errandDirections, beltDirections, agents, slots, kind]);
+
+  // A bubble can only quote a log this tab actually holds, and the tab holds a session's log only
+  // once it has subscribed — the console does the same for the agent you click. So the floor follows
+  // exactly the agents it is about to speak for: the selected room's, and any blocked agent anywhere.
+  // Idempotent (`wsClient` keeps a set) and asked for from the last contiguous seq, not from zero.
+  //
+  // The socket call is a component's, not the store's: the store never talks to the socket.
+  useEffect(() => {
+    for (const agent of agents) {
+      if (showsBubble(agent, selected)) subscribe(agent.id);
+    }
+  }, [agents, selected]);
 
   return (
     <>
@@ -266,10 +711,14 @@ export const Agents = memo(function Agents({
           key={agent.id}
           id={agent.id}
           status={agentStatus(agent)}
+          roleId={agent.roleId}
           bypass={agent.autonomy === "bypass"}
+          bubbles={showsBubble(agent, selected)}
+          bubbleLevel={i % BUBBLE_LEVELS}
           orchestrator={agent.isOrchestrator}
           x={slots[i][0]}
           z={slots[i][1]}
+          fetch={fetches.get(agent.id)}
         />
       ))}
     </>

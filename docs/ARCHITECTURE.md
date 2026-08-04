@@ -1,7 +1,11 @@
 # Fabrica — Architecture
 
-Status: **draft for review** (2026-08-03). Canonical decisions live in the design spec
-(`docs/superpowers/specs/2026-08-03-fabrica-design.md`); this file is the technical map.
+Status: **current as of 2026-08-04, end of M5** — read end to end against the code on that
+date and corrected where it had drifted (it was last written as a pre-M0 draft, and every
+milestone since had appended to it without anyone re-reading the whole). The design spec
+`docs/superpowers/specs/2026-08-03-fabrica-design.md` is where the product started and is
+kept as a historical record; **where the two disagree, this file and `CLAUDE.md` are right**.
+`docs/ROADMAP.md` carries what is deliberately *not* built.
 
 ## 1. System overview
 
@@ -21,10 +25,17 @@ Status: **draft for review** (2026-08-03). Canonical decisions live in the desig
 │  │ agent, WAL  │  │ report,      │  │ blockers    │  │ + 429 catch  │  │ per acct  │ │
 │  │ event log   │  │ push-inject  │  │             │  │ + scheduler  │  │ + login   │ │
 │  └──────┬──────┘  └──────────────┘  └─────────────┘  └──────────────┘  └───────────┘ │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  ┌──────────────┐  ┌───────────┐ │
+│  │ RoleLibrary │  │ Onboarding   │  │ Chronicle   │  │ MetricsStore │  │ Factory-  │ │
+│  │ roles/*.yaml│  │ CLAUDE.md?   │  │ ADR files + │  │ burn rate +  │  │ Portability│ │
+│  │ + user dir  │  │ interview +  │  │ FTS5 index  │  │ cost, from   │  │ export /  │ │
+│  │ (M1c)       │  │ proposals    │  │ (M3b)       │  │ snapshots +  │  │ import,   │ │
+│  │             │  │ (M1c)        │  │             │  │ the log (M5) │  │ no secrets│ │
+│  └─────────────┘  └──────────────┘  └─────────────┘  └──────────────┘  └───────────┘ │
 └─────────┼─────────────────────────────────────────────────────────────────────────────┘
-          │ M0–M3: host subprocesses (per-account CLAUDE_CONFIG_DIR)
-          │ M4: per-room container runtime (agent-runner image, unix-socket transport,
-          │     egress firewall, CPU/memory/pid caps) — see §2.4
+          │ host: subprocesses of the server (per-account CLAUDE_CONFIG_DIR) — the default
+          │ container: per-room container runtime (agent-runner image, unix-socket
+          │     transport, egress firewall, CPU/memory/pid caps) — see §2.4
           ▼
    Claude Code sessions (one per agent) ──► project workspace (rooms = subfolders)
 ```
@@ -44,7 +55,11 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   calling the SDK's `setPermissionMode()`, because `bypass` needs a spawn-time flag that
   cannot be added to a running query.) Captures `session_id` from the init message and
   persists it → restart recovery via `options.resume`. `canUseTool` callback is forwarded
-  to the browser as an approval card (with per-room auto-approve policies).
+  to the browser as an approval card. **There are no per-room auto-approve policies** — an
+  earlier draft of this document promised them and nothing was ever built; what exists is
+  per-*session* autonomy (below), the role's own `allowedTools` (unused by every shipped
+  preset), and the one blanket exception for the factory's own in-process tools
+  (`docs/decisions/0002-factory-tools-are-not-gated.md`).
 - **Event log** — append-only SQLite table `events(session_id, seq, ts, type, payload)`.
   Source of truth for the UI; the WebSocket is a lossy tail. Client reconnect sends
   `{sessionId, afterSeq}` and replays. (Pattern proven by Vibe Kanban's MsgStore and
@@ -191,6 +206,47 @@ evidence: `docs/decisions/0001-bun-runtime-keep-vite.md`.
   `.claude/skills/` so the repo stays self-contained — never overwriting a directory that is
   already there. `sessions.role_id` holds the *id*, so an edited preset is not frozen onto agents
   created before it.
+- **MetricsStore** (`metricsStore.ts`, M5) — burn rate and cost, and the two are of very
+  different quality on purpose.
+  - **The burn rate is a measurement.** It is the least-squares slope of `usage_snapshots`
+    (M2's persisted utilisation history), per window, projected to `LIMIT_PAUSE_PERCENT` —
+    the line the scheduler actually acts on, not 100 %. The window that runs out **soonest**
+    wins rather than the fullest one, because that is the one the operator's afternoon
+    depends on. A window that rolled *breaks* the series rather than flattening it (96 % → 3 %
+    is a new window, not a rate of minus ninety-three points an hour).
+  - **A projection nobody can make says "unknown", with the reason in words.** Fewer than
+    two readings, a series spanning under 15 minutes, or a window that is not filling all
+    produce a null figure. Guessing here would be worse than a blank: the operator would
+    plan around it.
+  - **The cost is a reconstruction, and is marked approximate everywhere.** There is **no
+    pricing table anywhere in SuperFabric** — the figure comes from `turn_complete.costUsd`,
+    which is the CLI's own `total_cost_usd`. That field **accumulates per `query()`** rather
+    than per turn (established from the CLI bundle, not from a live turn — see
+    `server/notes/agent-sdk-api.md`, "What `total_cost_usd` counts"), so a turn's cost is the
+    delta from the previous `turn_complete` in the same session and a value that goes
+    *backwards* is a restarted executor, not a refund. Aggregated per account (machine-wide,
+    like an account), per room (per floor, because a room belongs to one), and separately for
+    the ambient `~/.claude`. `list_metrics` reads nothing over the network and spends no quota.
+- **FactoryPortability** (`factoryPortability.ts`, M5) — moving a factory.
+  - **The export carries no secrets, and that is a test rather than a promise.** Rooms (name,
+    folder *relative to the root*, position, runtime, account binding **by label**), the
+    agents that staffed them, the board, and the decision index. No token, nothing read from
+    any `CLAUDE_CONFIG_DIR`, no account id, and **no absolute path at all** — a shared factory
+    describes a shape, not a filesystem. `test/factoryPortability.test.ts` serialises a
+    populated export and greps the bytes for `sk-ant-oat`/`sk-ant-ort`/`sk-ant-api`/`whsec_`/
+    `.credentials.json`, for every configured config directory, for every account id and for
+    the project root, and fails on any hit.
+  - **Import goes through the ordinary `RoomManager.createRoom`**, so name safety, root
+    containment and never-overwriting-a-charter hold *because it is the same code path*.
+  - **It reports what it could not do.** A room that already exists, an account label this
+    machine lacks (the room is left unbound, not bound to something near), a task naming a
+    room that did not arrive, an ADR that is not in this repository, and the agents it
+    described. A partial import that claimed to be complete is worse than a refused one.
+  - **Two deliberate refusals.** Agents are *described, not started*: a conversation does not
+    travel with an export, and spawning a CLI per described agent when a file is opened is
+    not something anyone asked for. And a decision is still a file — `Chronicle.indexImported`
+    writes an index row only when the ADR is actually present, reading the body off disk so
+    there is never a second copy of a decision's text.
 - **Per-agent autonomy** — alongside the role bundle, every session carries an `autonomy` field
   (`attended` | `auto` | `bypass`, persisted in `sessions.autonomy` and re-applied on resume) that
   maps to the Agent SDK's `permissionMode` inside the executor. `auto` is the default: the CLI's
@@ -208,8 +264,21 @@ Two layers, by explicit product decision — the factory must *look like a facto
 - **3D scene (WebGL)** — isometric factory floor: the project block is the main
   building, rooms are workshop buildings, inter-room links are **conveyor paths**
   (`CatmullRomCurve3` splines) with package meshes animating along them when messages
-  flow. Agent status renders on the buildings (lights/smoke/badges); later milestones
-  add small animated agent characters (glTF + AnimationMixer) working inside rooms.
+  flow. Agent status renders on the buildings (beacon, lit windows, chimney smoke).
+  **Agents act (M5), and the motion is procedural rather than purchased**: when a package
+  arrives on a belt, a free agent in that room walks from its post to the loading bay the
+  belt enters and carries the crate back (`scene/errands.ts` is the pure scheduling and
+  path maths, tested without a canvas); an agent waiting on an approval faces the camera and
+  stands still; a room with nobody home visibly piles crates at its bay (`BayPile.tsx`).
+  A thought bubble over a working figure says what it is doing, from the same one-line
+  summariser the console uses (`gist.ts` — one answer, so the two surfaces cannot disagree).
+  Atmosphere is `Chimney.tsx` (an instanced plume while a room works, fading after it stops),
+  conditional window light, belt slats that crawl only while a package is on that belt, and
+  per-room props that reflect the work (`scene/props.ts`), all of it derived from state the
+  store already holds. **The glTF + AnimationMixer characters this document originally
+  promised were dropped on purpose** — see the M5 section of the roadmap for the reasoning
+  (motion tied to the event log is more informative, and it avoids licensing third-party
+  character assets into an MIT repository).
   Camera: orthographic, opening on an isometric view, with `MapControls` — pan, zoom
   (2…400), orbit and tilt, the tilt clamped just above the horizon so the camera can
   never go under the floor. Perf discipline:
@@ -226,8 +295,12 @@ Two layers, by explicit product decision — the factory must *look like a facto
   the free top strip, mirroring the project switcher — not a fourth edge panel, because the middle
   of the screen is the product), limit meters (per
   account: 5h + weekly + per-model, reset countdowns; an estimate is hatched and carries a `≈`,
-  a badge and its reason, because a guess shown as a measurement is worse than a gap), approval
-  cards, agent chat drawer,
+  a badge and its reason, because a guess shown as a measurement is worse than a gap),
+  **the burn rate and cost-equivalent under those meters** (`hud/BurnRate.tsx` — a duration
+  at a resolution the data supports, "Time left: unknown" plus the server's reason where
+  there is no projection, and "this factory's spend, by room"), **export/import in the
+  project switcher** (`hud/FactoryTransfer.tsx` — the import's *problems* list is the point
+  of the surface and stays up until dismissed), approval cards, agent chat drawer,
   orchestrator console. Labels pinned to buildings use drei `<Html>`.
   The **orchestrator is marked on the floor rather than in a widget of its own**: it is an agent in
   the project room, so its figure carries a standard, its helmet is the project block's slate, the
@@ -272,7 +345,21 @@ so fitting is deliberately "put the floor plan back" rather than "keep my angle"
 and the slab are sized for the widest zoom, so the edge of the world is never the thing on screen.
 
 ### 2.3 Shared (`packages/shared`)
-Protocol types: WS envelopes, event payloads, bus message schema, task schema. Zod.
+Zod, and three kinds of thing that must have exactly one definition:
+
+- **the wire protocol** (`protocol.ts`) — `SessionEvent`, `ClientMessage`, `ServerMessage`, and
+  the shapes they carry (rooms, tasks, bus messages, accounts, usage, roles, onboarding, the
+  M5 metrics and the factory export). Constants the *server acts on and the UI draws* live here
+  too, so a bar cannot turn amber at a different number from the one that warns the agents:
+  `LIMIT_WARN_PERCENT`, `LIMIT_PAUSE_PERCENT`, `USAGE_POLL_INTERVAL_MS`.
+- **the container↔server envelope** (`runner.ts`) — declared here because *both* ends validate
+  it from one schema.
+- **the SDK→`SessionEvent` mapping** (`sdkEvents.ts`) — here because there are now two hosts for
+  a session (in-process and containerised) and their transcripts must be byte-identical; two
+  copies of this mapping would make that a claim rather than a fact.
+
+Plus `layout.ts` (the ring the floor places rooms on, shared so the server can seed a new
+room's position).
 
 ### 2.4 Agent runtime placement (M4)
 
@@ -376,18 +463,34 @@ their choice — but the UI now distinguishes the two: `ungated · uncontained` 
 <project-root>/
   CLAUDE.md                  # project-wide context; its ABSENCE is what "un-onboarded" means,
                              # and the onboarding agent writes it (§2.1)
-  .fabrica/                  # factory state: fabrica.db (SQLite), layout.json, accounts.json (no secrets)
+  README.md                  # also written by the onboarding interview
+  docs/decisions/NNNN-*.md   # the Chronicle's ADRs — the artefact; the DB row is an index (§2.1)
   attachments/               # files the operator pasted, dropped or uploaded at the project
   backend/                   # a room
     CLAUDE.md                # room charter: responsibility, interfaces, conventions
-    .claude/agents/*.md      # room subagents, skills
+    .claude/skills/<name>/   # skills a role installed here, so the repo stays self-contained
     attachments/             # …or at this room, when it was the selected one
     ...code...
   frontend/ ...
 ```
 
-Room = folder. Deleting Fabrica leaves a normal repo. Room agents run with `cwd` =
-room folder and `--add-dir` for explicitly shared paths.
+**The state directory is not under the project root by default** and holds one file plus one
+socket:
+
+```
+<data dir>/                  # $SUPERFABRIC_DATA, else ./.fabrica relative to the server's cwd
+  fabrica.db                 # SQLite (WAL): everything. Rooms' positions live in `rooms`,
+                             # accounts in `accounts` — there is no layout.json and no
+                             # accounts.json, whatever earlier drafts of this file said.
+  run/runner.sock            # the container transport (§2.4); $SUPERFABRIC_RUNNER_SOCKET_DIR
+  roles/*.yaml               # optional: the operator's own role presets, overriding by id
+```
+
+Room = folder. Deleting Fabrica leaves a normal repo. Room agents run with `cwd` = the room
+folder and nothing else is added to their reach: **`--add-dir` / `additionalDirectories` is
+not used anywhere** (an earlier draft of this document said it was), so a host agent's *reach*
+is the operator's whole filesystem and a contained agent's is its three mounts. The room
+folder is where it starts, not a boundary.
 
 ## 4. Key flows
 
@@ -429,6 +532,15 @@ and nobody is moved. At `resets_at` (or as soon as a reading *taken after the pa
 rolled) the scheduler restarts exactly those sessions with `options.resume` on the same config dir
 and injects "you were paused… this is the same conversation, carry on".
 
+**Moving a factory** (built in M5): `export_project` reads the asking socket's own floor and
+answers with one JSON document — rooms, staffing, board, decision index, accounts by label,
+**no absolute path and no credential** → the browser saves it → `import_factory {root, factory}`
+on any server parses it with `FactoryExport`, adopts or creates the project for that root,
+and creates each room through the ordinary `createRoom`. Everything it could not do comes back
+in `problems` (a colliding room, a missing account label, an ADR the repository does not hold,
+and the agents it described but did not start), the socket is moved onto the floor it just
+built, and every other tab is told the switcher gained an entry.
+
 **Crash recovery**: on boot, server reads `sessions` table, resumes every session marked
 active (`options.resume` + JSONL transcripts persisted in each account's config dir).
 
@@ -436,7 +548,8 @@ active (`options.resume` + JSONL transcripts persisted in each account's config 
 
 | Concern | Choice | Why |
 |---|---|---|
-| Canvas | react-three-fiber + drei (Three.js) | MIT; true 3D factory (buildings, conveyors, packages, later agent characters) + DOM overlay for 2D panels; React Flow superseded by the 3D directive, tldraw rejected (license) |
+| Canvas | react-three-fiber + drei (Three.js) | MIT; true 3D factory (buildings, conveyors, packages, agent figures that walk) + DOM overlay for 2D panels; React Flow superseded by the 3D directive, tldraw rejected (license). Agent motion is **procedural**, driven by the event log — no glTF characters, by the M5 decision |
+| HUD | Tailwind v4 + Radix primitives vendored as our own source (`web/src/ui/`) + lucide-react | all MIT; no config file (the theme is `@theme` in `index.css`), and every colour that *means* something is generated from `scene/palette.ts` so a panel and a beacon cannot disagree — see decision 0003 |
 | Agent driving | TS Agent SDK, streaming-input | multi-turn steering, interrupt, resume, canUseTool, in-process MCP |
 | Transport | WebSocket (ws), multiplexed | bidirectional (approvals/interrupts), unanimous in prior art |
 | Server runtime | Bun 1.3+ (web stays on Node 22+ / Vite) | runs TS directly and ships SQLite, so no `tsx` and no native module; vitest is Vite-native so the web keeps Vite — see decision 0001 |
@@ -451,8 +564,8 @@ active (`options.resume` + JSONL transcripts persisted in each account's config 
 |---|---|
 | `/api/oauth/usage` is undocumented, may change | Adapter interface; JSONL estimation fallback; feature-flag |
 | ToS: headless subscription use | Personal accounts only, no pooling/rotation-as-a-service, no shared credentials; document clearly; API-key fallback exists |
-| Headless OAuth login impossible in container | Login happens out-of-band on host (hidden PTY flow); containers only mount ready profiles |
-| Concurrent token refresh across sessions of one account | One config dir per account shared by its sessions; serialize refresh via server-side lock; monitor for invalidation |
+| Headless OAuth login impossible in container | Login happens out-of-band on the host and **needs no PTY at all** — `claude auth login` prints its URL over a plain pipe and reads the code from stdin (decision 0004; the "hidden PTY flow" this row used to name was probed and not needed). Containers only mount a ready profile |
+| Concurrent token refresh across sessions of one account | **Not mitigated, and this row used to claim it was.** One config dir per account is enforced (`create` + a UNIQUE column + `realpath`), so two *accounts* can never share a credentials file. Several sessions of the *same* account do share one, and the CLI rewrites the refresh token in place; SuperFabric has **no server-side refresh lock** — the "serialize refresh" this row promised was never built, the CLI's own behaviour there is undocumented, and no failure has been observed. Treat it as a known gap, not a handled risk |
 | SDK/CLI breaking changes (fast-moving) | Pin versions; executor abstraction layer (Vibe Kanban pattern) so CLI-flags path can replace SDK if needed |
 | 3D scene perf with many live updates | instanced meshes, zustand per-object selectors, demand frameloop; art style is low-poly stylized (cheap to render and to produce) |
-| 3D asset production (buildings, packages, characters) | start with primitive/procedural low-poly geometry, introduce glTF assets incrementally; overlay panels carry the information load so the scene can stay simple |
+| 3D asset production (buildings, packages, characters) | Resolved by **not producing assets**: everything on the floor is primitive/procedural low-poly geometry and every figure's motion is derived from the event log. The "introduce glTF assets incrementally" plan was dropped in M5 — motion tied to real state is more informative than a purchased mesh, and it keeps third-party character licences out of an MIT repository |

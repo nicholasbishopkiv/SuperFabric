@@ -9,13 +9,17 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { useState } from "react";
-import { useAccounts, useAccountUsage, useFabric, useUsage } from "../store";
+import { useShallow } from "zustand/react/shallow";
+import {
+  useAccountMetrics, useAccounts, useAccountUsage, useAmbientCost, useFabric, useRoomCosts, useUsage,
+} from "../store";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { FieldNote, Input } from "../ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { cn } from "../ui/utils";
 import { LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT } from "@superfabric/shared";
+import { BurnRate, formatUsd } from "./BurnRate";
 import { UsageMeters } from "./UsageMeters";
 import { send } from "../wsClient";
 
@@ -188,6 +192,7 @@ function LoginFlow({ account, connected }: { account: AccountInfo; connected: bo
 /** One account: whether it can actually run anything, where its credentials live, and the login. */
 function AccountRow({ account, connected }: { account: AccountInfo; connected: boolean }) {
   const usage = useAccountUsage(account.id);
+  const metrics = useAccountMetrics(account.id);
   return (
     <li className="rounded-[3px] border border-line/60 bg-panel-sunken/30 px-2 py-1.5">
       <div className="flex items-center gap-1.5">
@@ -225,8 +230,61 @@ function AccountRow({ account, connected }: { account: AccountInfo; connected: b
       {/* Only for an account that could have a reading at all: a meter under "not logged in" would
           be answering a question the operator has not reached yet. */}
       {account.credentialsPresent && <UsageMeters usage={usage} />}
+      {/* The projection sits directly under the meters it is derived from: the bars say how full the
+          windows are, this says how long that leaves — the question the operator asks next. */}
+      {account.credentialsPresent && <BurnRate burn={metrics?.burn} cost={metrics?.cost} />}
       <LoginFlow account={account} connected={connected} />
     </li>
+  );
+}
+
+/**
+ * Where this factory's quota went, by department — and what the operator's own `~/.claude` spent.
+ *
+ * In the accounts popover rather than on the room panel, because it answers the question directly
+ * after "how long do I have": *where is it going*. It is the one thing here that is **per project**
+ * (a room belongs to one floor, unlike a subscription), which is why the heading says so out loud
+ * rather than leaving the operator to wonder whether they are looking at every factory at once.
+ *
+ * Rooms that have cost nothing are simply absent: a list of eleven rooms at $0.00 buries the two that
+ * are spending.
+ */
+function FactorySpend() {
+  const rooms = useFabric(useShallow((s) => s.rooms));
+  const costs = useRoomCosts();
+  const ambient = useAmbientCost();
+  if (costs.length === 0 && (ambient === null || ambient.week.usd === 0)) return null;
+
+  const nameOf = (roomId: string): string => rooms.find((r) => r.id === roomId)?.name ?? "a former room";
+  return (
+    <div className="mt-2 border-t border-line pt-2">
+      <div className="text-2xs font-semibold uppercase tracking-wide text-fg-faint">
+        This factory&rsquo;s spend, by room
+      </div>
+      <ul className="mt-1 space-y-0.5">
+        {costs.map((room) => (
+          <li key={room.roomId} className="flex items-baseline gap-1.5 text-2xs">
+            <span className="truncate text-fg-muted">{nameOf(room.roomId)}</span>
+            <span className="ml-auto shrink-0 font-mono tabular-nums text-fg-muted">
+              ≈{formatUsd(room.cost.day.usd)} <span className="text-fg-faint">/ 24 h</span>
+            </span>
+            <span className="shrink-0 font-mono tabular-nums text-fg-muted">
+              ≈{formatUsd(room.cost.week.usd)} <span className="text-fg-faint">/ 7 d</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+      {/* Agents with no account bound run on the operator's own `~/.claude`, which has no row above to
+          hang a figure on — so it is said here rather than folded into an account that never ran it. */}
+      {ambient !== null && ambient.week.usd > 0 && (
+        <FieldNote>
+          Agents on your own <code className="font-mono">~/.claude</code> (no account bound):{" "}
+          ≈{formatUsd(ambient.day.usd)} in 24 h, ≈{formatUsd(ambient.week.usd)} in 7 d. Every figure
+          here is a cost-equivalent from the CLI&rsquo;s own numbers — on a subscription no money
+          changes hands per turn.
+        </FieldNote>
+      )}
+    </div>
   );
 }
 
@@ -314,6 +372,8 @@ export function AccountSwitcher() {
             </li>
           )}
         </ul>
+
+        <FactorySpend />
 
         <form onSubmit={submit} className="border-t border-line pt-2">
           <div className="flex gap-1.5">

@@ -10,7 +10,9 @@ import { registerAttachmentRoutes } from "./attachmentRoutes.js";
 import { Chronicle } from "./chronicle.js";
 import { openDb } from "./db.js";
 import { EventStore } from "./eventStore.js";
+import { FactoryPortability } from "./factoryPortability.js";
 import { LimitMonitor } from "./limitMonitor.js";
+import { MetricsStore } from "./metricsStore.js";
 import { FactoryBus } from "./factoryBus.js";
 import { OnboardingManager } from "./onboarding.js";
 import { ProjectManager } from "./projectManager.js";
@@ -165,8 +167,15 @@ const logins = new AccountLoginManager({ accounts, onChange: () => hub.announceA
 // So one `AccountInfo` describes the whole account — the row, whether it has credentials, and where
 // its login has got to — rather than the UI joining two lists that can disagree.
 accounts.setLoginStateSource((id) => logins.stateOf(id));
+// Burn rate and cost. The projection is the slope of the readings `limits` has already persisted, and
+// the cost is reconstructed from the event log — so this reads nothing over the network and spends no
+// quota, which is why a client may ask for it whenever it likes.
+const metrics = new MetricsStore(db, accounts, projects);
+// Moving a factory. Everything it needs is already here; nothing it produces contains a credential —
+// accounts travel as the labels the operator typed, and an import re-binds them by hand.
+const portability = new FactoryPortability({ db, projects, rooms, accounts, tasks, chronicle });
 hub = new WsHub(store, mgr, rooms, projects, {
-  tasks, bus, router, chronicle, accounts, logins, limits, roles, onboarding,
+  tasks, bus, router, chronicle, accounts, logins, limits, roles, onboarding, metrics, portability,
 });
 
 // `.credentials.json` appearing is how the server learns a login finished — and it works whether the

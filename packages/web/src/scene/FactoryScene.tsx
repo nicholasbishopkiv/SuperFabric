@@ -1,5 +1,5 @@
 import { MapControls } from "@react-three/drei";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { useCallback, useEffect } from "react";
 import { useFabric, useHasMotion } from "../store";
 import { Buildings } from "./Buildings";
@@ -61,9 +61,34 @@ export function FactoryScene() {
           need: the drag has to silence them, and the framing has to notice the operator using them. */}
       <RoomDrag />
       <CameraFraming />
+      <FloorClock />
       <RedrawOnStoreChange />
     </Canvas>
   );
+}
+
+/**
+ * The one place the render loop hands time back to the store.
+ *
+ * Two things outlive the state that started them and have to be retired by somebody: an errand (the
+ * agent has walked back in, so the errand and the crate it carried are done with) and a chimney plume
+ * that has finished fading. Both are what keep `hasMotion` true, so **not** retiring them is a GPU
+ * spinning for ever — and both of those store changes are what let the canvas fall back to
+ * `frameloop="demand"`.
+ *
+ * One `useFrame` for the whole floor rather than one per room, and both actions are real no-ops when
+ * there is nothing to retire (they return the state object itself, which notifies no listener), so an
+ * animating factory pays two comparisons a frame for this.
+ */
+function FloorClock() {
+  const reapErrands = useFabric((s) => s.reapErrands);
+  const reapSmoke = useFabric((s) => s.reapSmoke);
+  useFrame(() => {
+    const now = Date.now();
+    reapErrands(now);
+    reapSmoke(now);
+  });
+  return null;
 }
 
 /**
@@ -128,10 +153,18 @@ function RedrawOnStoreChange() {
   // The waiting markers are static by design (see `WaitingPackages`), so nothing else will ever ask
   // for the frame that draws a new one — or erases the one that just left on a belt.
   const waiting = useFabric((s) => s.waiting);
+  // The crates piled at a bay are static for the same reason, so the same applies: one frame when a
+  // crate lands at an unstaffed door, and one more when somebody finally carries it in.
+  const bayCrates = useFabric((s) => s.bayCrates);
+  // …and the plume: `smokeUntil` clearing is what stops the fade, so the frame that draws the *last*
+  // state of it — no smoke at all — has to be asked for, because by then `hasMotion` is false again.
+  const smokeUntil = useFabric((s) => s.smokeUntil);
+  // An errand ending is the frame that puts the figure back on its mark with empty hands.
+  const errands = useFabric((s) => s.errands);
 
   useEffect(() => {
     invalidate();
-  }, [invalidate, rooms, sessions, selectedRoomId, packages, waiting]);
+  }, [invalidate, rooms, sessions, selectedRoomId, packages, waiting, bayCrates, smokeUntil, errands]);
 
   return null;
 }

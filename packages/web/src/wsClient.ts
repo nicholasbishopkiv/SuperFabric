@@ -51,6 +51,10 @@ export function connect(): void {
     // The meters beside them. A *query* over what the server already holds — asking never makes it
     // read the usage endpoint, so a tab reloading ten times costs the operator's quota nothing.
     send({ kind: "list_usage" });
+    // Burn rate and cost. A query over the same already-held state, and free for exactly the same
+    // reason. Per project, unlike the two above — the room half of the answer belongs to one floor —
+    // so `open_project` re-asks for it (see the server's `openProject`).
+    send({ kind: "list_metrics" });
     // The role library. Machine-wide like the accounts and asked for once per connect — an operator
     // who has just edited a preset gets it by reloading the tab, and the server re-reads the file.
     send({ kind: "list_roles" });

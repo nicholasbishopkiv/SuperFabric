@@ -175,15 +175,104 @@ export const DETAIL = {
   /** Glazing. Dark, because a window is a hole with glass in it. */
   window: "#27303a",
   /**
-   * The lights are on inside. Kept *very* faint on purpose: warm glass is the scene's only warm
-   * accent on a building, and any brighter it starts reading as the amber that means `blocked`.
+   * The lights are on inside — drawn **only when a room actually has a live agent in it**, which is
+   * what turned this from decoration into a reading. An empty department is a dark building.
+   *
+   * Kept *very* faint on purpose: warm glass is the scene's only warm accent on a building, and any
+   * brighter it starts reading as the amber that means `blocked`. That constraint is the reason the
+   * lit/dark distinction is carried by **temperature as well as brightness** — `windowDark` below is
+   * a colder, deader glass, so the pair reads at a glance without the lit state having to shout.
    */
   windowGlow: "#ffd7a0",
-  /** How hard that glow burns. Tuned down from 0.28, where the strips read as amber bars. */
-  windowGlowIntensity: 0.09,
+  /**
+   * How hard that glow burns. Tuned down from 0.28, where the strips read as amber bars — and
+   * deliberately left where it was when the *constant* glow was signed off, give or take a hair.
+   * Making a room occupied readable is not a licence to make a lit window louder than the version
+   * that had already been judged against the beacons; the new reading is carried by the **dark**
+   * state, which is new, rather than by brightening the lit one, which was not.
+   */
+  windowGlowIntensity: 0.1,
+  /**
+   * Glazing with nobody behind it: colder and darker than `window`, and not lit at all. Cold rather
+   * than merely darker because value alone at this size is almost invisible from the reading
+   * distance, and temperature is the floor's established way of separating two neutrals.
+   */
+  windowDark: "#1a2028",
   vent: "#8d949c",
   /** Roof glazing, pale so it reads as sky rather than as a panel. */
   skylight: "#cfe0ea",
+} as const;
+
+// ---- roles, and what a room is furnished with --------------------------------------------------
+
+/**
+ * The values a role's hard hat comes in — and the reason there is not a hue among them.
+ *
+ * The vest is the status and the trim is the department, so a role has to be said somewhere else.
+ * The obvious answer is a hue per role, and **the hue wheel is spoken for**: `STATUS_HUE_BANDS`
+ * takes red-through-amber, green and the bypass magenta; the accent band takes 190–300 for the
+ * departments; and the three slivers left over (60–90 yellow-green, 165–190 teal, 300–318
+ * violet-magenta) are exactly the ones `ACCENT_HUE_MIN`/`MAX` were pulled in to *avoid*, because
+ * even desaturated they read as a cousin of a status. Eleven role hues cannot be cut from that
+ * without one of them lying.
+ *
+ * So role is carried by **shape and value**: a hat silhouette per work family (see `roleLook.ts`)
+ * and one of these five neutrals per role inside it. Every one is under 15% saturation — below the
+ * point the floor's own rules treat a hue as meaning anything at all (`idle` is a 9% slate, and the
+ * accent tests already skip anything under 20% on those grounds) — so a hat can never be mistaken
+ * for a status, for a department or for the ungated marker. Two of them are colours the floor
+ * already wears: `white` is the hard hat every figure wore before roles existed, and `bone` is the
+ * paint on the slab.
+ */
+export const ROLE_HAT = {
+  white: "#eef0ee",
+  bone: FLOOR.paint,
+  steel: "#aab3bd",
+  slate: "#6b7683",
+  graphite: "#454c55",
+} as const;
+
+/**
+ * What a carried tool is made of. Three neutrals the floor already owns — plant metal, the bone
+ * white of its paint, and the near-black of a bay opening — because the tool's job is to change a
+ * **silhouette**, and a tool that also introduced a colour would be paying twice for one reading.
+ */
+export const CARRIED = {
+  metal: DETAIL.vent,
+  pale: FLOOR.paint,
+  dark: DETAIL.bay,
+} as const;
+
+/**
+ * A room's furniture: the bench, the rack, the desk a department works at.
+ *
+ * All cool near-neutrals, in the same family as the buildings they stand against, and deliberately
+ * **not** warm: warm cardboard is what *moves* on this floor (see `PACKAGE_COLORS`), so furniture
+ * borrowing that temperature would read as goods. A prop introduces no hue and no new meaning — it
+ * says what kind of work happens here and then gets out of the way. The one thing on a prop that
+ * ever changes is its lamp or screen, and that reuses `DETAIL.windowGlow` at the glazing's own
+ * intensity rather than inventing a second "somebody is working" colour.
+ */
+export const PROP = {
+  /** Legs, frames, uprights: the same steel as the stanchions on the kerb. */
+  frame: FLOOR.stanchion,
+  /** A worktop, seen from above and therefore the biggest face of any prop. */
+  top: "#7e8792",
+  /** A darker face: a rack's front, the back of a screen, the underside of a bench. */
+  panel: "#4c555f",
+  /** Paper, boards, a drawing pinned to a table. */
+  paper: FLOOR.paint,
+  /**
+   * How hard a prop's screen or lamp burns while the room is working.
+   *
+   * The glazing's own colour (`DETAIL.windowGlow`) but **not** its intensity, and that is a decision
+   * about area rather than a licence to be louder: a window strip is a couple of square units of a
+   * building's face, a monitor is a fifth of one, and at `windowGlowIntensity` the screen was
+   * invisible at the zoom a room is actually read at — measured, in the first screenshot of it. Four
+   * times the intensity over a twentieth of the area is still a fraction of the light a lit window
+   * puts on the floor, so the reading order is unchanged.
+   */
+  screenGlowIntensity: 0.42,
 } as const;
 
 /** The package meshes travelling the belts, and the belts themselves. */
@@ -199,6 +288,37 @@ export const SLAT_COLOR = "#6d757d";
 export const PACKAGE_COLORS = ["#c58a4a", "#b87d42", "#d09a5c", "#a97239"] as const;
 /** Legacy single-colour export, still the mean of the four. */
 export const PACKAGE_COLOR = PACKAGE_COLORS[0];
+
+/**
+ * Which of the four tones a package of this id wears. **One answer, used in three places** — the box
+ * riding a belt, the crate left standing at a bay and the crate in an agent's hands are the same
+ * object at three moments of its life, and a box that changed colour when somebody picked it up would
+ * read as a different box.
+ */
+export function packageToneIndex(id: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 8) % PACKAGE_COLORS.length;
+}
+
+/**
+ * Smoke from a roof vent, and what it fades towards as it rises and thins out.
+ *
+ * A **mid** grey rather than the white a plume is usually drawn as, and that is a decision about this
+ * particular floor: the camera looks *down*, so what is behind a workshop's roof is mostly the pale
+ * concrete slab, not sky. White smoke over `FLOOR.slab` is invisible. This sits between the slab and
+ * the project block's near-black walls, so the same plume reads against both — and it is a neutral, so
+ * it competes with nothing that means anything.
+ */
+export const SMOKE = {
+  /** Fresh from the pipe. */
+  fresh: "#8e969d",
+  /** Thinned out, on its way to nothing: lighter, so a plume dissolves upwards. */
+  thin: "#bcc2c7",
+} as const;
 
 /**
  * A message nobody has picked up yet, stacked at its sender's loading bay.

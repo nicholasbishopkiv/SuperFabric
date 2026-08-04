@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
-  ACCOUNT_CREDENTIALS_FILE, AGENT_MODELS, ATTACHMENTS_DIRNAME, AccountInfo, AccountUsage,
+  ACCOUNT_CREDENTIALS_FILE, AGENT_MODELS, ATTACHMENTS_DIRNAME, AccountBurn, AccountInfo, AccountUsage,
   AttachmentUploadResult, AutonomyMode,
   CHRONICLE_SEARCH_LIMIT, ChronicleHit, ClientMessage,
-  DEFAULT_AUTONOMY, LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT,
+  DEFAULT_AUTONOMY, FACTORY_EXPORT_FORMAT, FACTORY_EXPORT_NOTE, FACTORY_EXPORT_VERSION, FactoryExport,
+  FactoryMetrics, LIMIT_PAUSE_PERCENT, LIMIT_WARN_PERCENT,
   MAX_ATTACHMENT_BYTES, MessageInfo, MessageKind, ModelId,
   ProjectInfo, RoleSpec, RoomInfo, ServerMessage, SessionEvent, SessionStatus, TaskInfo, TaskStatus,
   USAGE_POLL_INTERVAL_MS, UsageWindow,
@@ -730,6 +731,116 @@ describe("protocol", () => {
       expect(ServerMessage.parse({
         kind: "sessions", sessions: [{ ...SESSION_INFO, roleId: "architect" }],
       })).toMatchObject({ sessions: [{ roleId: "architect" }] });
+    });
+  });
+  /**
+   * M5: burn rate and cost.
+   *
+   * The wire's job here is to make an unknown projection *representable* — a null hour figure with a
+   * reason beside it — because a schema that required a number would have forced a guess into it.
+   */
+  describe("burn rate and cost", () => {
+    const BURN = {
+      accountId: "a1", windowKey: "five_hour", windowLabel: "5-hour", percentPerHour: 12.5,
+      secondsToLimit: 7200, resetsFirst: false, approximate: false, samples: 21, spanSeconds: 3600,
+      unknown: null,
+    } as const;
+    const ROLLUPS = { day: { usd: 0.42, turns: 3 }, week: { usd: 1.75, turns: 11 } } as const;
+
+    it("carries a projection, and carries the absence of one just as precisely", () => {
+      expect(AccountBurn.parse(BURN).secondsToLimit).toBe(7200);
+      // The shape that matters: no figure, and the reason in the operator's words. A schema that made
+      // `secondsToLimit` required would have forced a guess into this position.
+      const unknown = AccountBurn.parse({
+        ...BURN, windowKey: null, windowLabel: null, percentPerHour: null, secondsToLimit: null,
+        samples: 1, spanSeconds: 0, unknown: "only 1 reading of 5-hour so far — a rate needs two",
+      });
+      expect(unknown.secondsToLimit).toBeNull();
+      expect(unknown.unknown).toContain("a rate needs two");
+    });
+
+    it("puts the metrics on the wire with the ambient account reported separately", () => {
+      const metrics = FactoryMetrics.parse({
+        accounts: [{ accountId: "a1", burn: BURN, cost: ROLLUPS }],
+        ambient: ROLLUPS,
+        rooms: [{ roomId: "r1", cost: ROLLUPS }],
+      });
+      expect(metrics.accounts[0]!.cost.week.usd).toBe(1.75);
+      // Agents on the operator's own `~/.claude` have no account row to hang spend on, so they get
+      // their own bucket rather than an invented entry in the account list.
+      expect(metrics.ambient.day.turns).toBe(3);
+      expect(ServerMessage.parse({ kind: "metrics", metrics }).kind).toBe("metrics");
+      expect(ClientMessage.parse({ kind: "list_metrics" }).kind).toBe("list_metrics");
+    });
+
+    it("refuses a negative dollar figure and a utilisation-free projection", () => {
+      expect(() => FactoryMetrics.parse({
+        accounts: [], ambient: { day: { usd: -1, turns: 0 }, week: { usd: 0, turns: 0 } }, rooms: [],
+      })).toThrow();
+    });
+
+  });
+
+  /**
+   * M5: moving a factory.
+   *
+   * The wire's job here is to make an export refuse to be anything but an export, and to keep an
+   * account a *label* rather than an id all the way across.
+   */
+  describe("exporting and importing a factory", () => {
+    const EXPORT = {
+      format: FACTORY_EXPORT_FORMAT,
+      version: FACTORY_EXPORT_VERSION,
+      exportedAt: 1_800_000_000,
+      note: FACTORY_EXPORT_NOTE,
+      project: { name: "payments-platform" },
+      accountLabels: ["work"],
+      rooms: [{
+        name: "backend", kind: "room", relativePath: "backend", position: { x: 1, z: 2 },
+        runtime: "container", accountLabel: "work",
+        agents: [{
+          roleId: "architect", model: "claude-opus-5", autonomy: "auto", accountLabel: "work",
+          isOrchestrator: false,
+        }],
+      }],
+      tasks: [{ title: "Ship it", detail: "", status: "open", roomName: "backend" }],
+      decisions: [{
+        number: 1, title: "Retries", relativePath: "docs/decisions/0001-retries.md",
+        roomName: "backend", createdAt: 1_800_000_000,
+      }],
+    } as const;
+
+    it("round-trips an export, and refuses a file that is not one", () => {
+      const parsed = FactoryExport.parse(EXPORT);
+      expect(parsed.rooms[0]!.agents[0]!.accountLabel).toBe("work");
+      // An account is a *label* on the wire, never an id: the whole re-binding story depends on it.
+      expect(JSON.stringify(parsed)).not.toContain("accountId");
+      expect(() => FactoryExport.parse({ ...EXPORT, format: "something-else" })).toThrow();
+      expect(() => FactoryExport.parse({ ...EXPORT, version: 99 })).toThrow();
+      // A room name has to survive being a folder segment on the importing machine too.
+      expect(() => FactoryExport.parse({
+        ...EXPORT, rooms: [{ ...EXPORT.rooms[0], name: "../escape" }],
+      })).toThrow();
+    });
+
+    it("takes a factory in as unparsed, so a bad file is refused by name rather than as a bad frame", () => {
+      const msg = ClientMessage.parse({ kind: "import_factory", root: "/srv/x", factory: { junk: 1 } });
+      expect(msg.kind).toBe("import_factory");
+      // The handler parses it with `FactoryExport` and says what is wrong; the frame itself is valid,
+      // which is what lets the operator be told "this is not an export" instead of "bad message".
+      expect(() => ClientMessage.parse({ kind: "import_factory", factory: {} })).toThrow();
+    });
+
+    it("carries an import's problems as a list, not as one string", () => {
+      const msg = ServerMessage.parse({
+        kind: "factory_import",
+        result: {
+          projectId: "p1", projectName: "payments-platform", projectCreated: true,
+          roomsCreated: ["frontend"], tasksCreated: 3, decisionsIndexed: 1, agentsDescribed: 4,
+          problems: ['room "backend" was not created: room "backend" already exists'],
+        },
+      });
+      expect(msg).toMatchObject({ kind: "factory_import", result: { problems: [expect.any(String)] } });
     });
   });
 });

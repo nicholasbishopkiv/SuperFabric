@@ -1,6 +1,14 @@
 # SuperFabric — Product Vision
 
-> 🇷🇺 Русский оригинал: [VISION.ru.md](VISION.ru.md)
+> 🇷🇺 Русский оригинал: [VISION.ru.md](VISION.ru.md) — a snapshot of 2026-08-03; this file
+> is the maintained one.
+
+**What this document is.** The brief the product was built against, kept as a statement of
+intent rather than rewritten into a description of what shipped. It was written on
+2026-08-03 and re-read against the code on 2026-08-04, at the end of M5: the paragraphs
+below are all now true of something that exists, except where they are marked. What is
+*not* built is listed in [ROADMAP.md](ROADMAP.md#what-is-not-built) rather than quietly
+softened here — a vision that edits itself to match the implementation stops being a vision.
 
 ## Refined brief
 
@@ -19,11 +27,13 @@
 > its documentation + one or more **agents** (Claude Code sessions), each with its own
 > model, skills, MCP servers, and permissions.
 >
-> Agents are created from a **roles library**: dozens of ready presets (architect,
-> designer, backend developer, QA, DevOps, tech writer…), where a role = a system prompt
-> + recommended skills/superpowers + plugins and MCP servers + a recommended model. Pick
-> a role and SuperFabric offers to attach the whole bundle — no need to understand
-> skills and configs. Presets are customizable and shareable.
+> Agents are created from a **roles library**: ready presets (architect, designer, backend
+> developer, QA, DevOps, tech writer…), where a role = a system prompt + recommended
+> skills + MCP servers + a recommended model. Pick a role and SuperFabric attaches the
+> whole bundle — no need to understand skills and configs. Presets are plain YAML files, so
+> they are customizable and shareable by copying them. *(**Eleven** ship, not the "dozens"
+> the first draft of this brief promised. The format is the deliverable and the count is
+> not; the honest version is that eleven is where the shipped library stands.)*
 >
 > Departments exchange tasks and questions through the **factory MCP bus** (the chat
 > room asks the payments room for push-notification webhooks — and receives the answer
@@ -41,12 +51,16 @@
 > folder, and the agent simply receives the path — the way a colleague would be handed a
 > file on disk rather than an attachment.
 >
-> Accounts are added right from the UI: the **"Add session"** button opens an embedded
-> terminal where the user logs into a Claude account; every new room or agent is then
-> bound to one of the registered accounts. Claude Code is the first supported engine;
-> the core is built against an **executor abstraction**, so other agents (Codex /
-> ChatGPT agents, Antigravity, …) plug in later — different strengths for different
-> tasks.
+> Accounts are added right from the UI: a link to open and a box for the code the Claude
+> sign-in page gives back, against a `CLAUDE_CONFIG_DIR` of that account's own; every new
+> room or agent is then bound to one of the registered accounts. *(The brief expected an
+> embedded terminal. Probing found `claude auth login` needs no TTY at all, so the flow is
+> two fields and there is no terminal emulator in the product —
+> [decision 0004](decisions/0004-account-login-over-a-pipe.md).)* Claude Code is the first
+> supported engine; the core is built against an **executor abstraction**, so other agents
+> (Codex / ChatGPT agents, Antigravity, …) plug in later — different strengths for
+> different tasks. *(Two implementations of that seam ship, and both drive Claude Code:
+> in-process, and inside a container. No second provider exists.)*
 >
 > The factory keeps a **chronicle**: every prompt, every decision, and its reasoning is
 > preserved — the stream of thought of how the product evolved. Any agent (or the user)
@@ -57,8 +71,18 @@
 > blocker, animated message flows between rooms — and can message any agent directly.
 > The **limit monitor** shows, per subscription, the exact picture of 5-hour and weekly
 > windows (including per-model buckets), warns agents when a limit approaches, pauses
-> them, and automatically resumes sessions from the same spot after reset. Sessions
-> survive restarts: all state is cached and restored.
+> them, and automatically resumes sessions from the same spot after reset — plus a burn
+> rate beside each meter, saying how long the account has at the rate it is going, or
+> **unknown** when there is too little history to say. Sessions survive restarts: all state
+> is cached and restored. *(The "exact picture" is exact only while Anthropic's own
+> undocumented usage endpoint answers. When it does not, a local estimate stands in and
+> every figure it produces is visibly marked as a guess — that honesty is part of the
+> vision, not a compromise of it.)*
+
+> **A factory can be moved.** The floor — its rooms, their staffing, the board and the index
+> of what has been decided — exports to one file and rebuilds elsewhere. Credentials never
+> travel with it: an account is referenced by the label its owner gave it, and re-bound by
+> hand on arrival.
 
 ## Principles
 
@@ -95,11 +119,25 @@ floor.
 
 ## v1 success criteria
 
-- [ ] 3 accounts × 3+ parallel agents work on one project for ≥ 8 hours without manual
-      intervention.
-- [ ] No session is lost on a server or container restart.
-- [ ] Per-account limits match the official `/usage` numbers; agents pause and resume
-      automatically.
-- [ ] A message from room A reaches room B in < 5 seconds, visibly on the canvas.
-- [ ] A fresh project gets onboarded (CLAUDE.md/README created by the interview agent)
-      in a single session.
+Checked against the code and the recorded acceptance runs on 2026-08-04. A box is ticked
+only where there is evidence in [ROADMAP.md](ROADMAP.md), not where the feature merely
+exists.
+
+- [ ] **3 accounts × 3+ parallel agents work on one project for ≥ 8 hours without manual
+      intervention.** *Never run.* The mechanism is built and tested, but the author has
+      never had three logged-in subscriptions at once, and an eight-hour unattended run has
+      not happened. This is the one criterion nothing has demonstrated.
+- [x] **No session is lost on a server or container restart.** M0 proved it for host
+      sessions (server SIGTERM'd mid-session, agent recalled a secret word afterwards); M4
+      proved it for contained ones through a `kill -9`, with the same container re-adopted
+      by its label.
+- [x] **Per-account limits match the official `/usage` numbers; agents pause and resume
+      automatically.** Live meters read from the endpoint in M2 (5-hour 49 %, weekly 88 %, a
+      per-model window at 100 %); warn/pause/resume forced with a stubbed adapter on a fake
+      clock, so no real limit was approached.
+- [x] **A message from room A reaches room B in < 5 seconds, visibly on the canvas.** M3a,
+      live: one operator prompt, `factory_send` with no approval card, the receiving agent
+      picking it up as an injected turn, and a package on the belt each way.
+- [x] **A fresh project gets onboarded (CLAUDE.md/README created by the interview agent) in
+      a single session.** M1c, live: one interview, eight turns, $0.44, seven questions one
+      at a time, both files written and five rooms proposed.

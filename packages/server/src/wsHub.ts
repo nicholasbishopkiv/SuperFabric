@@ -1,7 +1,9 @@
 import { CHRONICLE_SEARCH_LIMIT, ClientMessage, type ServerMessage } from "@superfabric/shared";
 import type { AccountLoginManager } from "./accountLogin.js";
 import type { AccountManager } from "./accountManager.js";
+import type { FactoryPortability } from "./factoryPortability.js";
 import type { LimitMonitor } from "./limitMonitor.js";
+import type { MetricsStore } from "./metricsStore.js";
 import type { Chronicle } from "./chronicle.js";
 import type { EventStore } from "./eventStore.js";
 import type { FactoryBus } from "./factoryBus.js";
@@ -27,7 +29,7 @@ const SESSION_SHAPE_EVENTS = new Set(["session_status", "approval_request", "app
 const BROADCAST_DEBOUNCE_MS = 250;
 
 /** State the server pushes on its own, as opposed to answering a query. */
-type PushedList = "sessions" | "tasks" | "messages" | "accounts" | "usage" | "onboarding";
+type PushedList = "sessions" | "tasks" | "messages" | "accounts" | "usage" | "onboarding" | "metrics";
 
 export interface WsHubOptions {
   /** The task board. Absent => `create_task`/`update_task`/`list_tasks` are refused with an error. */
@@ -73,6 +75,17 @@ export interface WsHubOptions {
    * would quietly hide the feature.
    */
   onboarding?: OnboardingManager;
+  /**
+   * Burn rate and cost. Absent => `list_metrics` is refused with an error rather than answered with
+   * zeroes, for the same reason the chronicle is: "this server computes no metrics" and "you have spent
+   * nothing" are different facts, and the second one is the dangerous one to show.
+   */
+  metrics?: MetricsStore;
+  /**
+   * Exporting and importing a factory. Absent => the two messages are refused with an error, which is
+   * the shape of every other optional collaborator here.
+   */
+  portability?: FactoryPortability;
   /** Overridable so tests do not have to wait out the real window. */
   sessionsDebounceMs?: number;
 }
@@ -104,6 +117,8 @@ export class WsHub {
   private readonly limits: LimitMonitor | undefined;
   private readonly roles: RoleLibrary | undefined;
   private readonly onboarding: OnboardingManager | undefined;
+  private readonly metrics: MetricsStore | undefined;
+  private readonly transfer: FactoryPortability | undefined;
 
   constructor(
     private store: EventStore,
@@ -122,6 +137,8 @@ export class WsHub {
     this.limits = opts.limits;
     this.roles = opts.roles;
     this.onboarding = opts.onboarding;
+    this.metrics = opts.metrics;
+    this.transfer = opts.portability;
     // The bus persists and delivers on its own schedule (a send from a tool, a delivery at a turn
     // boundary), so the hub learns about traffic by subscribing rather than by being called. The
     // board is the same story and for a stronger reason: an agent moving its own task with
@@ -133,8 +150,12 @@ export class WsHub {
     // server fires it once per agent, which the coalescing window turns into one frame.
     opts.accounts?.onChange(() => this.scheduleBroadcast("accounts"));
     // The meters announce themselves too: a poll finishes on a timer that holds no socket, and a
-    // 429 seen mid-turn marks an account from inside the session runner.
-    opts.limits?.onChange(() => this.scheduleBroadcast("usage"));
+    // 429 seen mid-turn marks an account from inside the session runner. A fresh reading is also a
+    // fresh *rate*, so the projection rides the same signal.
+    opts.limits?.onChange(() => {
+      this.scheduleBroadcast("usage");
+      this.scheduleBroadcast("metrics");
+    });
     store.onAppend((sessionId, seq, event) => {
       const msg: ServerMessage = { kind: "event", sessionId, seq, event };
       for (const [sock, sessions] of this.subs) {
@@ -158,6 +179,11 @@ export class WsHub {
       // rather than on the operator's next reload.
       if (this.onboarding !== undefined && event.type === "turn_complete") {
         this.scheduleBroadcast("onboarding");
+      }
+      // A turn boundary is the only thing that changes what the work has cost — `turn_complete` is
+      // where `costUsd` arrives — so the metrics frame rides it, coalesced like everything else.
+      if (this.metrics !== undefined && event.type === "turn_complete") {
+        this.scheduleBroadcast("metrics");
       }
     });
   }
@@ -209,6 +235,7 @@ export class WsHub {
     else if (kind === "accounts") this.broadcastAccounts();
     else if (kind === "usage") this.broadcastUsage();
     else if (kind === "onboarding") this.broadcastOnboarding();
+    else if (kind === "metrics") this.broadcastMetrics();
     else this.broadcastMessages();
   }
 
@@ -425,6 +452,15 @@ export class WsHub {
         case "list_usage":
           this.safeSend(sock, { kind: "usage", usage: this.limitStore().list() });
           break;
+        // Burn rate and cost, from readings and log rows this server already holds. Like `list_usage`
+        // it reads nothing over the network — and unlike it, it is scoped, because the room half of
+        // the answer belongs to one floor.
+        case "list_metrics":
+          this.safeSend(sock, {
+            kind: "metrics",
+            metrics: this.metricStore().snapshot(this.activeProject(sock)),
+          });
+          break;
         case "create_account": {
           // The store announces its own change (see the constructor), so the fresh list reaches every
           // tab without this branch having to push it — the same arrangement the board has.
@@ -592,6 +628,35 @@ export class WsHub {
           this.safeSend(sock, { kind: "chronicle", query: msg.query, hits });
           break;
         }
+        // Portability. An export is a read of this socket's own floor — answered to the socket that
+        // asked, never broadcast, because it is a file the operator started downloading.
+        case "export_project": {
+          const projectId = msg.projectId ?? this.activeProject(sock);
+          // A client holding another project's id must not be able to read that factory's shape
+          // through this socket, for the same reason `requireRoomOnFloor` exists.
+          if (projectId !== this.activeProject(sock)) {
+            throw new Error("a factory can only be exported from the floor this tab is looking at");
+          }
+          this.safeSend(sock, { kind: "factory_export", factory: this.portability().export(projectId) });
+          break;
+        }
+        // An import changes the world: a project may appear, rooms and a board certainly do. So the
+        // switcher is refreshed for everybody, this socket is moved onto the floor it just built (an
+        // operator who imports a factory wants to be looking at it), and the *result* — including
+        // everything the import could not do — goes back as its own message rather than as a notice.
+        case "import_factory": {
+          const result = this.portability().import({
+            root: msg.root,
+            ...(msg.name !== undefined ? { name: msg.name } : {}),
+            factory: msg.factory,
+          });
+          this.safeSend(sock, { kind: "factory_import", result });
+          this.openProject(sock, result.projectId);
+          for (const other of [...this.subs.keys()]) {
+            if (other !== sock) this.sendProjects(other);
+          }
+          break;
+        }
       }
     } catch (err) {
       this.safeSend(sock, { kind: "error", message: String(err) });
@@ -696,6 +761,26 @@ export class WsHub {
   }
 
   /**
+   * Burn rate and cost, per floor.
+   *
+   * Per project rather than to every socket, unlike `usage` — the account half of the frame is
+   * machine-wide and identical everywhere, but the room half belongs to one factory, and a tab must
+   * never be shown another floor's spend. See `FactoryMetrics`.
+   */
+  private broadcastMetrics(): void {
+    if (this.metrics === undefined) return;
+    this.broadcastPerProject((p) => ({ kind: "metrics", metrics: this.metrics!.snapshot(p) }));
+  }
+
+  /**
+   * Public entry point for "the metrics moved for a reason outside a socket". Coalesced like every
+   * other pushed list.
+   */
+  announceMetrics(): void {
+    this.scheduleBroadcast("metrics");
+  }
+
+  /**
    * Where each floor stands with onboarding. Per project like the rooms, because that is what it is
    * about — and because `onboarded` is a `CLAUDE.md` at *one* project's root.
    */
@@ -768,6 +853,11 @@ export class WsHub {
     if (this.onboarding !== undefined) {
       this.safeSend(sock, { kind: "onboarding", onboarding: this.onboarding.state(project.id) });
     }
+    // The metrics frame's room half is this floor's spend, so it is re-scoped like the rooms rather
+    // than surviving the switch the way the machine-wide `usage` does.
+    if (this.metrics !== undefined) {
+      this.safeSend(sock, { kind: "metrics", metrics: this.metrics.snapshot(project.id) });
+    }
     // Other tabs: the switcher gained (or re-ordered) an entry, and their `lastOpenedAt` changed.
     for (const other of [...this.subs.keys()]) {
       if (other !== sock) this.sendProjects(other);
@@ -825,6 +915,20 @@ export class WsHub {
   private limitStore(): LimitMonitor {
     if (this.limits === undefined) throw new Error("this server does not monitor limits");
     return this.limits;
+  }
+
+  /** Likewise for the metrics: no projection is an answer, a projection of zero would be a lie. */
+  private metricStore(): MetricsStore {
+    if (this.metrics === undefined) throw new Error("this server does not compute metrics");
+    return this.metrics;
+  }
+
+  /** Likewise for portability: "this server cannot move a factory" is not an empty export. */
+  private portability(): FactoryPortability {
+    if (this.transfer === undefined) {
+      throw new Error("this server cannot export or import a factory");
+    }
+    return this.transfer;
   }
 
   /** Likewise for roles: a server that ships none says so rather than answering with an empty picker. */
