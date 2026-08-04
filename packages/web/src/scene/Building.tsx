@@ -31,6 +31,7 @@ import {
   ROOM_ROOF_THICKNESS,
 } from "./layout";
 import { DETAIL, PROJECT, ROOM, roomAccent, SANDBOX_COLOR, SELECT_COLOR } from "./palette";
+import { RoomProps } from "./Props";
 import { StatusBeacon } from "./StatusBeacon";
 
 const LABEL_COLOR = "#1c1c1c";
@@ -192,6 +193,17 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
       })}
 
       <StatusBeacon status={status} y={beaconHeight(kind)} />
+
+      {/* What this department works at, in the yard between the wall and the figures: a bench where
+          they build, a test rig where they check, a desk where they write. Chosen from the *roles*
+          standing here rather than from what anyone is doing this second — see `props.ts` — and
+          placed clear of every door, because a belt arrives at those. */}
+      <RoomProps
+        roomId={roomId}
+        kind={kind}
+        beltDirections={beltDirections}
+        working={status === "working"}
+      />
 
       {/* Figures stand at the project block too, not only at the workshops: an agent created in the
           project room is a real agent, and a floor that hid it would be lying about what is running. */}

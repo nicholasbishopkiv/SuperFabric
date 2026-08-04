@@ -1513,6 +1513,30 @@ export const useRoomAgents = (roomId: string): SessionInfo[] =>
   useFabric(useShallow((s) => roomAgents(s.sessions, roomId)));
 
 /**
+ * The distinct roles standing in one room, sorted — which is what the room's **furniture** is chosen
+ * from (`scene/props.ts`).
+ *
+ * Deduplicated and sorted here rather than in the scene, and returning **flat strings**, because that
+ * is what makes it cheap: it goes through `useShallow`, so a room's yard is rebuilt only when the set
+ * of disciplines actually changes. Three backend agents produce one entry; a status tick, a token or
+ * an agent setting off for a crate produce none. `roleId: null` contributes nothing — an agent that
+ * has not said what it is does not furnish a room.
+ *
+ * The same `roomAgents` list the figures come from, so what stands in the yard and who stands in front
+ * of it can never disagree: a `done` session is history and takes its bench with it.
+ */
+export function roomRoleIds(sessions: readonly SessionInfo[], roomId: string): string[] {
+  const ids = new Set<string>();
+  for (const session of roomAgents(sessions, roomId)) {
+    if (session.roleId !== null) ids.add(session.roleId);
+  }
+  return [...ids].sort();
+}
+
+export const useRoomRoleIds = (roomId: string): string[] =>
+  useFabric(useShallow((s) => roomRoleIds(s.sessions, roomId)));
+
+/**
  * The sessions that belong to no room at all. Every M0 session is one of these (`room_id` did not
  * exist yet), and so is anything created through the console drawer's plain "New session" button —
  * they run, they cost quota, and **nothing on the factory floor draws them**, because a figure with

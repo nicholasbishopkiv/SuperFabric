@@ -19,6 +19,7 @@ import {
   openTaskCount,
   orchestratorSession,
   roomAgents,
+  roomRoleIds,
   roomlessSessions,
   roleLabel,
   ROLE_NONE_LABEL,
@@ -498,6 +499,44 @@ describe("roomAgents", () => {
     // a figure standing next to a label that says "2 agents" would be a lie either way round
     expect(roomAgents(sessions, "r1")).toHaveLength(liveAgentCount(sessions, "r1"));
     expect(roomAgents(sessions, "r1").map((s) => s.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("roomRoleIds", () => {
+  it("is the set of disciplines standing in the room, deduplicated and sorted", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1", roleId: "qa" }),
+      session({ id: "b", roomId: "r1", roleId: "backend" }),
+      session({ id: "c", roomId: "r1", roleId: "backend" }),
+      session({ id: "d", roomId: "r2", roleId: "devops" }),
+    ];
+    // Sorted and deduplicated *here*, so the scene's `useShallow` sees the same array identity while
+    // the set of disciplines is unchanged — which is what keeps a room's furniture from rebuilding on
+    // every token an agent produces.
+    expect(roomRoleIds(sessions, "r1")).toEqual(["backend", "qa"]);
+    expect(roomRoleIds(sessions, "r2")).toEqual(["devops"]);
+    expect(roomRoleIds(sessions, "nobody")).toEqual([]);
+  });
+
+  it("counts an agent with no role as furnishing nothing", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1", roleId: null }),
+      session({ id: "b", roomId: "r1", roleId: "qa" }),
+    ];
+    expect(roomRoleIds(sessions, "r1")).toEqual(["qa"]);
+    expect(roomRoleIds([session({ roomId: "r1", roleId: null })], "r1")).toEqual([]);
+  });
+
+  it("furnishes for exactly the agents the floor draws — history takes its bench with it", () => {
+    const sessions = [
+      session({ id: "a", roomId: "r1", roleId: "backend", state: "done" }),
+      session({ id: "b", roomId: "r1", roleId: "qa", state: "error" }),
+      session({ id: "c", roomId: "r1", roleId: "devops", state: "paused" }),
+    ];
+    // The same list the figures come from (`roomAgents`), so what stands in the yard and who stands
+    // in front of it can never disagree.
+    expect(roomRoleIds(sessions, "r1")).toEqual(["devops"]);
+    expect(roomAgents(sessions, "r1").map((s) => s.id)).toEqual(["c"]);
   });
 });
 

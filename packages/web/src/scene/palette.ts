@@ -262,6 +262,17 @@ export const PROP = {
   panel: "#4c555f",
   /** Paper, boards, a drawing pinned to a table. */
   paper: FLOOR.paint,
+  /**
+   * How hard a prop's screen or lamp burns while the room is working.
+   *
+   * The glazing's own colour (`DETAIL.windowGlow`) but **not** its intensity, and that is a decision
+   * about area rather than a licence to be louder: a window strip is a couple of square units of a
+   * building's face, a monitor is a fifth of one, and at `windowGlowIntensity` the screen was
+   * invisible at the zoom a room is actually read at — measured, in the first screenshot of it. Four
+   * times the intensity over a twentieth of the area is still a fraction of the light a lit window
+   * puts on the floor, so the reading order is unchanged.
+   */
+  screenGlowIntensity: 0.42,
 } as const;
 
 /** The package meshes travelling the belts, and the belts themselves. */
