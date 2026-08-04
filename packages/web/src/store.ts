@@ -5,6 +5,8 @@ import type {
   MessageInfo,
   MessageKind,
   ProjectInfo,
+  RoleProblem,
+  RoleSpec,
   RoomInfo,
   SavedAttachment,
   ScenePosition,
@@ -175,6 +177,19 @@ export interface FabricState {
    * server's three-minute poll. Machine-wide like the accounts, so a factory switch leaves it alone.
    */
   usage: AccountUsage[];
+  /**
+   * The role library, in the server's order (by id).
+   *
+   * Machine-wide like `accounts`, and left alone by a factory switch for the same reason: a role is a
+   * file on the machine the server runs on, not a property of one floor.
+   */
+  roles: RoleSpec[];
+  /**
+   * Role files that failed to load, if any. Carried next to the list rather than folded into it,
+   * because a preset that did not parse is a thing the operator has to be told — a picker that is
+   * quietly one entry shorter than their `roles/` folder gives them nothing to act on.
+   */
+  roleProblems: RoleProblem[];
   /**
    * The factory this tab is looking at, or null before the server has said. Server-owned: the socket
    * holds the active project, so this is whatever the last `projects` message carried and never
@@ -395,6 +410,8 @@ export const initialFabricState = {
   projects: [] as ProjectInfo[],
   accounts: [] as AccountInfo[],
   usage: [] as AccountUsage[],
+  roles: [] as RoleSpec[],
+  roleProblems: [] as RoleProblem[],
   activeProjectId: null as string | null,
   sessions: [] as SessionInfo[],
   rooms: [] as RoomInfo[],
@@ -461,6 +478,7 @@ function sameSession(a: SessionInfo, b: SessionInfo): boolean {
   return a.state === b.state && a.status === b.status && a.blocked === b.blocked
     && a.autonomy === b.autonomy && a.model === b.model && a.roomId === b.roomId
     && a.isOrchestrator === b.isOrchestrator && a.accountId === b.accountId
+    && a.roleId === b.roleId
     && a.pausedUntil === b.pausedUntil
     && a.claudeSessionId === b.claudeSessionId && a.lastSeq === b.lastSeq;
 }
@@ -712,6 +730,9 @@ export const useFabric = create<FabricState>((set, get) => ({
       if (msg.kind === "tasks") return applyTasks(s, msg.tasks);
       if (msg.kind === "accounts") return applyAccounts(s, msg.accounts);
       if (msg.kind === "usage") return applyUsage(s, msg.usage);
+      // Answered once per connect and only changed by the operator editing a file, so there is
+      // nothing here to coalesce or to preserve identity through — the whole list is the answer.
+      if (msg.kind === "roles") return { roles: msg.roles, roleProblems: msg.problems };
       // An answer to a question nobody is asking any more is dropped: the operator has typed on,
       // and showing them the hits for a prefix of what is in the box would be worse than showing
       // them nothing. See `ChronicleState`.
@@ -993,6 +1014,34 @@ export const useAccountUsage = (accountId: string): AccountUsage | undefined =>
 
 /** What "no account" is called wherever it is offered or shown. One string, not four. */
 export const ACCOUNT_NONE_LABEL = "default";
+
+// ---- roles ----
+//
+// Machine-wide like the accounts: a role is a file where the server runs, so the list is the same on
+// every floor and a project switch leaves it alone. What is per-agent is the binding, and it rides on
+// `SessionInfo.roleId`.
+
+export const useRoles = (): RoleSpec[] => useFabric(useShallow((s) => s.roles));
+
+/** Role files the server could not load. Empty is the normal state; anything here is worth showing. */
+export const useRoleProblems = (): RoleProblem[] => useFabric(useShallow((s) => s.roleProblems));
+
+/** One role, or `undefined` for `null` and for an id this tab holds no spec for. */
+export const useRole = (roleId: string | null): RoleSpec | undefined =>
+  useFabric((s) => (roleId === null ? undefined : s.roles.find((r) => r.id === roleId)));
+
+/**
+ * What to call a role in one line. An id we hold no spec for is shown as the id, never as "none":
+ * "this agent is a role I cannot describe" and "this agent has no role" are different facts, and the
+ * second would hide a preset the operator deleted out from under a running agent.
+ */
+export function roleLabel(roles: readonly RoleSpec[], roleId: string | null): string {
+  if (roleId === null) return ROLE_NONE_LABEL;
+  return roles.find((r) => r.id === roleId)?.name ?? roleId;
+}
+
+/** What "no role" is called wherever it is offered or shown. */
+export const ROLE_NONE_LABEL = "no role";
 
 /** The factory this tab is showing, or undefined before the server has said which. */
 export const useActiveProject = (): ProjectInfo | undefined =>

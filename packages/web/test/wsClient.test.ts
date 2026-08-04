@@ -64,7 +64,7 @@ describe("wsClient", () => {
     // follows is scoped to it.
     expect(sock.sent.map((m) => m.kind))
       .toEqual(["list_projects", "list_sessions", "list_rooms", "list_messages", "list_tasks",
-        "list_accounts", "list_usage"]);
+        "list_accounts", "list_usage", "list_roles"]);
   });
 
   it("re-asks for the floor after a reconnect", async () => {

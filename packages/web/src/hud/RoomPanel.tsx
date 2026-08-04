@@ -19,6 +19,7 @@ import {
   useRoomTaskCount,
   useSelectedRoomId,
   useAccounts,
+  useRoleProblems,
 } from "../store";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -28,6 +29,7 @@ import { send } from "../wsClient";
 import { AccountSelect } from "./AccountSelect";
 import { AutonomySelect } from "./AutonomySelect";
 import { ModelSelect } from "./ModelSelect";
+import { RoleSelect } from "./RoleSelect";
 import { EdgePanel, PanelSection } from "./Panel";
 import { StatusDot } from "./StatusDot";
 import { formatCountdown, useTickingNow } from "./UsageMeters";
@@ -213,6 +215,15 @@ function AgentLine({ agent, connected }: { agent: SessionInfo; connected: boolea
         </Badge>
       )}
       <span className="ml-auto flex items-center gap-1">
+        {/* What this agent arrived as. Changing it restarts the executor on the new charter, model
+            and tool servers, resuming the same conversation — and never touches its autonomy, which
+            is the control immediately to its right and the operator's own. */}
+        <RoleSelect
+          value={agent.roleId}
+          disabled={!connected}
+          short
+          onChange={(roleId) => send({ kind: "set_role", sessionId: agent.id, roleId })}
+        />
         <AutonomySelect
           value={agent.autonomy}
           disabled={!connected}
@@ -386,10 +397,52 @@ function RoomAccount({ roomId, accountId, connected }: {
   );
 }
 
+/**
+ * What the next agent created here arrives as.
+ *
+ * A picker beside the button rather than a dialog behind it: choosing a role is the *normal* way to
+ * add an agent — it is the whole point of the feature for someone who does not know Claude Code's
+ * configuration surface — and a normal choice should not be one click further away than the default
+ * one. Local to this panel, not persisted: it is a property of the click, not of the room.
+ */
+function NewAgentRole({
+  roleId,
+  connected,
+  onChange,
+}: {
+  roleId: string | null;
+  connected: boolean;
+  onChange: (roleId: string | null) => void;
+}) {
+  const problems = useRoleProblems();
+
+  return (
+    <div className="mt-1.5">
+      <div className="flex items-center gap-1.5">
+        <BotIcon className="size-3 shrink-0 text-fg-faint" />
+        <span className="text-2xs text-fg-muted">New agents arrive as</span>
+        <span className="ml-auto">
+          <RoleSelect value={roleId} disabled={!connected} short onChange={onChange} />
+        </span>
+      </div>
+      {/* A preset that did not load is the operator's own file being broken, and it is the one thing
+          about roles they cannot discover any other way — the picker would just be one entry short. */}
+      {problems.length > 0 && (
+        <FieldNote className="text-status-error">
+          {problems.length} role file{problems.length === 1 ? "" : "s"} did not load:{" "}
+          {problems.map((p) => `${p.file} ${p.message}`).join(" · ")}
+        </FieldNote>
+      )}
+    </div>
+  );
+}
+
 /** The selected room in full: where it lives on disk, who works there, and how to add someone. */
 function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolean }) {
   const room = useRoom(roomId);
   const agents = useRoomAgents(roomId);
+  /** The role the next "+ agent" click uses. Null is a plain agent, which is the default. */
+  const [roleId, setRoleId] = useState<string | null>(null);
   if (room === undefined) return null;
 
   return (
@@ -399,7 +452,9 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
         <Button
           size="xs"
           variant="accent"
-          onClick={() => send({ kind: "create_session", roomId })}
+          onClick={() =>
+            send({ kind: "create_session", roomId, ...(roleId === null ? {} : { roleId }) })
+          }
           disabled={!connected}
           title="Start a Claude Code session in this room's folder"
         >
@@ -423,6 +478,7 @@ function SelectedRoom({ roomId, connected }: { roomId: string; connected: boolea
       )}
       {/* Every room, including the central building: the orchestrator spends quota like anyone. */}
       <RoomAccount roomId={roomId} accountId={room.accountId} connected={connected} />
+      <NewAgentRole roleId={roleId} connected={connected} onChange={setRoleId} />
       {/* The charter is where an agent learns it is a department with a bus. A room created here
           gets that section written for it; a folder that already had a CLAUDE.md keeps its own,
           untouched — so for those it is the operator who has to say it. */}

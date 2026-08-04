@@ -51,6 +51,9 @@ export function connect(): void {
     // The meters beside them. A *query* over what the server already holds — asking never makes it
     // read the usage endpoint, so a tab reloading ten times costs the operator's quota nothing.
     send({ kind: "list_usage" });
+    // The role library. Machine-wide like the accounts and asked for once per connect — an operator
+    // who has just edited a preset gets it by reloading the tab, and the server re-reads the file.
+    send({ kind: "list_roles" });
     // The server hard-terminates sockets on shutdown, so a reconnect must re-ask for the tail of
     // every session we were following — from the last contiguous seq we hold, not from 0.
     const { contiguousSeq } = useFabric.getState();
