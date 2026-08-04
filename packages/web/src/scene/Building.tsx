@@ -1,4 +1,3 @@
-import { Html } from "@react-three/drei";
 import type { ThreeEvent } from "@react-three/fiber";
 import { memo, useMemo } from "react";
 import { BackSide } from "three";
@@ -19,6 +18,7 @@ import { Agents } from "./Agents";
 import { BayPile } from "./BayPile";
 import { Chimney } from "./Chimney";
 import { pilesByBay } from "./errands";
+import { SceneOverlay } from "./SceneOverlay";
 import {
   BAY_WIDTH,
   beaconHeight,
@@ -217,7 +217,7 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
         white rectangle. A constant screen-space size is also the right behaviour for a plan view —
         the label stays exactly as readable at every zoom level, which is what the factor was for.
       */}
-      <Html position={[0, labelHeight(kind), 0]} center occlude>
+      <SceneOverlay position={[0, labelHeight(kind), 0]} center occlude>
         <div
           style={{
             font: "600 13px system-ui, sans-serif",
@@ -235,7 +235,9 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
             padding: "2px 7px",
             whiteSpace: "nowrap",
             // The mesh underneath owns the click; a label that swallowed it would make the
-            // building unselectable from exactly the spot the operator aims at.
+            // building unselectable from exactly the spot the operator aims at. On its own this
+            // does *not* achieve that — drei nests two hit-testable elements above this one, which
+            // is why `SceneOverlay` exists. Kept as the innermost of the three.
             pointerEvents: "none",
             userSelect: "none",
           }}
@@ -256,7 +258,7 @@ export const Building = memo(function Building({ roomId }: { roomId: string }) {
             <span style={{ color: SANDBOX_COLOR, fontWeight: 700 }}> · sandboxed</span>
           )}
         </div>
-      </Html>
+      </SceneOverlay>
     </group>
   );
 });

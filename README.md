@@ -59,7 +59,7 @@ packages and work in smoking workshops; several projects in one server; a multi-
 limit monitor with warn/pause/auto-resume; the inter-room bus, the task board, the
 orchestrator and the decision chronicle; the roles library and the onboarding interview;
 an optional container per room; burn-rate metrics; and factory export/import.
-**1,344 tests green** (shared 88, server 807 + 1 live-quota test run by hand, web 419,
+**1,355 tests green** (shared 88, server 813 + 1 live-quota test run by hand, web 424,
 agent-runner 30).
 
 **It has not been used in anger by anyone but its author, and a list of what is

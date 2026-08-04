@@ -554,7 +554,7 @@ real CLI):
 - **The frameloop gate is intact**: `requestAnimationFrame` fired **0** times in 3 s with
   every agent idle.
 
-1159 → **1344 tests green** (shared 88, server 807 + 1 skipped live-quota test, web 419,
+1159 → **1355 tests green** (shared 88, server 813 + 1 skipped live-quota test, web 424,
 agent-runner 30).
 
 ## What is not built

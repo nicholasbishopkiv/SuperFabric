@@ -82,6 +82,17 @@
     -webkit-font-smoothing: antialiased;
   }
 
+  /* The wrapper drei appends to the canvas container for every `<Html>` in the scene. drei writes
+     that element's `style.cssText` itself and puts no `pointer-events` in it, so it hit-tests as
+     `auto` and a press on a building's label never reaches the canvas — which is what made buildings
+     undraggable. `!important` because drei also assigns the property inline on that same element
+     (see the `occlude` branch of its layout effect); a plain rule would be a coin toss.
+     The other half of this lives in `scene/SceneOverlay.tsx`, which is the only thing that may set
+     this class, and a test holds the two together. */
+  .sf-scene-overlay {
+    pointer-events: none !important;
+  }
+
   /* Panels scroll a lot and are small; the platform scrollbar is too wide and too bright for one. */
   .hud-scroll {
     scrollbar-width: thin;

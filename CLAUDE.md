@@ -382,7 +382,7 @@ originally sketched; that was consciously changed and the reason is recorded in 
 See `docs/ROADMAP.md` for the acceptance evidence of each, including the live onboarding
 transcript and M4's isolation proofs from inside a running container.
 
-**1344 tests green** (shared 88, server 807 + 1 skipped live-quota test, web 419, agent-runner 30).
+**1355 tests green** (shared 88, server 813 + 1 skipped live-quota test, web 424, agent-runner 30).
 
 **What is *not* built is listed at the end of `docs/ROADMAP.md`** and is worth reading before you
 add a doc sentence that implies otherwise — there are no notifications off the browser tab, eleven
@@ -427,6 +427,29 @@ README names).
   `unexpected-response`. Anything that must send an `Origin` uses Bun's native `WebSocket`
   with `{ headers: { Origin } }`, and anything that must see the handshake's HTTP status
   writes the upgrade request by hand (see `test/wsOrigin.test.ts`).
+
+### Scene gotchas worth knowing before you touch the floor
+
+- **A drei `<Html>` swallows the pointer, and `pointerEvents: "none"` on your own div does not
+  stop it.** In non-transform mode drei renders three nested elements and only the innermost is
+  yours: the wrapper it appends to the canvas container (whose `style.cssText` it assigns itself,
+  with no `pointer-events`) and a div of its own carrying the `style` *prop*. Two hit-testable
+  elements above your content mean a press on a label never reaches the canvas, so no raycast runs
+  and the building under it cannot be selected or dragged — which is exactly how "перетаскивание
+  сломано" happened once already. **Use `scene/SceneOverlay.tsx` for every DOM overlay in the
+  scene**; a test in `test/sceneOverlay.test.ts` fails if a raw `<Html>` comes back. Anything in the
+  scene that genuinely wants clicks belongs in the HUD.
+- **No `distanceFactor` on this camera.** It is orthographic, so drei multiplies the overlay's
+  scale by `camera.zoom`; at the opening zoom of 38 a 13 px label became a white rectangle over the
+  whole floor.
+- **Anything that moves must be in `hasMotion`,** or `frameloop="demand"` never renders it. The
+  converse bites too: a status that is *not* motion (`starting` was one) pins the loop to `always`
+  forever and an idle factory burns a core.
+- **Debugging the scene in an automated browser: a hidden tab never sizes the canvas.** r3f measures
+  with a `ResizeObserver`, which delivers nothing while `document.hidden`, so the canvas stays at
+  its intrinsic 300×150 and every pointer coordinate lands somewhere else. Dispatch one
+  `window.dispatchEvent(new Event("resize"))` before measuring anything. This is a property of the
+  harness, not a bug in the app — do not go looking for it in `FactoryScene`.
 
 ## Layout
 

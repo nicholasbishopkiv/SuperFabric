@@ -1,5 +1,4 @@
 import type { RoomInfo } from "@superfabric/shared";
-import { Html } from "@react-three/drei";
 import { useFrame, useThree } from "@react-three/fiber";
 import { memo, useEffect, useMemo, useRef } from "react";
 import type { Group } from "three";
@@ -40,6 +39,7 @@ import {
   STATUS_COLOR,
 } from "./palette";
 import { type CarryKind, type HatShape, roleLook } from "./roleLook";
+import { SceneOverlay } from "./SceneOverlay";
 
 /**
  * A worker, in seven boxes and two spheres.
@@ -395,7 +395,7 @@ function ThoughtBubble({ bubble, level }: { bubble: Bubble; level: number }) {
   }, [invalidate, bubble.text]);
 
   return (
-    <Html position={[0, BUBBLE_Y, 0]} center>
+    <SceneOverlay position={[0, BUBBLE_Y, 0]} center>
       <div
         style={{
           position: "relative",
@@ -412,8 +412,10 @@ function ThoughtBubble({ bubble, level }: { bubble: Bubble; level: number }) {
           borderRadius: 9,
           padding: "2px 7px",
           whiteSpace: "nowrap",
-          // The figure owns every pointer event around it: a bubble that swallowed a click would make
-          // the building under it unselectable from exactly where the operator is looking.
+          // The figure owns every pointer event around it: a bubble that swallowed a click would
+          // make the building under it unselectable from exactly where the operator is looking —
+          // which is precisely what happened until `SceneOverlay` took over the two drei elements
+          // above this one. Kept as the innermost of the three.
           pointerEvents: "none",
           userSelect: "none",
         }}
@@ -434,7 +436,7 @@ function ThoughtBubble({ bubble, level }: { bubble: Bubble; level: number }) {
           }}
         />
       </div>
-    </Html>
+    </SceneOverlay>
   );
 }
 
