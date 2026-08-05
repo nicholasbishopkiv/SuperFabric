@@ -31,7 +31,7 @@ import {
   ROOM_ROOF_THICKNESS,
 } from "./layout";
 import { DETAIL, PROJECT, ROOM, roomAccent, SANDBOX_COLOR, SELECT_COLOR } from "./palette";
-import { RoomProps } from "./Props";
+import { RoomProps } from "./RoomProps";
 import { StatusBeacon } from "./StatusBeacon";
 
 const LABEL_COLOR = "#1c1c1c";

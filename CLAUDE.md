@@ -624,7 +624,9 @@ README names).
   `layout.ts` — plus M5's `errands.ts` (which agent fetches a crate, where the path runs, and what
   happens when nobody is free — pure, so it is tested without a canvas), `BayPile.tsx` (the crates a
   room with nobody home visibly stacks), `Chimney.tsx` + `atmosphere.ts` (a plume while a room
-  works, fading after it stops), `props.ts`/`Props.tsx` (per-room props that reflect the work),
+  works, fading after it stops), `props.ts`/`RoomProps.tsx` (per-room props that reflect the work —
+  two names rather than one case apart, because a case-insensitive filesystem resolves `./Props` to
+  `props.ts` and the import fails only on macOS),
   `roleLook.ts` (a distinct figure per role) and `bubble.ts` (what an agent is doing, over its
   head)) ·
   `hud/*` (room panel,
