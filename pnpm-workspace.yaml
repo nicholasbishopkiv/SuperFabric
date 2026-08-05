@@ -1,2 +1,19 @@
 packages:
   - packages/*
+
+# Which dependencies may run install scripts. pnpm 11 no longer reads the
+# `pnpm.neverBuiltDependencies` field in package.json, so the decision lives here.
+#
+# dockerode drags in ssh2 (for docker-over-ssh, which we never use) and ssh2 drags in
+# cpu-features; both have node-gyp install scripts and both are optional accelerators with
+# pure-JS fallbacks. Building them would put node-gyp back into `pnpm install` — exactly the
+# step `docs/decisions/0001-bun-runtime-keep-vite.md` removed by choosing bun:sqlite over
+# better-sqlite3. We talk to the daemon over its unix socket, so nothing here is even loaded.
+# protobufjs' script only regenerates definitions the published package already ships.
+#
+# esbuild is the exception: its postinstall resolves the platform binary Vite and vitest run.
+allowBuilds:
+  esbuild: true
+  cpu-features: false
+  protobufjs: false
+  ssh2: false
